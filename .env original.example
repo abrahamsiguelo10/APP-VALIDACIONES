@@ -1,0 +1,16 @@
+# ── Base de datos (Supabase) ──────────────────────────────────────
+# Obtener desde: Supabase > Project Settings > Database > Connection string
+DATABASE_URL=postgresql://postgres:[PASSWORD]@db.[REF].supabase.co:5432/postgres
+
+# ── JWT ───────────────────────────────────────────────────────────
+# Generar con: node -e "console.log(require('crypto').randomBytes(64).toString('hex'))"
+JWT_SECRET=cambia_esto_por_un_string_aleatorio_largo
+JWT_EXPIRES_IN=8h
+
+# ── Servidor ──────────────────────────────────────────────────────
+PORT=3000
+NODE_ENV=production
+
+# ── CORS — origen del frontend ────────────────────────────────────
+# En producción: tu dominio de Cloudflare Pages
+CORS_ORIGIN=https://siguelo.pages.dev
