@@ -30,6 +30,25 @@ const migrations = [
       ADD COLUMN IF NOT EXISTS color TEXT DEFAULT '#38bdf8';
     `
   },
+  {
+  name: '004_create_roles_table',
+  sql: `
+    CREATE TABLE IF NOT EXISTS public.roles (
+      id         TEXT PRIMARY KEY,
+      label      TEXT NOT NULL,
+      modules    JSONB NOT NULL DEFAULT '["dashboard","validador"]'::jsonb,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+  `
+},
+{
+  name: '005_add_role_id_to_users',
+  sql: `
+    ALTER TABLE public.users
+    ADD COLUMN IF NOT EXISTS role_id TEXT REFERENCES public.roles(id) ON DELETE SET NULL;
+  `
+},
 ];
 
 async function runMigrations() {

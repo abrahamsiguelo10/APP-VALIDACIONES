@@ -15,13 +15,14 @@ require('dotenv').config();
 const express = require('express');
 const cors    = require('cors');
 
-const { pool }         = require('./db/pool');
+const { pool }          = require('./db/pool');
 const { runMigrations } = require('./db/migrate');
 
 const authRoutes  = require('./routes/auth');
 const userRoutes  = require('./routes/users');
 const destRoutes  = require('./routes/destinations');
 const unitRoutes  = require('./routes/units');
+const roleRoutes  = require('./routes/roles');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -52,6 +53,7 @@ app.use('/auth',         authRoutes);
 app.use('/users',        userRoutes);
 app.use('/destinations', destRoutes);
 app.use('/units',        unitRoutes);
+app.use('/roles',        roleRoutes);
 
 /* ── 404 ──────────────────────────────────────────────────────── */
 app.use((_req, res) => {
