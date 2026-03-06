@@ -54,6 +54,28 @@ const migrations = [
   name: '006_add_rut_to_units',
   sql: `ALTER TABLE public.units ADD COLUMN IF NOT EXISTS rut VARCHAR(20);`
 },
+{
+  name: '007_create_clientes_table',
+  sql: `
+    CREATE TABLE IF NOT EXISTS public.clientes (
+      id         VARCHAR(36)  PRIMARY KEY,
+      nombre     VARCHAR(255) NOT NULL,
+      rut        VARCHAR(20),
+      token      VARCHAR(64)  UNIQUE NOT NULL,
+      enabled    BOOLEAN      DEFAULT true,
+      created_at TIMESTAMPTZ  DEFAULT now(),
+      updated_at TIMESTAMPTZ  DEFAULT now()
+    );
+  `
+},
+{
+  name: '008_add_cliente_id_to_units',
+  sql: `
+    ALTER TABLE public.units
+    ADD COLUMN IF NOT EXISTS cliente_id VARCHAR(36)
+    REFERENCES public.clientes(id) ON DELETE SET NULL;
+  `
+},
 ];
 
 async function runMigrations() {
