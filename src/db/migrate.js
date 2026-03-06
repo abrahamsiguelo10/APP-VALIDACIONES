@@ -9,6 +9,7 @@
 const { query } = require('./pool');
 
 const migrations = [
+  
   {
     name: '001_add_field_schema_to_destinations',
     sql: `
@@ -49,6 +50,10 @@ const migrations = [
     ADD COLUMN IF NOT EXISTS role_id TEXT REFERENCES public.roles(id) ON DELETE SET NULL;
   `
 },
+{
+  name: '006_add_rut_to_units',
+  sql: `ALTER TABLE public.units ADD COLUMN IF NOT EXISTS rut VARCHAR(20);`
+},
 ];
 
 async function runMigrations() {
@@ -79,5 +84,7 @@ async function runMigrations() {
 
   console.log('[migrate] Migraciones al día.');
 }
+
+
 
 module.exports = { runMigrations };
