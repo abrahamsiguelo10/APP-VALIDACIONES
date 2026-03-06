@@ -18,11 +18,13 @@ const cors    = require('cors');
 const { pool }          = require('./db/pool');
 const { runMigrations } = require('./db/migrate');
 
-const authRoutes  = require('./routes/auth');
-const userRoutes  = require('./routes/users');
-const destRoutes  = require('./routes/destinations');
-const unitRoutes  = require('./routes/units');
-const roleRoutes  = require('./routes/roles');
+const authRoutes      = require('./routes/auth');
+const userRoutes      = require('./routes/users');
+const destRoutes      = require('./routes/destinations');
+const unitRoutes      = require('./routes/units');
+const roleRoutes      = require('./routes/roles');
+const clienteRoutes   = require('./routes/clientes');
+const validadorRoutes = require('./routes/validador');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -54,6 +56,8 @@ app.use('/users',        userRoutes);
 app.use('/destinations', destRoutes);
 app.use('/units',        unitRoutes);
 app.use('/roles',        roleRoutes);
+app.use('/clientes',     clienteRoutes);
+app.use('/validador',    validadorRoutes);
 
 /* ── 404 ──────────────────────────────────────────────────────── */
 app.use((_req, res) => {
