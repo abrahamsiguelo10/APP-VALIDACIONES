@@ -85,4 +85,7 @@ async function start() {
   }
 }
 
+import gpsProxy from './routes/gps-proxy.js';
+app.use('/gps', gpsProxy);
+
 start();
