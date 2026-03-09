@@ -2,8 +2,8 @@
 // Proxía las llamadas a la API GPS de Skynav/integraciones para evitar CORS en el cliente.
 // Solo acepta peticiones autenticadas con token de cliente válido.
 
-import express from 'express';
-import fetch   from 'node-fetch';
+const express = require('express');
+const fetch   = require('node-fetch');
 
 const router = express.Router();
 
@@ -47,4 +47,4 @@ router.get('/:endpoint', async (req, res) => {
   }
 });
 
-export default router;
+module.exports = router;
