@@ -76,6 +76,13 @@ const migrations = [
     REFERENCES public.clientes(id) ON DELETE SET NULL;
   `
 },
+{
+  name: '009_add_password_hash_to_clientes',
+  sql: `
+    ALTER TABLE public.clientes
+    ADD COLUMN IF NOT EXISTS password_hash TEXT;
+  `
+},
 ];
 
 async function runMigrations() {
