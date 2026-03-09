@@ -75,7 +75,7 @@ router.get('/me/units', async (req, res) => {
   const { rows } = await query(
     `SELECT imei, plate, rut, created_at
      FROM public.units
-     WHERE cliente_id = $1
+     WHERE cliente_id = $1 AND enabled = true
      ORDER BY plate ASC`,
     [payload.sub]
   );
