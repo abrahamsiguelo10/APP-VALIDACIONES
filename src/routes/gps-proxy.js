@@ -3,7 +3,6 @@
 // Solo acepta peticiones autenticadas con token de cliente válido.
 
 const express = require('express');
-const fetch   = require('node-fetch');
 
 const router = express.Router();
 
