@@ -91,7 +91,89 @@ router.post('/logout', async (req, res) => {
   return res.json({ ok: true });
 });
 
-/* ── PATCH /auth/me ───────────────────────────────────────────── */
+/* ── GET /auth/users  (solo admin) ───────────────────────────── */
+router.get('/users', requireAuth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Acceso denegado.' });
+  const { rows } = await query(
+    'SELECT id, username, role, enabled FROM public.users ORDER BY id ASC'
+  );
+  return res.json(rows);
+});
+
+/* ── PATCH /auth/users/:id  (solo admin) ─────────────────────── */
+// Permite al admin cambiar username, contraseña y estado de cualquier usuario.
+router.patch('/users/:id', requireAuth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Acceso denegado.' });
+
+  const targetId = parseInt(req.params.id);
+  const { username, newPassword, enabled } = req.body;
+
+  const { rows } = await query('SELECT id, username, role FROM public.users WHERE id = $1', [targetId]);
+  const user = rows[0];
+  if (!user) return res.status(404).json({ error: 'Usuario no encontrado.' });
+
+  const updates = [];
+  const values  = [];
+  let idx = 1;
+
+  if (username !== undefined) {
+    const newName = username.trim().toLowerCase();
+    if (newName.length < 3) return res.status(400).json({ error: 'El usuario debe tener al menos 3 caracteres.' });
+    const { rows: ex } = await query(
+      'SELECT id FROM public.users WHERE username = $1 AND id != $2',
+      [newName, targetId]
+    );
+    if (ex.length) return res.status(409).json({ error: 'Ese nombre de usuario ya está en uso.' });
+    updates.push(`username = $${idx++}`);
+    values.push(newName);
+  }
+
+  if (newPassword !== undefined && newPassword !== '') {
+    if (newPassword.length < 6) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres.' });
+    const hash = await bcrypt.hash(newPassword, 10);
+    updates.push(`password_hash = $${idx++}`);
+    values.push(hash);
+  }
+
+  if (enabled !== undefined) {
+    updates.push(`enabled = $${idx++}`);
+    values.push(!!enabled);
+  }
+
+  if (!updates.length) return res.status(400).json({ error: 'Nada que actualizar.' });
+
+  values.push(targetId);
+  const { rows: updated } = await query(
+    `UPDATE public.users SET ${updates.join(', ')} WHERE id = $${idx} RETURNING id, username, role, enabled`,
+    values
+  );
+
+  return res.json({ ok: true, user: updated[0] });
+});
+
+/* ── POST /auth/users  (solo admin — crear usuario) ──────────── */
+router.post('/users', requireAuth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Acceso denegado.' });
+
+  const { username, password, role = 'user' } = req.body;
+  if (!username || !password) return res.status(400).json({ error: 'Usuario y contraseña requeridos.' });
+  if (password.length < 6) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres.' });
+
+  const name = username.trim().toLowerCase();
+  const { rows: ex } = await query('SELECT id FROM public.users WHERE username = $1', [name]);
+  if (ex.length) return res.status(409).json({ error: 'Ese nombre de usuario ya está en uso.' });
+
+  const hash = await bcrypt.hash(password, 10);
+  const { rows } = await query(
+    `INSERT INTO public.users (username, password_hash, role, enabled)
+     VALUES ($1, $2, $3, true)
+     RETURNING id, username, role, enabled`,
+    [name, hash, role]
+  );
+  return res.status(201).json({ ok: true, user: rows[0] });
+});
+
+
 // Permite al usuario autenticado cambiar su username y/o contraseña.
 router.patch('/me', requireAuth, async (req, res) => {
   const { username, currentPassword, newPassword } = req.body;
