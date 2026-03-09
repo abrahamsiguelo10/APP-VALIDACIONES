@@ -3,6 +3,7 @@
 // Solo acepta peticiones autenticadas con token de cliente válido.
 
 const express = require('express');
+const { pool } = require('../db/pool');
 
 const router = express.Router();
 
@@ -22,8 +23,7 @@ router.get('/:endpoint', async (req, res) => {
   }
 
   // Verificar que el token es válido y que la patente pertenece al cliente
-  const db = req.app.locals.db;
-  const clienteRes = await db.query(
+  const clienteRes = await pool.query(
     `SELECT c.id FROM clientes c
      JOIN units u ON u.cliente_id = c.id
      WHERE c.token = $1 AND c.enabled = true AND UPPER(u.plate) = UPPER($2)
