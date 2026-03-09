@@ -30,7 +30,7 @@ router.get('/', async (req, res) => {
 
   let sql = `
     SELECT
-      u.imei, u.plate, u.name, u.rut, u.enabled,
+      u.imei, u.plate, u.name, u.rut, u.enabled, u.cliente_id,
       u.created_at, u.updated_at,
       COALESCE(
         json_agg(
@@ -65,7 +65,7 @@ router.get('/', async (req, res) => {
 router.get('/:imei', async (req, res) => {
   const { rows } = await query(
     `SELECT
-       u.imei, u.plate, u.name, u.rut, u.enabled, u.created_at, u.updated_at,
+       u.imei, u.plate, u.name, u.rut, u.enabled, u.cliente_id, u.created_at, u.updated_at,
        COALESCE(
          json_agg(
            json_build_object(
@@ -91,17 +91,17 @@ router.get('/:imei', async (req, res) => {
 
 /* ── POST /units ──────────────────────────────────────────────── */
 router.post('/', requireRole('admin'), async (req, res) => {
-  const { imei, plate, name, rut } = req.body;
+  const { imei, plate, name, rut, cliente_id } = req.body;
 
   if (!imei) return res.status(400).json({ error: 'imei es requerido.' });
 
   let rows;
   try {
     ({ rows } = await query(
-      `INSERT INTO public.units (imei, plate, name, rut)
-       VALUES ($1, $2, $3, $4)
-       RETURNING imei, plate, name, rut, enabled, created_at`,
-      [imei.trim(), plate?.trim() || null, name?.trim() || null, rut || null]
+      `INSERT INTO public.units (imei, plate, name, rut, cliente_id)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING imei, plate, name, rut, enabled, cliente_id, created_at`,
+      [imei.trim(), plate?.trim() || null, name?.trim() || null, rut || null, cliente_id || null]
     ));
   } catch (err) {
     if (err.code === '23505') {
@@ -124,23 +124,25 @@ router.post('/batch', requireRole('admin'), async (req, res) => {
   const chunk = units.slice(0, 1000);
 
   const valuePlaceholders = chunk.map((_, i) =>
-    `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${i * 4 + 4})`
+    `($${i * 5 + 1}, $${i * 5 + 2}, $${i * 5 + 3}, $${i * 5 + 4}, $${i * 5 + 5})`
   ).join(', ');
 
   const params = chunk.flatMap(u => [
     String(u.imei).trim(),
-    u.plate?.trim() || null,
-    u.name?.trim()  || null,
-    u.rut           || null,
+    u.plate?.trim()  || null,
+    u.name?.trim()   || null,
+    u.rut            || null,
+    u.cliente_id     || null,
   ]);
 
   await query(`
-    INSERT INTO public.units (imei, plate, name, rut)
+    INSERT INTO public.units (imei, plate, name, rut, cliente_id)
     VALUES ${valuePlaceholders}
     ON CONFLICT (imei) DO UPDATE SET
       plate      = EXCLUDED.plate,
       name       = EXCLUDED.name,
       rut        = EXCLUDED.rut,
+      cliente_id = EXCLUDED.cliente_id,
       updated_at = now()
   `, params);
 
@@ -168,7 +170,7 @@ router.delete('/batch', requireRole('admin'), async (req, res) => {
 /* ── PATCH /units/:imei ───────────────────────────────────────── */
 router.patch('/:imei', requireRole('admin'), async (req, res) => {
   const { imei } = req.params;
-  const { plate, name } = req.body;
+  const { plate, name, rut, cliente_id } = req.body;
 
   const { rows: before } = await query(
     'SELECT * FROM public.units WHERE imei = $1', [imei]
@@ -179,9 +181,10 @@ router.patch('/:imei', requireRole('admin'), async (req, res) => {
   const values  = [];
   let   i       = 1;
   
-  if (plate !== undefined) { updates.push(`plate = $${i++}`); values.push(plate?.trim() || null); }
-  if (name  !== undefined) { updates.push(`name  = $${i++}`); values.push(name?.trim()  || null); }
-  if (rut !== undefined) { updates.push(`rut = $${i++}`); values.push(rut || null); }
+  if (plate      !== undefined) { updates.push(`plate      = $${i++}`); values.push(plate?.trim() || null); }
+  if (name       !== undefined) { updates.push(`name       = $${i++}`); values.push(name?.trim()  || null); }
+  if (rut        !== undefined) { updates.push(`rut        = $${i++}`); values.push(rut || null); }
+  if (cliente_id !== undefined) { updates.push(`cliente_id = $${i++}`); values.push(cliente_id || null); }
   if (!updates.length) return res.status(400).json({ error: 'Nada que actualizar.' });
 
   updates.push(`updated_at = now()`);
