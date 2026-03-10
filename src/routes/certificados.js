@@ -115,4 +115,31 @@ router.patch('/:id/revalidar', requireAuth, requireRole('admin'), async (req, re
   }
 });
 
+/* DELETE /certificados/:id — solo si está vencido (admin) */
+router.delete('/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    // Verificar que esté vencido antes de eliminar
+    const { rows: check } = await query(
+      `SELECT estado, fecha_vencimiento FROM public.certificados WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!check.length) return res.status(404).json({ error: 'No encontrado.' });
+
+    const cert = check[0];
+    const vencido = cert.estado === 'vencido' ||
+      (cert.estado === 'vigente' && new Date(cert.fecha_vencimiento) < new Date());
+
+    if (!vencido) {
+      return res.status(400).json({ error: 'Solo se pueden eliminar certificados vencidos.' });
+    }
+
+    await query(`DELETE FROM public.certificados WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[cert DELETE]', err);
+    res.status(500).json({ error: 'Error al eliminar.' });
+  }
+});
+
+
 module.exports = router;
