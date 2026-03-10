@@ -94,3 +94,5 @@ router.patch('/:id/revalidar', requireAuth, requireRole('admin'), async (req, re
 });
 
 module.exports = router;
+
+
