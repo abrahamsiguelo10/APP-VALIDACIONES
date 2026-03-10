@@ -126,11 +126,12 @@ router.delete('/:id', requireAuth, requireRole('admin'), async (req, res) => {
     if (!check.length) return res.status(404).json({ error: 'No encontrado.' });
 
     const cert = check[0];
-    const vencido = cert.estado === 'vencido' ||
+    const eliminable = cert.estado === 'invalidado' ||
+      cert.estado === 'vencido' ||
       (cert.estado === 'vigente' && new Date(cert.fecha_vencimiento) < new Date());
 
-    if (!vencido) {
-      return res.status(400).json({ error: 'Solo se pueden eliminar certificados vencidos.' });
+    if (!eliminable) {
+      return res.status(400).json({ error: 'Solo se pueden eliminar certificados vencidos o invalidados.' });
     }
 
     await query(`DELETE FROM public.certificados WHERE id = $1`, [req.params.id]);
