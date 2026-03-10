@@ -26,6 +26,7 @@ const roleRoutes      = require('./routes/roles');
 const clienteRoutes   = require('./routes/clientes');
 const validadorRoutes = require('./routes/validador');
 const gpsProxyRoutes  = require('./routes/gps-proxy');
+const certRoutes      = require('./routes/certificados');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -51,40 +52,6 @@ app.get('/health', async (_req, res) => {
   }
 });
 
-app.get('/admin/system-info', async (req, res) => {
-  const auth = req.headers.authorization;
-  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'No autorizado.' });
-  try {
-    const jwt = require('jsonwebtoken');
-    const payload = jwt.verify(auth.slice(7), process.env.JWT_SECRET);
-    if (payload.role !== 'admin') return res.status(403).json({ error: 'Acceso denegado.' });
-  } catch { return res.status(401).json({ error: 'Sesión expirada.' }); }
-
-  try {
-    await pool.query('SELECT 1');
-    const { rows: counts } = await pool.query(`
-      SELECT
-        (SELECT COUNT(*) FROM public.units)        AS units,
-        (SELECT COUNT(*) FROM public.users)        AS users,
-        (SELECT COUNT(*) FROM public.clientes)     AS clientes
-    `);
-    res.json({
-      status:  'ok',
-      db:      'connected',
-      uptime:  Math.floor(process.uptime()),
-      version: process.env.npm_package_version || '1.0.0',
-      node:    process.version,
-      counts:  counts[0],
-      ts:      new Date().toISOString(),
-      env:     process.env.NODE_ENV || 'production',
-    });
-  } catch (e) {
-    res.status(503).json({ status: 'error', db: 'disconnected', uptime: Math.floor(process.uptime()) });
-  }
-});
-
-
-
 /* ── Rutas ────────────────────────────────────────────────────── */
 app.use('/auth',         authRoutes);
 app.use('/users',        userRoutes);
@@ -94,6 +61,7 @@ app.use('/roles',        roleRoutes);
 app.use('/clientes',     clienteRoutes);
 app.use('/validador',    validadorRoutes);
 app.use('/gps',          gpsProxyRoutes);
+app.use('/certificados', certRoutes);
 
 /* ── 404 ──────────────────────────────────────────────────────── */
 app.use((_req, res) => {
