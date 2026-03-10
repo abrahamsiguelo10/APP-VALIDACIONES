@@ -83,6 +83,28 @@ const migrations = [
     ADD COLUMN IF NOT EXISTS password_hash TEXT;
   `
 },
+{
+  name: '010_create_certificados_table',
+  sql: `
+    CREATE TABLE IF NOT EXISTS public.certificados (
+      id                UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+      patente           VARCHAR(20)  NOT NULL,
+      imei              VARCHAR(50)  NOT NULL,
+      empresa           VARCHAR(255),
+      rut_empresa       VARCHAR(20),
+      firmante          VARCHAR(255),
+      rut_firmante      VARCHAR(20),
+      fecha_emision     DATE         NOT NULL,
+      fecha_vencimiento DATE         NOT NULL,
+      validez_texto     VARCHAR(100),
+      estado            VARCHAR(20)  NOT NULL DEFAULT 'vigente',
+      invalidado_por    VARCHAR(100),
+      invalidado_at     TIMESTAMPTZ,
+      emitido_por       VARCHAR(100),
+      created_at        TIMESTAMPTZ  DEFAULT now()
+    );
+  `
+},
 ];
 
 async function runMigrations() {
