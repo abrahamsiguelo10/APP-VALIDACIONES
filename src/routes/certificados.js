@@ -42,6 +42,28 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res) => {
   }
 });
 
+/* GET /certificados/patente/:plate — último certificado por patente (PÚBLICO) */
+router.get('/patente/:plate', async (req, res) => {
+  try {
+    const plate = req.params.plate.toUpperCase();
+    const { rows } = await query(
+      `SELECT * FROM public.certificados
+       WHERE UPPER(patente) = $1
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [plate]
+    );
+    if (!rows.length) return res.status(404).json({ encontrado: false });
+    const c = rows[0];
+    let estado = c.estado;
+    if (estado === 'vigente' && new Date(c.fecha_vencimiento) < new Date()) estado = 'vencido';
+    res.json({ ...c, estado });
+  } catch (err) {
+    console.error('[cert GET /patente]', err);
+    res.status(500).json({ error: 'Error al buscar certificado.' });
+  }
+});
+
 /* GET /certificados/:id — verificación PÚBLICA */
 router.get('/:id', async (req, res) => {
   try {
@@ -94,5 +116,3 @@ router.patch('/:id/revalidar', requireAuth, requireRole('admin'), async (req, re
 });
 
 module.exports = router;
-
-
