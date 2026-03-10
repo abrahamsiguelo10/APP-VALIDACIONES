@@ -38,8 +38,6 @@ router.get('/admin', async (req, res) => {
   }
 });
 
-module.exports = router;
-
 // GET /gps/unit-status?token=xxx&plate=yyy
 // GET /gps/last-responses?token=xxx&plate=yyy
 router.get('/:endpoint', async (req, res) => {
