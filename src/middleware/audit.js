@@ -1,33 +1,38 @@
-/**
- * middleware/audit.js
- * Registra acciones importantes en public.audit_log.
- * Usar como función helper, no como middleware global.
- */
+// middleware/audit.js
+// Registra acciones importantes en la tabla audit_log
 
-const { query } = require('../db/pool');
+const { pool } = require('../db/pool');
 
-/**
- * log({ req, action, target, before, after })
- */
-async function log({ req, action, target = null, before = null, after = null }) {
+async function log({ req, action, target, before, after }) {
   try {
-    await query(
+    // Protección defensiva — req puede llegar parcial
+    const headers = req?.headers || {};
+    const ip = headers['x-forwarded-for']?.split(',')[0]?.trim()
+      || req?.ip
+      || req?.socket?.remoteAddress
+      || 'unknown';
+
+    const userId   = req?.user?.id       || req?.user?.sub || null;
+    const username = req?.user?.username || req?.user?.rut || null;
+    const role     = req?.user?.role     || req?.user?.tipo || null;
+
+    await pool.query(
       `INSERT INTO public.audit_log
-         (actor, role, action, target, before_json, after_json, ip, user_agent)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+         (action, target, before_data, after_data, user_id, username, role, ip, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now())`,
       [
-        req.user?.username ?? 'sistema',
-        req.user?.role     ?? 'system',
         action,
-        target,
-        before ? JSON.stringify(before) : null,
-        after  ? JSON.stringify(after)  : null,
-        req.ip ?? req.headers['x-forwarded-for'] ?? null,
-        req.headers['user-agent'] ?? null,
+        target   || null,
+        before   ? JSON.stringify(before) : null,
+        after    ? JSON.stringify(after)  : null,
+        userId,
+        username,
+        role,
+        ip,
       ]
     );
   } catch (err) {
-    // No cortar el flujo si el log falla
+    // No dejar que un fallo de audit rompa la petición principal
     console.error('[audit] Error al registrar:', err.message);
   }
 }
