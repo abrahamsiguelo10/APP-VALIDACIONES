@@ -29,8 +29,14 @@ router.get('/admin', async (req, res) => {
       fetch(`${GPS_BASE}/api/unit-status?plate=${encodeURIComponent(plate.toUpperCase())}`, { headers: { Accept: 'application/json' } }),
       fetch(`${GPS_BASE}/api/last-responses?plate=${encodeURIComponent(plate.toUpperCase())}`, { headers: { Accept: 'application/json' } }),
     ]);
-    const status    = await statusRes.json();
-    const responses = await responsesRes.json();
+    // Parsear con manejo de cuerpo vacío o malformado
+    const parseOrNull = async (r) => {
+      const text = await r.text();
+      if (!text || !text.trim()) return null;
+      try { return JSON.parse(text); } catch { return null; }
+    };
+    const status    = await parseOrNull(statusRes);
+    const responses = await parseOrNull(responsesRes);
     res.json({ status, responses });
   } catch (e) {
     console.error('[gps-proxy/admin] error:', e.message);
@@ -67,7 +73,13 @@ router.get('/:endpoint', async (req, res) => {
   try {
     const url = `${GPS_BASE}/api/${endpoint}?plate=${encodeURIComponent(plate.toUpperCase())}`;
     const gpsRes = await fetch(url, { headers: { 'Accept': 'application/json' } });
-    const data = await gpsRes.json();
+    const text = await gpsRes.text();
+    if (!text || !text.trim()) {
+      return res.status(502).json({ error: 'El servidor GPS no devolvió datos.' });
+    }
+    let data;
+    try { data = JSON.parse(text); }
+    catch { return res.status(502).json({ error: 'Respuesta inválida del servidor GPS.' }); }
     res.status(gpsRes.status).json(data);
   } catch (e) {
     console.error('[gps-proxy] error:', e.message);
