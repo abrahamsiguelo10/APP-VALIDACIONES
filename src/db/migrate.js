@@ -105,6 +105,29 @@ const migrations = [
     );
   `
 },
+  {
+    name: '011_create_gps_events_table',
+    sql: `
+      CREATE TABLE IF NOT EXISTS public.gps_events (
+        id             BIGSERIAL    PRIMARY KEY,
+        plate          VARCHAR(20)  NOT NULL,
+        imei           VARCHAR(50),
+        lat            NUMERIC(11,7),
+        lon            NUMERIC(11,7),
+        speed          NUMERIC(6,1),
+        heading        SMALLINT,
+        ignition       BOOLEAN,
+        wialon_ts      TIMESTAMPTZ,
+        received_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        destination_id TEXT,
+        forward_ok     BOOLEAN,
+        forward_resp   TEXT,
+        raw_hex        TEXT
+      );
+      CREATE INDEX IF NOT EXISTS gps_events_plate_received_idx
+        ON public.gps_events (plate, received_at DESC);
+    `
+  },
 ];
 
 async function runMigrations() {
