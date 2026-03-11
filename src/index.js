@@ -18,6 +18,8 @@ const cors    = require('cors');
 const { pool }          = require('./db/pool');
 const { runMigrations } = require('./db/migrate');
 
+const { startTcpServer } = require('./tcp-server');
+
 const authRoutes      = require('./routes/auth');
 const userRoutes      = require('./routes/users');
 const destRoutes      = require('./routes/destinations');
@@ -83,6 +85,12 @@ app.use((err, _req, res, _next) => {
 async function start() {
   try {
     await runMigrations();
+
+    // Arrancar servidor TCP Wialon Retranslator (si está habilitado)
+    if (process.env.TCP_ENABLED !== 'false') {
+      startTcpServer();
+    }
+
     app.listen(PORT, () => {
       console.log(`✓ Síguelo API escuchando en puerto ${PORT}`);
       console.log(`  NODE_ENV: ${process.env.NODE_ENV ?? 'development'}`);
