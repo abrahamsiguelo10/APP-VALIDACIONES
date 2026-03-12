@@ -81,6 +81,9 @@ app.use((err, _req, res, _next) => {
   });
 });
 
+const adminRoutes = require('./routes/admin');  // import
+app.use('/admin', adminRoutes);                 // montaje
+
 /* ── Arranque ─────────────────────────────────────────────────── */
 async function start() {
   try {
