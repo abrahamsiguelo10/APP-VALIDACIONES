@@ -19,15 +19,25 @@ console.log(`[gps-proxy] Modo: ${GPS_SOURCE.toUpperCase()}`);
 // ── Local: estado de transmisión ──────────────────────────────────
 
 async function getUnitStatusLocal(plate) {
+  // Query única: último evento TCP + imei + nombres de destinos asignados
   const { rows } = await pool.query(
     `SELECT
        e.received_at,
        e.wialon_ts,
        EXTRACT(EPOCH FROM (now() - e.received_at)) / 60 AS age_minutes,
        u.imei,
-       u.destinations
+       COALESCE(
+         (SELECT array_agg(d.name ORDER BY d.name)
+          FROM public.destinations d
+          WHERE d.id::text IN (
+            SELECT elem->>'destination_id'
+            FROM jsonb_array_elements(COALESCE(u.destinations, '[]'::jsonb)) AS elem
+            WHERE elem->>'destination_id' IS NOT NULL
+          )
+         ), ARRAY[]::text[]
+       ) AS target_names
      FROM public.gps_events e
-     LEFT JOIN public.units u ON UPPER(u.plate) = UPPER(e.plate)
+     JOIN public.units u ON UPPER(u.plate) = UPPER(e.plate)
      WHERE UPPER(e.plate) = UPPER($1)
      ORDER BY e.received_at DESC
      LIMIT 1`,
@@ -35,15 +45,23 @@ async function getUnitStatusLocal(plate) {
   );
 
   if (!rows.length) {
-    // No hay eventos TCP, pero igual buscamos la unidad para devolver imei/targets
+    // Sin eventos TCP — igual buscar unidad para imei/targets
     const { rows: uRows } = await pool.query(
-      `SELECT u.imei, u.destinations,
-              array_agg(d.name) FILTER (WHERE d.name IS NOT NULL) AS target_names
+      `SELECT
+         u.imei,
+         COALESCE(
+           (SELECT array_agg(d.name ORDER BY d.name)
+            FROM public.destinations d
+            WHERE d.id::text IN (
+              SELECT elem->>'destination_id'
+              FROM jsonb_array_elements(COALESCE(u.destinations, '[]'::jsonb)) AS elem
+              WHERE elem->>'destination_id' IS NOT NULL
+            )
+           ), ARRAY[]::text[]
+         ) AS target_names
        FROM public.units u
-       LEFT JOIN public.destinations d
-         ON d.id::text = ANY(SELECT jsonb_array_elements_text(u.destinations))
        WHERE UPPER(u.plate) = UPPER($1)
-       GROUP BY u.imei, u.destinations`,
+       LIMIT 1`,
       [plate]
     );
     return {
@@ -51,36 +69,20 @@ async function getUnitStatusLocal(plate) {
       tcpLastAt:           null,
       tcpAgeMinutes:       null,
       activeWindowMinutes: TX_ACTIVE_MINUTES,
-      imei:                uRows[0]?.imei   || null,
+      imei:                uRows[0]?.imei        || null,
       targets:             uRows[0]?.target_names || [],
     };
   }
 
   const r      = rows[0];
   const ageMin = parseFloat(r.age_minutes);
-
-  // Resolver nombres de destinos desde el array de IDs en units.destinations
-  let targets = [];
-  if (r.destinations && Array.isArray(r.destinations) && r.destinations.length) {
-    const ids = r.destinations.map(d =>
-      typeof d === 'object' ? (d.destination_id ?? d.id) : d
-    ).filter(Boolean);
-    if (ids.length) {
-      const { rows: dRows } = await pool.query(
-        `SELECT name FROM public.destinations WHERE id::text = ANY($1)`,
-        [ids.map(String)]
-      );
-      targets = dRows.map(d => d.name);
-    }
-  }
-
   return {
     isTransmitting:      ageMin <= TX_ACTIVE_MINUTES,
     tcpLastAt:           r.received_at,
     tcpAgeMinutes:       parseFloat(ageMin.toFixed(1)),
     activeWindowMinutes: TX_ACTIVE_MINUTES,
-    imei:                r.imei   || null,
-    targets,
+    imei:                r.imei        || null,
+    targets:             r.target_names || [],
   };
 }
 
