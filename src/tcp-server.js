@@ -5,34 +5,30 @@
  * ─────────────────────────────────────────────────────────────────
  * Servidor TCP — protocolo Wialon Retranslator binario.
  *
- * Se detectaron DOS formatos de paquete en producción:
+ * Se detectaron DOS tipos de paquete en producción:
  *
- * TIPO A — magic 0x00 0x02 (estándar documentado)
- *   [0-1]   Magic: 0x00 0x02
- *   [2-5]   MsgLen  (uint32 LE)
- *   [6-9]   Timestamp (uint32 LE)
- *   [10-13] Flags / señal
- *   [14+]   UnitId  null-terminated ASCII
- *   [pos+0] Lat     (int32 LE, grados × 1e7)
- *   [pos+4] Lon     (int32 LE, grados × 1e7)
- *   [pos+8] Speed   (uint16 LE, km/h)
- *   [pos+10] Heading (uint16 LE, grados)
- *   [pos+12] Flags  (bit0 = ignición)
+ * TIPO A — magic 0x00 0x02 (paquete GPS estándar Wialon Retranslator)
+ *   [0-1]    Magic: 0x00 0x02
+ *   [2-5]    MsgLen   (uint32 LE)
+ *   [6-9]    Timestamp (uint32 LE, unix epoch)
+ *   [10-13]  Flags / señal
+ *   [14+]    UnitId   null-terminated ASCII
+ *   [pos+0]  Lat      (int32 LE, grados × 1e7)
+ *   [pos+4]  Lon      (int32 LE, grados × 1e7)
+ *   [pos+8]  Speed    (uint16 LE, km/h)
+ *   [pos+10] Heading  (uint16 LE, grados 0-359)
+ *   [pos+12] Flags    (bit0 = ignición)
  *
- * TIPO B — cualquier otro magic (variante observada en campo)
+ * TIPO B — cualquier otro magic (telemetría CAN / atributos Wialon IPS)
  *   [0-3]   Header / type bytes (varía: 49 02, 7a 03, 74 04…)
- *   [4+]    UnitId  null-terminated ASCII  ← IMEI COMPLETO aquí
- *   [pos+0] Timestamp (uint32 LE)
- *   [pos+4] Lat     (int32 LE, grados × 1e7)
- *   [pos+8] Lon     (int32 LE, grados × 1e7)
- *   [pos+12] Speed  (uint16 LE, km/h)
- *   [pos+14] Heading (uint16 LE)
- *   [pos+16] Flags  (bit0 = ignición)
+ *   [4+]    UnitId  null-terminated ASCII  ← IMEI COMPLETO
+ *   Resto:  atributos CAN/sensor en formato propietario — SIN datos GPS válidos
+ *   → Se extrae solo el unitId para identificar la unidad; lat/lon/speed = null
  *
  * Búsqueda de unidad en BD (orden de prioridad):
  *   1. IMEI exacto
  *   2. Patente exacta
- *   3. IMEI termina con el unitId recibido (sufijo Wialon)
+ *   3. IMEI termina con el unitId recibido (Wialon a veces envía sufijo)
  * ─────────────────────────────────────────────────────────────────
  */
 
@@ -51,13 +47,16 @@ function parseWialonPacket(buf) {
     return isTypeA ? parseTypeA(buf) : parseTypeB(buf);
 
   } catch (e) {
-    console.error('[tcp] Error parseando paquete:', e.message,
+    console.error('[tcp] Error parseando:', e.message,
       '— hex:', buf.toString('hex').slice(0, 60));
     return null;
   }
 }
 
-/** Tipo A: magic 0x00 0x02 — protocolo estándar Wialon Retranslator */
+/**
+ * Tipo A: magic 0x00 0x02 — GPS estándar Wialon Retranslator.
+ * Contiene coordenadas lat/lon/speed/heading válidas.
+ */
 function parseTypeA(buf) {
   if (buf.length < 14) return null;
 
@@ -69,6 +68,7 @@ function parseTypeA(buf) {
   const posStart = idEnd + 1;
 
   if (buf.length < posStart + 13) {
+    // Heartbeat sin posición
     return { unitId, ts, lat: null, lon: null, speed: null,
              heading: null, ignition: null, raw: buf.toString('hex') };
   }
@@ -78,48 +78,55 @@ function parseTypeA(buf) {
   const speed   = buf.readUInt16LE(posStart + 8);
   const heading = buf.readUInt16LE(posStart + 10);
   const flags   = buf[posStart + 12];
+  const ignition = !!(flags & 0x01);
 
-  return buildResult(unitId, ts, latRaw, lonRaw, speed, heading, flags, buf, 'A');
+  const lat = latRaw / 1e7;
+  const lon = lonRaw / 1e7;
+
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+    console.warn(`[tcp][TipoA] Coords fuera de rango: lat:${lat} lon:${lon} — unitId:${unitId}`);
+    return { unitId, ts, lat: null, lon: null, speed, heading, ignition,
+             raw: buf.toString('hex') };
+  }
+
+  // Validar speed y heading
+  const speedOk   = speed >= 0 && speed <= 300;
+  const headingOk = heading >= 0 && heading <= 360;
+  console.log(`[tcp][TipoA] OK: ${unitId} lat:${lat} lon:${lon} speed:${speed}${!speedOk?' (inválida)':''}`);
+  return {
+    unitId, ts,
+    lat, lon,
+    speed:   speedOk   ? speed   : null,
+    heading: headingOk ? heading : null,
+    ignition,
+    raw: null,
+  };
 }
 
-/** Tipo B: magic distinto — IMEI desde byte 4, timestamp antes de lat/lon */
+/**
+ * Tipo B: magic distinto — paquete de telemetría CAN / atributos Wialon IPS.
+ * El IMEI viene desde el byte 4, pero el resto del payload NO contiene
+ * datos GPS interpretables — solo se extrae el unitId para registrar
+ * actividad del dispositivo.
+ */
 function parseTypeB(buf) {
   if (buf.length < 8) return null;
 
   let idEnd = 4;
   while (idEnd < buf.length && buf[idEnd] !== 0x00) idEnd++;
-  const unitId   = buf.slice(4, idEnd).toString('utf8').trim();
-  const posStart = idEnd + 1;
+  const unitId = buf.slice(4, idEnd).toString('utf8').trim();
 
-  if (buf.length < posStart + 13) {
-    return { unitId, ts: null, lat: null, lon: null, speed: null,
-             heading: null, ignition: null, raw: buf.toString('hex') };
-  }
-
-  const ts      = buf.readUInt32LE(posStart);
-  const latRaw  = buf.readInt32LE(posStart + 4);
-  const lonRaw  = buf.readInt32LE(posStart + 8);
-  const speed   = buf.readUInt16LE(posStart + 12);
-  const heading = (buf.length >= posStart + 16) ? buf.readUInt16LE(posStart + 14) : 0;
-  const flags   = (buf.length >= posStart + 17) ? buf[posStart + 16] : 0;
-
-  return buildResult(unitId, ts, latRaw, lonRaw, speed, heading, flags, buf, 'B');
-}
-
-/** Valida coordenadas y construye el objeto resultado */
-function buildResult(unitId, ts, latRaw, lonRaw, speed, heading, flags, buf, tipo) {
-  const ignition = !!(flags & 0x01);
-  const lat      = latRaw / 1e7;
-  const lon      = lonRaw / 1e7;
-
-  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
-    console.warn(`[tcp][Tipo${tipo}] Coords fuera de rango: lat:${lat} lon:${lon} — unitId:${unitId}`);
-    return { unitId, ts, lat: null, lon: null, speed, heading, ignition,
-             raw: buf.toString('hex') };
-  }
-
-  console.log(`[tcp][Tipo${tipo}] Parseado OK: ${unitId} lat:${lat} lon:${lon} speed:${speed}`);
-  return { unitId, ts, lat, lon, speed, heading, ignition, raw: null };
+  console.log(`[tcp][TipoB] Telemetría CAN: unitId:${unitId} (sin GPS)`);
+  return {
+    unitId,
+    ts:       Math.floor(Date.now() / 1000),  // timestamp de recepción
+    lat:      null,
+    lon:      null,
+    speed:    null,
+    heading:  null,
+    ignition: null,
+    raw:      buf.toString('hex'),
+  };
 }
 
 function buildAck() {
@@ -129,6 +136,7 @@ function buildAck() {
 // ── Buscar unidad en BD ───────────────────────────────────────────
 
 async function findUnit(unitId) {
+  if (!unitId) return null;
   const { rows } = await pool.query(
     `SELECT plate, imei FROM public.units
      WHERE UPPER(imei)  = UPPER($1)
@@ -163,16 +171,17 @@ async function saveEvent(parsed) {
       [
         plate, imei,
         parsed.lat, parsed.lon,
-        parsed.speed, parsed.heading, parsed.ignition,
+        parsed.speed, parsed.heading,
+        parsed.ignition,
         parsed.ts,
         parsed.raw,
       ]
     );
 
     const coords = parsed.lat != null
-      ? `lat:${parsed.lat} lon:${parsed.lon}`
-      : 'sin coords';
-    console.log(`[tcp] ✓ Guardado: ${plate} | ${coords} speed:${parsed.speed} ign:${parsed.ignition}`);
+      ? `lat:${parsed.lat} lon:${parsed.lon} speed:${parsed.speed} ign:${parsed.ignition}`
+      : 'sin GPS';
+    console.log(`[tcp] ✓ Guardado: ${plate} | ${coords}`);
     return plate;
 
   } catch (e) {
@@ -184,11 +193,11 @@ async function saveEvent(parsed) {
 // ── Reenviar a destinos ───────────────────────────────────────────
 
 async function forwardToDestinations(plate, parsed) {
+  // Solo reenviar si hay coordenadas GPS válidas
   if (!parsed.lat || !parsed.lon) return;
 
   let destinations = [];
   try {
-    // Buscar destinos asignados a la unidad
     const { rows } = await pool.query(
       `SELECT d.api_url, d.name
        FROM public.destinations d
@@ -232,9 +241,7 @@ async function forwardToDestinations(plate, parsed) {
     speed:     parsed.speed,
     heading:   parsed.heading,
     ignition:  parsed.ignition,
-    timestamp: parsed.ts
-      ? new Date(parsed.ts * 1000).toISOString()
-      : new Date().toISOString(),
+    timestamp: new Date(parsed.ts * 1000).toISOString(),
   };
 
   for (const dest of destinations) {
