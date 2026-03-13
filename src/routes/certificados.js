@@ -53,7 +53,7 @@ router.get('/patente/:plate', async (req, res) => {
        LIMIT 1`,
       [plate]
     );
-    if (!rows.length) return res.status(404).json({ encontrado: false });
+    if (!rows.length) return res.status(200).json({ encontrado: false });
     const c = rows[0];
     let estado = c.estado;
     if (estado === 'vigente' && new Date(c.fecha_vencimiento) < new Date()) estado = 'vencido';
