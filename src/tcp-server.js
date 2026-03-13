@@ -119,11 +119,19 @@ function buildAck() {
 
 async function saveEvent(parsed) {
   try {
-    // Buscar patente en tabla units por IMEI o por el ID tal como viene
-    // unitId puede ser IMEI o patente según config del retranslador en Wialon
+    // Buscar unit por:
+    //   1. IMEI exacto
+    //   2. Patente exacta
+    //   3. IMEI termina con el unitId recibido (Wialon a veces envía los últimos N dígitos)
     const { rows } = await pool.query(
       `SELECT plate, imei FROM public.units
-       WHERE UPPER(imei) = UPPER($1) OR UPPER(plate) = UPPER($1)
+       WHERE UPPER(imei)  = UPPER($1)
+          OR UPPER(plate) = UPPER($1)
+          OR (LENGTH($1) >= 4 AND imei LIKE '%' || $1)
+       ORDER BY
+         CASE WHEN UPPER(imei)  = UPPER($1) THEN 0
+              WHEN UPPER(plate) = UPPER($1) THEN 1
+              ELSE 2 END
        LIMIT 1`,
       [parsed.unitId]
     );
