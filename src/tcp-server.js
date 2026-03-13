@@ -3,32 +3,30 @@
 /**
  * src/tcp-server.js
  * ─────────────────────────────────────────────────────────────────
- * Servidor TCP — protocolo Wialon Retranslator binario.
+ * Servidor TCP — protocolo Wialon Retranslator (especificación oficial).
  *
- * Se detectaron DOS tipos de paquete en producción:
+ * Estructura del paquete:
+ *   [0-3]    Packet size  (uint32 LITTLE-ENDIAN, excluye este campo)
+ *   [4+]     UID          null-terminated ASCII string
+ *   [pos+0]  Timestamp    (uint32 BIG-ENDIAN, unix epoch UTC)
+ *   [pos+4]  Bitmask      (uint32 BIG-ENDIAN)
+ *   [pos+8+] Bloques de datos (mientras queden bytes)
  *
- * TIPO A — magic 0x00 0x02 (paquete GPS estándar Wialon Retranslator)
- *   [0-1]    Magic: 0x00 0x02
- *   [2-5]    MsgLen   (uint32 LE)
- *   [6-9]    Timestamp (uint32 LE, unix epoch)
- *   [10-13]  Flags / señal
- *   [14+]    UnitId   null-terminated ASCII
- *   [pos+0]  Lat      (int32 LE, grados × 1e7)
- *   [pos+4]  Lon      (int32 LE, grados × 1e7)
- *   [pos+8]  Speed    (uint16 LE, km/h)
- *   [pos+10] Heading  (uint16 LE, grados 0-359)
- *   [pos+12] Flags    (bit0 = ignición)
+ * Estructura de cada bloque:
+ *   [0-1]  Block type   uint16 BE  (siempre 0x0BBB)
+ *   [2-5]  Block size   uint32 BE  (excluye type y este campo)
+ *   [6]    Stealth      byte
+ *   [7]    Data type    byte       (0x01=string 0x02=binary 0x03=int 0x04=double 0x05=long)
+ *   [8+]   Block name   null-terminated ASCII
+ *   [n+]   Value        según data type
  *
- * TIPO B — cualquier otro magic (telemetría CAN / atributos Wialon IPS)
- *   [0-3]   Header / type bytes (varía: 49 02, 7a 03, 74 04…)
- *   [4+]    UnitId  null-terminated ASCII  ← IMEI COMPLETO
- *   Resto:  atributos CAN/sensor en formato propietario — SIN datos GPS válidos
- *   → Se extrae solo el unitId para identificar la unidad; lat/lon/speed = null
- *
- * Búsqueda de unidad en BD (orden de prioridad):
- *   1. IMEI exacto
- *   2. Patente exacta
- *   3. IMEI termina con el unitId recibido (Wialon a veces envía sufijo)
+ * Bloque posinfo (data type 0x02, nombre "posinfo"):
+ *   [0-7]   Longitude  double LITTLE-ENDIAN
+ *   [8-15]  Latitude   double LITTLE-ENDIAN
+ *   [16-23] Altitude   double LITTLE-ENDIAN
+ *   [24-25] Speed      uint16 BIG-ENDIAN  (km/h)
+ *   [26-27] Course     uint16 BIG-ENDIAN  (0-359°)
+ *   [28]    Satellites byte
  * ─────────────────────────────────────────────────────────────────
  */
 
@@ -37,100 +35,109 @@ const { pool } = require('./db/pool');
 
 const TCP_PORT = parseInt(process.env.TCP_PORT || '9001', 10);
 
-// ── Parseo ────────────────────────────────────────────────────────
+// ── Parser principal ──────────────────────────────────────────────
 
 function parseWialonPacket(buf) {
   try {
-    if (buf.length < 10) return null;
+    if (buf.length < 14) return null;
 
-    const isTypeA = (buf[0] === 0x00 && buf[1] === 0x02);
-    return isTypeA ? parseTypeA(buf) : parseTypeB(buf);
+    let pos = 0;
+
+    // Packet size (uint32 LE) — solo para validación
+    const pktSize = buf.readUInt32LE(pos); pos += 4;
+    if (pktSize === 0 || pktSize > 65536) {
+      console.warn('[tcp] Packet size inválido:', pktSize);
+      return null;
+    }
+
+    // UID null-terminated
+    let uidEnd = pos;
+    while (uidEnd < buf.length && buf[uidEnd] !== 0x00) uidEnd++;
+    const unitId = buf.slice(pos, uidEnd).toString('ascii').trim();
+    pos = uidEnd + 1;
+
+    if (!unitId) {
+      console.warn('[tcp] UID vacío, paquete ignorado');
+      return null;
+    }
+
+    if (buf.length < pos + 8) return null;
+
+    // Timestamp (uint32 BE)
+    const ts = buf.readUInt32BE(pos); pos += 4;
+
+    // Bitmask (uint32 BE)
+    const bitmask = buf.readUInt32BE(pos); pos += 4;
+
+    // Leer bloques buscando "posinfo"
+    let lat = null, lon = null, speed = null, heading = null, ignition = null;
+
+    while (pos + 6 < buf.length) {
+      const blkType = buf.readUInt16BE(pos); pos += 2;
+
+      if (blkType !== 0x0BBB) {
+        // Bloque desconocido — intentar saltar limpiamente
+        console.warn('[tcp] Block type inesperado:', '0x'+blkType.toString(16), '— saltando');
+        break;
+      }
+
+      const blkSize = buf.readUInt32BE(pos); pos += 4;
+      if (blkSize === 0 || pos + blkSize > buf.length) break;
+
+      const blk      = buf.slice(pos, pos + blkSize);
+      pos           += blkSize;
+
+      // stealth(1) + dataType(1) + name(null-term) + value
+      if (blk.length < 3) continue;
+      const dataType = blk[1];
+
+      let nameEnd = 2;
+      while (nameEnd < blk.length && blk[nameEnd] !== 0x00) nameEnd++;
+      const blockName = blk.slice(2, nameEnd).toString('ascii');
+      const valBuf    = blk.slice(nameEnd + 1);
+
+      if (blockName === 'posinfo' && dataType === 0x02) {
+        if (valBuf.length < 29) continue;
+
+        lon           = valBuf.readDoubleLE(0);
+        lat           = valBuf.readDoubleLE(8);
+        const alt     = valBuf.readDoubleLE(16);
+        speed         = valBuf.readUInt16BE(24);
+        heading       = valBuf.readUInt16BE(26);
+        const sats    = valBuf[28];
+
+        console.log(`[tcp] posinfo: lat:${lat} lon:${lon} alt:${alt} speed:${speed} course:${heading} sats:${sats}`);
+
+        // Validar coordenadas
+        if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+          console.warn('[tcp] Coordenadas fuera de rango, descartando');
+          lat = null; lon = null;
+        }
+        // Validar speed/heading
+        if (speed > 300)  speed   = null;
+        if (heading > 359) heading = null;
+
+      } else if (blockName === 'ign') {
+        // Ignición: integer 0x03 o double 0x04
+        if (dataType === 0x03 && valBuf.length >= 4) {
+          ignition = valBuf.readUInt32BE(0) === 1;
+        } else if (dataType === 0x04 && valBuf.length >= 8) {
+          ignition = valBuf.readDoubleLE(0) === 1;
+        }
+      }
+    }
+
+    return { unitId, ts, lat, lon, speed, heading, ignition, raw: lat == null ? buf.toString('hex') : null };
 
   } catch (e) {
-    console.error('[tcp] Error parseando:', e.message,
-      '— hex:', buf.toString('hex').slice(0, 60));
+    console.error('[tcp] Error parseando paquete:', e.message,
+      '— hex:', buf.toString('hex').slice(0, 80));
     return null;
   }
 }
 
-/**
- * Tipo A: magic 0x00 0x02 — GPS estándar Wialon Retranslator.
- * Contiene coordenadas lat/lon/speed/heading válidas.
- */
-function parseTypeA(buf) {
-  if (buf.length < 14) return null;
-
-  const ts = buf.readUInt32LE(6);
-
-  let idEnd = 14;
-  while (idEnd < buf.length && buf[idEnd] !== 0x00) idEnd++;
-  const unitId   = buf.slice(14, idEnd).toString('utf8').trim();
-  const posStart = idEnd + 1;
-
-  if (buf.length < posStart + 13) {
-    // Heartbeat sin posición
-    return { unitId, ts, lat: null, lon: null, speed: null,
-             heading: null, ignition: null, raw: buf.toString('hex') };
-  }
-
-  const latRaw  = buf.readInt32LE(posStart);
-  const lonRaw  = buf.readInt32LE(posStart + 4);
-  const speed   = buf.readUInt16LE(posStart + 8);
-  const heading = buf.readUInt16LE(posStart + 10);
-  const flags   = buf[posStart + 12];
-  const ignition = !!(flags & 0x01);
-
-  const lat = latRaw / 1e7;
-  const lon = lonRaw / 1e7;
-
-  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
-    console.warn(`[tcp][TipoA] Coords fuera de rango: lat:${lat} lon:${lon} — unitId:${unitId}`);
-    return { unitId, ts, lat: null, lon: null, speed, heading, ignition,
-             raw: buf.toString('hex') };
-  }
-
-  // Validar speed y heading
-  const speedOk   = speed >= 0 && speed <= 300;
-  const headingOk = heading >= 0 && heading <= 360;
-  console.log(`[tcp][TipoA] OK: ${unitId} lat:${lat} lon:${lon} speed:${speed}${!speedOk?' (inválida)':''}`);
-  return {
-    unitId, ts,
-    lat, lon,
-    speed:   speedOk   ? speed   : null,
-    heading: headingOk ? heading : null,
-    ignition,
-    raw: null,
-  };
-}
-
-/**
- * Tipo B: magic distinto — paquete de telemetría CAN / atributos Wialon IPS.
- * El IMEI viene desde el byte 4, pero el resto del payload NO contiene
- * datos GPS interpretables — solo se extrae el unitId para registrar
- * actividad del dispositivo.
- */
-function parseTypeB(buf) {
-  if (buf.length < 8) return null;
-
-  let idEnd = 4;
-  while (idEnd < buf.length && buf[idEnd] !== 0x00) idEnd++;
-  const unitId = buf.slice(4, idEnd).toString('utf8').trim();
-
-  console.log(`[tcp][TipoB] Telemetría CAN: unitId:${unitId} (sin GPS)`);
-  return {
-    unitId,
-    ts:       Math.floor(Date.now() / 1000),  // timestamp de recepción
-    lat:      null,
-    lon:      null,
-    speed:    null,
-    heading:  null,
-    ignition: null,
-    raw:      buf.toString('hex'),
-  };
-}
-
 function buildAck() {
-  return Buffer.from([0x11, 0x22, 0x33, 0x44]);
+  return Buffer.from([0x11]);
 }
 
 // ── Buscar unidad en BD ───────────────────────────────────────────
@@ -180,8 +187,8 @@ async function saveEvent(parsed) {
 
     const coords = parsed.lat != null
       ? `lat:${parsed.lat} lon:${parsed.lon} speed:${parsed.speed} ign:${parsed.ignition}`
-      : 'sin GPS';
-    console.log(`[tcp] ✓ Guardado: ${plate} | ${coords}`);
+      : 'sin GPS (telemetría)';
+    console.log(`[tcp] ✓ ${plate} | ${coords}`);
     return plate;
 
   } catch (e) {
@@ -193,7 +200,6 @@ async function saveEvent(parsed) {
 // ── Reenviar a destinos ───────────────────────────────────────────
 
 async function forwardToDestinations(plate, parsed) {
-  // Solo reenviar si hay coordenadas GPS válidas
   if (!parsed.lat || !parsed.lon) return;
 
   let destinations = [];
@@ -213,7 +219,6 @@ async function forwardToDestinations(plate, parsed) {
     );
     destinations = rows;
   } catch {
-    // Fallback: todos los destinos activos
     try {
       const { rows } = await pool.query(
         `SELECT api_url, name FROM public.destinations WHERE enabled = true`
@@ -249,12 +254,9 @@ async function forwardToDestinations(plate, parsed) {
     try {
       const res = await fetch(dest.api_url, {
         method:  'POST',
-        headers: {
-          'Content-Type':  'application/json',
-          'Authorization': `Bearer ${token}`,
-        },
-        body:   JSON.stringify(payload),
-        signal: AbortSignal.timeout(8000),
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body:    JSON.stringify(payload),
+        signal:  AbortSignal.timeout(8000),
       });
       console.log(`[tcp] → ${dest.name || dest.api_url}: ${res.status}`);
     } catch (e) {
@@ -274,8 +276,7 @@ function startTcpServer() {
 
     socket.on('data', async (chunk) => {
       buffer = Buffer.concat([buffer, chunk]);
-      // Log completo para diagnóstico de protocolo (máx 500 bytes = 1000 chars hex)
-      console.log(`[tcp] Buffer raw (${buffer.length}b): ${buffer.toString('hex').slice(0, 1000)}`);
+      console.log(`[tcp] Buffer (${buffer.length}b): ${buffer.toString('hex').slice(0, 200)}`);
 
       const parsed = parseWialonPacket(buffer);
       buffer = Buffer.alloc(0);
@@ -295,24 +296,17 @@ function startTcpServer() {
       }
     });
 
-    socket.on('error', (e) => {
-      console.error(`[tcp] Socket error (${remote}):`, e.message);
-    });
-
-    socket.on('close', () => {
-      console.log(`[tcp] Conexión cerrada: ${remote}`);
-    });
+    socket.on('error', (e) => console.error(`[tcp] Socket error (${remote}):`, e.message));
+    socket.on('close', () => console.log(`[tcp] Conexión cerrada: ${remote}`));
 
     socket.setTimeout(5 * 60 * 1000);
     socket.on('timeout', () => {
-      console.warn(`[tcp] Timeout inactividad: ${remote}`);
+      console.warn(`[tcp] Timeout: ${remote}`);
       socket.destroy();
     });
   });
 
-  server.on('error', (e) => {
-    console.error('[tcp] Error servidor TCP:', e.message);
-  });
+  server.on('error', (e) => console.error('[tcp] Error servidor TCP:', e.message));
 
   server.listen(TCP_PORT, '0.0.0.0', () => {
     console.log(`✓ TCP Wialon Retranslator escuchando en puerto ${TCP_PORT}`);
