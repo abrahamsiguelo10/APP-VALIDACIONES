@@ -29,7 +29,7 @@ const clienteRoutes   = require('./routes/clientes');
 const validadorRoutes = require('./routes/validador');
 const gpsProxyRoutes  = require('./routes/gps-proxy');
 const certRoutes      = require('./routes/certificados');
-
+const adminRoutes = require('./routes/admin'); 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
@@ -65,6 +65,9 @@ app.use('/validador',    validadorRoutes);
 app.use('/gps',          gpsProxyRoutes);
 app.use('/certificados', certRoutes);
 
+
+app.use('/admin', adminRoutes);                 // montaje
+
 /* ── 404 ──────────────────────────────────────────────────────── */
 app.use((_req, res) => {
   res.status(404).json({ error: 'Endpoint no encontrado.' });
@@ -81,8 +84,7 @@ app.use((err, _req, res, _next) => {
   });
 });
 
-const adminRoutes = require('./routes/admin');  // import
-app.use('/admin', adminRoutes);                 // montaje
+
 
 /* ── Arranque ─────────────────────────────────────────────────── */
 async function start() {
