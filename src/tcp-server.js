@@ -274,7 +274,8 @@ function startTcpServer() {
 
     socket.on('data', async (chunk) => {
       buffer = Buffer.concat([buffer, chunk]);
-      console.log(`[tcp] Buffer raw (${buffer.length}b): ${buffer.toString('hex').slice(0, 120)}`);
+      // Log completo para diagnóstico de protocolo (máx 500 bytes = 1000 chars hex)
+      console.log(`[tcp] Buffer raw (${buffer.length}b): ${buffer.toString('hex').slice(0, 1000)}`);
 
       const parsed = parseWialonPacket(buffer);
       buffer = Buffer.alloc(0);
