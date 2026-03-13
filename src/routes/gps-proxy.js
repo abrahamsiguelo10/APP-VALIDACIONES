@@ -19,23 +19,13 @@ console.log(`[gps-proxy] Modo: ${GPS_SOURCE.toUpperCase()}`);
 // ── Local: estado de transmisión ──────────────────────────────────
 
 async function getUnitStatusLocal(plate) {
-  // Query única: último evento TCP + imei + nombres de destinos asignados
+  // Último evento TCP
   const { rows } = await pool.query(
     `SELECT
        e.received_at,
        e.wialon_ts,
        EXTRACT(EPOCH FROM (now() - e.received_at)) / 60 AS age_minutes,
-       u.imei,
-       COALESCE(
-         (SELECT array_agg(d.name ORDER BY d.name)
-          FROM public.destinations d
-          WHERE d.id::text IN (
-            SELECT elem->>'destination_id'
-            FROM jsonb_array_elements(COALESCE(u.destinations, '[]'::jsonb)) AS elem
-            WHERE elem->>'destination_id' IS NOT NULL
-          )
-         ), ARRAY[]::text[]
-       ) AS target_names
+       u.imei
      FROM public.gps_events e
      JOIN public.units u ON UPPER(u.plate) = UPPER(e.plate)
      WHERE UPPER(e.plate) = UPPER($1)
@@ -44,33 +34,32 @@ async function getUnitStatusLocal(plate) {
     [plate]
   );
 
+  // Nombres de destinos asignados (tabla unit_destinations)
+  const { rows: dRows } = await pool.query(
+    `SELECT d.name
+     FROM public.unit_destinations ud
+     JOIN public.units u ON u.imei = ud.imei
+     JOIN public.destinations d ON d.id = ud.destination_id
+     WHERE UPPER(u.plate) = UPPER($1)
+     ORDER BY d.name`,
+    [plate]
+  ).catch(() => ({ rows: [] }));
+
+  const targets = dRows.map(r => r.name);
+
   if (!rows.length) {
-    // Sin eventos TCP — igual buscar unidad para imei/targets
+    // Sin eventos TCP — buscar imei igual
     const { rows: uRows } = await pool.query(
-      `SELECT
-         u.imei,
-         COALESCE(
-           (SELECT array_agg(d.name ORDER BY d.name)
-            FROM public.destinations d
-            WHERE d.id::text IN (
-              SELECT elem->>'destination_id'
-              FROM jsonb_array_elements(COALESCE(u.destinations, '[]'::jsonb)) AS elem
-              WHERE elem->>'destination_id' IS NOT NULL
-            )
-           ), ARRAY[]::text[]
-         ) AS target_names
-       FROM public.units u
-       WHERE UPPER(u.plate) = UPPER($1)
-       LIMIT 1`,
+      `SELECT imei FROM public.units WHERE UPPER(plate) = UPPER($1) LIMIT 1`,
       [plate]
-    );
+    ).catch(() => ({ rows: [] }));
     return {
       isTransmitting:      false,
       tcpLastAt:           null,
       tcpAgeMinutes:       null,
       activeWindowMinutes: TX_ACTIVE_MINUTES,
-      imei:                uRows[0]?.imei        || null,
-      targets:             uRows[0]?.target_names || [],
+      imei:                uRows[0]?.imei || null,
+      targets,
     };
   }
 
@@ -81,8 +70,8 @@ async function getUnitStatusLocal(plate) {
     tcpLastAt:           r.received_at,
     tcpAgeMinutes:       parseFloat(ageMin.toFixed(1)),
     activeWindowMinutes: TX_ACTIVE_MINUTES,
-    imei:                r.imei        || null,
-    targets:             r.target_names || [],
+    imei:                r.imei || null,
+    targets,
   };
 }
 
