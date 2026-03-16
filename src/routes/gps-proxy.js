@@ -217,6 +217,36 @@ async function authorizeGps(req, plate) {
 
   return { ok: false, status: 400, error: 'Faltan parámetros token y plate.' };
 }
+// ── GET /gps/destino-eventos?plate=&dest_id=&limit= ──────────────────────────
+// Historial de los últimos N envíos de una unidad a un destino específico.
+// Protegido con requireAdmin (igual que /admin).
+router.get('/destino-eventos', requireAdmin, async (req, res) => {
+  const { plate, dest_id, limit = 8 } = req.query;
+  if (!plate)    return res.status(400).json({ error: 'Falta plate.' });
+  if (!dest_id)  return res.status(400).json({ error: 'Falta dest_id.' });
+ 
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        e.received_at   AS at,
+        e.wialon_ts,
+        e.lat, e.lon, e.speed, e.heading, e.ignition,
+        e.forward_ok    AS ok,
+        e.forward_resp  AS response
+      FROM   public.gps_events e
+      JOIN   public.units u ON u.imei = e.imei
+      WHERE  UPPER(u.plate)     = UPPER($1)
+        AND  e.destination_id::text = $2
+      ORDER  BY e.received_at DESC
+      LIMIT  $3
+    `, [plate, dest_id, Math.min(parseInt(limit) || 8, 50)]);
+ 
+    res.json(rows);
+  } catch (e) {
+    console.error('[gps-proxy/destino-eventos] error:', e.message);
+    res.status(500).json({ error: 'Error consultando historial de destino.' });
+  }
+});
 
 // ── GET /gps/admin?plate=XXX  (solo admin JWT) ────────────────────
 
