@@ -1,13 +1,9 @@
 // src/db/migrate.js
-// Migraciones 001-013. Las nuevas son 012 (driver_slug) y 013 (auth).
-// Las migraciones existentes (001-011) se conservan idénticas.
+// Usa pool.js (pg directo con DATABASE_URL) — igual que el resto del proyecto.
+// Las migraciones 001-011 son idénticas a las ya aplicadas en producción.
+// Las nuevas son 012 (driver_slug) y 013 (auth).
 
-const { createClient } = require('@supabase/supabase-js');
-
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+const { query } = require('./pool');
 
 const migrations = [
   {
@@ -103,26 +99,25 @@ const migrations = [
   {
     name: '012_add_driver_slug_to_destinations',
     sql: `ALTER TABLE public.destinations
-          ADD COLUMN IF NOT EXISTS driver_slug TEXT DEFAULT NULL;
-          -- Poblar driver_slug para destinos cuyos nombres coinciden con slugs conocidos
+            ADD COLUMN IF NOT EXISTS driver_slug TEXT DEFAULT NULL;
           UPDATE public.destinations
-          SET driver_slug = name
-          WHERE driver_slug IS NULL
-            AND name IN ('byduarte','cala','drivin','bermann','skynav','skyangel',
-                         'tranciti','sitrack','startsee','pegasus','unigis','qmgps',
-                         'drivetech','ziyu','i-dux','tmsfalabella','antucoya',
-                         'centinela','pelambres');`
+            SET driver_slug = name
+            WHERE driver_slug IS NULL
+              AND name IN ('byduarte','cala','drivin','bermann','skynav','skyangel',
+                           'tranciti','sitrack','startsee','pegasus','unigis','qmgps',
+                           'drivetech','ziyu','i-dux','tmsfalabella','antucoya',
+                           'centinela','pelambres');`
   },
   {
     name: '013_add_auth_to_destinations',
     sql: `ALTER TABLE public.destinations
-          ADD COLUMN IF NOT EXISTS auth JSONB DEFAULT NULL;`
+            ADD COLUMN IF NOT EXISTS auth JSONB DEFAULT NULL;`
     /*
-      Estructura esperada del campo auth:
-        null                         → sin autenticación
-        { type: "bearer", token }    → Authorization: Bearer <token>
-        { type: "basic", username, password } → Authorization: Basic base64(u:p)
-        { type: "apikey", header, value }     → <header>: <value>
+      Estructura de auth:
+        null                                          → sin autenticación
+        { type:"bearer", token }                      → Authorization: Bearer <token>
+        { type:"basic",  username, password }         → Authorization: Basic base64(u:p)
+        { type:"apikey", header, value }              → <header>: <value>
     */
   },
 ];
@@ -131,39 +126,34 @@ async function runMigrations() {
   console.log('🔄 Ejecutando migraciones...');
 
   // Crear tabla de control si no existe
-  await supabase.rpc('exec_sql', {
-    sql: `CREATE TABLE IF NOT EXISTS public._migrations (
-            name       TEXT PRIMARY KEY,
-            applied_at TIMESTAMPTZ DEFAULT now()
-          );`
-  }).catch(() => {
-    // Si exec_sql no existe, usamos el cliente directo (Supabase v2)
-  });
+  await query(`
+    CREATE TABLE IF NOT EXISTS public._migrations (
+      name       TEXT PRIMARY KEY,
+      applied_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
 
   for (const migration of migrations) {
     // Verificar si ya fue aplicada
-    const { data: existing } = await supabase
-      .from('_migrations')
-      .select('name')
-      .eq('name', migration.name)
-      .single();
+    const { rows } = await query(
+      'SELECT name FROM public._migrations WHERE name = $1',
+      [migration.name]
+    );
 
-    if (existing) {
+    if (rows.length > 0) {
       console.log(`  ✓ ${migration.name} (ya aplicada)`);
       continue;
     }
 
     try {
-      // Ejecutar SQL via rpc o directamente
-      const { error } = await supabase.rpc('exec_sql', { sql: migration.sql });
-      if (error) throw error;
-
-      // Registrar migración
-      await supabase.from('_migrations').insert({ name: migration.name });
+      await query(migration.sql);
+      await query(
+        'INSERT INTO public._migrations (name) VALUES ($1)',
+        [migration.name]
+      );
       console.log(`  ✅ ${migration.name}`);
     } catch (err) {
       console.error(`  ❌ ${migration.name}: ${err.message}`);
-      // No abortar — las siguientes migraciones pueden ser independientes
     }
   }
 
