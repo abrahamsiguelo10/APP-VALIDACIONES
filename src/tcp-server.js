@@ -234,6 +234,7 @@ function startTcpServer() {
           if (!unit.enabled) { console.log(`[TCP] ${unit.plate} deshabilitada`); continue; }
 
           await forwardToDestinations(unit, parsed);
+          console.log(`[TCP] RAW from ${sessionImei||'?'}: ${chunk.toString('ascii').trim().slice(0,100)}`);
         }
       }
     });
