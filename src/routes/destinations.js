@@ -1,120 +1,118 @@
-/**
- * routes/destinations.js
- * GET    /destinations
- * POST   /destinations
- * PATCH  /destinations/:id
- * PATCH  /destinations/:id/toggle
- * DELETE /destinations/:id
- *
- * Requieren auth. POST/PATCH/DELETE requieren rol admin.
- */
+// src/routes/destinations.js
+// CRUD de destinos GPS. Incluye auth y driver_slug (cols 013 y 012).
 
-const router  = require('express').Router();
-const { query } = require('../db/pool');
-const { requireAuth, requireRole } = require('../middleware/auth');
-const audit   = require('../middleware/audit');
+const express = require('express');
+const router  = express.Router();
+const { createClient } = require('@supabase/supabase-js');
+const { requireAuth } = require('../middleware/auth');
 
-router.use(requireAuth);
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
-/* ── GET /destinations ────────────────────────────────────────── */
-router.get('/', async (req, res) => {
-  const { rows } = await query(
-    `SELECT id, name, enabled, api_url, color, field_schema, created_at, updated_at
-     FROM public.destinations
-     ORDER BY name ASC`
-  );
-  res.json(rows);
+// ── GET /destinations ─────────────────────────────────────────
+// Devuelve todos los destinos incluyendo auth y driver_slug.
+// El tcp-server los usa en forwardToDestinations().
+router.get('/', requireAuth, async (req, res) => {
+  const { data, error } = await supabase
+    .from('destinations')
+    .select('id, name, enabled, api_url, color, field_schema, driver_slug, auth, created_at, updated_at')
+    .order('name');
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
 });
 
-/* ── POST /destinations ───────────────────────────────────────── */
-router.post('/', requireRole('admin'), async (req, res) => {
-  const { id, name, api_url, color, field_schema = [] } = req.body;
+// ── POST /destinations ────────────────────────────────────────
+router.post('/', requireAuth, async (req, res) => {
+  const { id, name, api_url, color, field_schema, driver_slug, auth } = req.body;
 
-  if (!id || !name) {
-    return res.status(400).json({ error: 'id y name son requeridos.' });
-  }
+  if (!name) return res.status(400).json({ error: 'name es requerido' });
 
-  let rows;
-  try {
-    ({ rows } = await query(
-      `INSERT INTO public.destinations (id, name, api_url, color, field_schema)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, name, enabled, api_url, color, field_schema, created_at`,
-      [id.trim(), name.trim(), api_url || null, color || '#38bdf8', JSON.stringify(field_schema)]
-    ));
-  } catch (err) {
-    if (err.code === '23505') {
-      return res.status(409).json({ error: `El destino con id "${id}" ya existe.` });
-    }
-    throw err;
-  }
+  const payload = {
+    id:           id || undefined,          // Si el cliente provee id custom lo usa
+    name:         name.trim(),
+    api_url:      api_url?.trim() || null,
+    color:        color || '#38bdf8',
+    field_schema: field_schema || [],
+    driver_slug:  driver_slug?.trim() || null,
+    auth:         auth || null,
+    enabled:      true,
+  };
 
-  await audit.log({ req, action: 'DEST_CREATE', target: id, after: rows[0] });
-  res.status(201).json(rows[0]);
+  const { data, error } = await supabase
+    .from('destinations')
+    .insert(payload)
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
 });
 
-/* ── PATCH /destinations/:id ──────────────────────────────────── */
-router.patch('/:id', requireRole('admin'), async (req, res) => {
+// ── PATCH /destinations/:id ───────────────────────────────────
+router.patch('/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
-  const { name, api_url, color, field_schema } = req.body;
+  const { name, api_url, color, field_schema, driver_slug, auth } = req.body;
 
-  const { rows: before } = await query(
-    'SELECT * FROM public.destinations WHERE id = $1',
-    [id]
-  );
-  if (!before.length) return res.status(404).json({ error: 'Destino no encontrado.' });
+  const updates = {};
+  if (name        !== undefined) updates.name         = name.trim();
+  if (api_url     !== undefined) updates.api_url      = api_url?.trim() || null;
+  if (color       !== undefined) updates.color        = color;
+  if (field_schema !== undefined) updates.field_schema = field_schema;
+  if (driver_slug !== undefined) updates.driver_slug  = driver_slug?.trim() || null;
+  if (auth        !== undefined) updates.auth         = auth;   // null = sin auth
+  updates.updated_at = new Date().toISOString();
 
-  const updates = [];
-  const values  = [];
-  let   i       = 1;
+  const { data, error } = await supabase
+    .from('destinations')
+    .update(updates)
+    .eq('id', id)
+    .select()
+    .single();
 
-  if (name        !== undefined) { updates.push(`name = $${i++}`);         values.push(name.trim()); }
-  if (api_url     !== undefined) { updates.push(`api_url = $${i++}`);      values.push(api_url || null); }
-  if (color       !== undefined) { updates.push(`color = $${i++}`);        values.push(color); }
-  if (field_schema !== undefined) { updates.push(`field_schema = $${i++}`); values.push(JSON.stringify(field_schema)); }
-
-  if (!updates.length) return res.status(400).json({ error: 'Nada que actualizar.' });
-
-  updates.push(`updated_at = now()`);
-  values.push(id);
-
-  const { rows } = await query(
-    `UPDATE public.destinations SET ${updates.join(', ')}
-     WHERE id = $${i}
-     RETURNING id, name, enabled, api_url, color, field_schema, updated_at`,
-    values
-  );
-
-  await audit.log({ req, action: 'DEST_UPDATE', target: id, before: before[0], after: rows[0] });
-  res.json(rows[0]);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
 });
 
-/* ── PATCH /destinations/:id/toggle ──────────────────────────── */
-router.patch('/:id/toggle', requireRole('admin'), async (req, res) => {
-  const { rows } = await query(
-    `UPDATE public.destinations
-     SET enabled = NOT enabled, updated_at = now()
-     WHERE id = $1
-     RETURNING id, name, enabled`,
-    [req.params.id]
-  );
-  if (!rows.length) return res.status(404).json({ error: 'Destino no encontrado.' });
+// ── PATCH /destinations/:id/toggle ───────────────────────────
+router.patch('/:id/toggle', requireAuth, async (req, res) => {
+  // Leer estado actual
+  const { data: current, error: fetchErr } = await supabase
+    .from('destinations')
+    .select('enabled')
+    .eq('id', req.params.id)
+    .single();
 
-  const action = rows[0].enabled ? 'DEST_ENABLE' : 'DEST_DISABLE';
-  await audit.log({ req, action, target: req.params.id, after: rows[0] });
-  res.json(rows[0]);
+  if (fetchErr) return res.status(404).json({ error: 'Destino no encontrado' });
+
+  const { data, error } = await supabase
+    .from('destinations')
+    .update({ enabled: !current.enabled, updated_at: new Date().toISOString() })
+    .eq('id', req.params.id)
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
 });
 
-/* ── DELETE /destinations/:id ─────────────────────────────────── */
-router.delete('/:id', requireRole('admin'), async (req, res) => {
-  const { rows } = await query(
-    'DELETE FROM public.destinations WHERE id = $1 RETURNING id, name',
-    [req.params.id]
-  );
-  if (!rows.length) return res.status(404).json({ error: 'Destino no encontrado.' });
+// ── DELETE /destinations/:id ──────────────────────────────────
+router.delete('/:id', requireAuth, async (req, res) => {
+  // Primero eliminar asignaciones en unit_destinations
+  await supabase
+    .from('unit_destinations')
+    .delete()
+    .eq('destination_id', req.params.id);
 
-  await audit.log({ req, action: 'DEST_DELETE', target: req.params.id, before: rows[0] });
-  res.json({ ok: true, deleted: rows[0] });
+  const { error } = await supabase
+    .from('destinations')
+    .delete()
+    .eq('id', req.params.id);
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
 });
 
 module.exports = router;
