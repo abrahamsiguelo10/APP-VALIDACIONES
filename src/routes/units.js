@@ -170,7 +170,7 @@ router.delete('/batch', requireRole('admin'), async (req, res) => {
 /* ── PATCH /units/:imei ───────────────────────────────────────── */
 router.patch('/:imei', requireRole('admin'), async (req, res) => {
   const { imei } = req.params;
-  const { plate, name, rut, cliente_id } = req.body;
+  const { plate, name, rut, cliente_id, enabled } = req.body;
 
   const { rows: before } = await query(
     'SELECT * FROM public.units WHERE imei = $1', [imei]
@@ -185,6 +185,7 @@ router.patch('/:imei', requireRole('admin'), async (req, res) => {
   if (name       !== undefined) { updates.push(`name       = $${i++}`); values.push(name?.trim()  || null); }
   if (rut        !== undefined) { updates.push(`rut        = $${i++}`); values.push(rut || null); }
   if (cliente_id !== undefined) { updates.push(`cliente_id = $${i++}`); values.push(cliente_id || null); }
+  if (enabled    !== undefined) { updates.push(`enabled    = $${i++}`); values.push(enabled); }
   if (!updates.length) return res.status(400).json({ error: 'Nada que actualizar.' });
 
   updates.push(`updated_at = now()`);
