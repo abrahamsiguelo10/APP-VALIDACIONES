@@ -22,6 +22,14 @@ router.get('/', requireAuth, async (req, res) => {
 // POST /destinations
 router.post('/', requireAuth, async (req, res) => {
   const { id, name, api_url, color, field_schema, driver_slug, auth } = req.body;
+  // Verificar si ya existe una org con el mismo nombre (insensible a mayúsculas)
+const { rows: existing } = await pool.query(
+  'SELECT id, name FROM public.destinations WHERE LOWER(name) = LOWER($1) LIMIT 1',
+  [name]
+);
+if (existing.length) {
+  return res.status(200).json(existing[0]); // devolver la existente sin crear duplicado
+}
   if (!name) return res.status(400).json({ error: 'name es requerido' });
   try {
     const { rows } = await query(`
