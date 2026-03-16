@@ -15,7 +15,8 @@ const { query } = require('./db/pool');
 const TCP_PORT = parseInt(process.env.TCP_PORT || '9001', 10);
 
 // ─── Parser Wialon IPS (texto) ────────────────────────────────────────────────
-// Formato: #D#date;time;lat1;lat2;lon1;lon2;speed;course;alt;sats;hdop;inputs;...
+// Formato Wialon: #D#DDMMYY;HHMMSS;DDMM.MMMM;NS;DDDMM.MMMM;EW;speed;course;alt;sats;...
+// Ejemplo real:   #D#160326;182342;3250.5190;S;07112.9180;W;0;0;0.000000;14;...
 function parseWialonIPS(raw) {
   try {
     const str = raw.toString('ascii').trim();
@@ -31,20 +32,38 @@ function parseWialonIPS(raw) {
 
     if (type === 'D' || type === 'SD') {
       const body = (parts[1] || '').split(';');
-      const [date, time, lat1, lat2, lon1, lon2, speed, course,,, inputs] = body;
+      // Campos: date;time;latDDMM;NS;lonDDDMM;EW;speed;course;alt;sats;hdop;inputs;...
+      const [date, time, latRaw, latHem, lonRaw, lonHem, speed, course, alt, sats,, inputs] = body;
 
-      const lat = parseFloat(lat1) + parseFloat(lat2) / 60;
-      const lon = parseFloat(lon1) + parseFloat(lon2) / 60;
+      // Convertir DDMM.MMMM → decimal
+      // latRaw = "3250.5190" → 32° + 50.5190/60
+      function nmea2dec(raw, hem) {
+        const v = parseFloat(raw);
+        if (isNaN(v)) return NaN;
+        const deg = Math.floor(v / 100);
+        const min = v - deg * 100;
+        let dec = deg + min / 60;
+        if (hem === 'S' || hem === 'W') dec = -dec;
+        return dec;
+      }
+
+      const lat = nmea2dec(latRaw, latHem);
+      const lon = nmea2dec(lonRaw, lonHem);
       if (isNaN(lat) || isNaN(lon)) return null;
 
-      const ignition = !!(parseInt(inputs || '0', 10) & 1);
+      // inputs puede ser "NA" o un número — bit 0 = ignición
+      const ignition = inputs && inputs !== 'NA'
+        ? !!(parseInt(inputs, 10) & 1)
+        : false;
 
       let wialon_ts = null;
       try {
         if (date && time) {
-          const [d, m, y] = date.split('.');
-          const [h, mi, s] = time.split(':');
-          wialon_ts = new Date(`20${y}-${m}-${d}T${h}:${mi}:${s}Z`).toISOString();
+          // date = "160326" → DD MM YY → 2026-03-16
+          const dd = date.slice(0,2), mm = date.slice(2,4), yy = date.slice(4,6);
+          // time = "182342" → HH MM SS
+          const hh = time.slice(0,2), mi = time.slice(2,4), ss = time.slice(4,6);
+          wialon_ts = new Date(`20${yy}-${mm}-${dd}T${hh}:${mi}:${ss}Z`).toISOString();
         }
       } catch (_) {}
 
@@ -59,6 +78,12 @@ function parseWialonIPS(raw) {
         raw:     str,
       };
     }
+
+    if (type === 'P') {
+      // Ping — responder #AP# y no hacer nada más
+      return { type: 'ping' };
+    }
+
     return null;
   } catch (err) {
     console.error('[TCP] parseWialonIPS error:', err.message);
@@ -350,6 +375,11 @@ function startTcpServer() {
             sessionImei = parsed.imei;
             socket.write('#AL#1\r\n');
             console.log(`[TCP-IPS] Login IMEI: ${sessionImei}`);
+            continue;
+          }
+
+          if (parsed.type === 'ping') {
+            socket.write('#AP#\r\n');
             continue;
           }
 
