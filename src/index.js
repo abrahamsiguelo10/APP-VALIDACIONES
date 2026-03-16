@@ -33,6 +33,11 @@ const adminRoutes = require('./routes/admin');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
+// ── Confiar en el proxy de Railway para leer la IP real del cliente ──
+// Sin esto todos los usuarios aparecen como la misma IP interna (100.64.x.x)
+// lo que dispara el rate limit de Railway para todos simultáneamente
+app.set('trust proxy', 1);
+
 /* ── CORS ─────────────────────────────────────────────────────── */
 app.use(cors({
   origin: process.env.CORS_ORIGIN?.split(',') ?? '*',
