@@ -1,315 +1,297 @@
+// src/tcp-server.js
+// Servidor TCP que recibe paquetes GPS en protocolo Wialon IPS,
+// guarda eventos en gps_events y reenvía a destinos configurados.
+//
+// CORRECCIONES vs versión anterior:
+//  - forwardToDestinations: query via unit_destinations (JOIN correcto)
+//  - buildAuthHeaders: construye header dinámico desde destinations.auth
+//  - Sin SKYNAV_TOKEN hardcodeado; cada destino tiene su propia auth
+//  - Modo shadow: registra pero no envía
+
 'use strict';
 
-/**
- * src/tcp-server.js
- * ─────────────────────────────────────────────────────────────────
- * Servidor TCP — protocolo Wialon Retranslator (especificación oficial).
- *
- * Estructura del paquete:
- *   [0-3]    Packet size  (uint32 LITTLE-ENDIAN, excluye este campo)
- *   [4+]     UID          null-terminated ASCII string
- *   [pos+0]  Timestamp    (uint32 BIG-ENDIAN, unix epoch UTC)
- *   [pos+4]  Bitmask      (uint32 BIG-ENDIAN)
- *   [pos+8+] Bloques de datos (mientras queden bytes)
- *
- * Estructura de cada bloque:
- *   [0-1]  Block type   uint16 BE  (siempre 0x0BBB)
- *   [2-5]  Block size   uint32 BE  (excluye type y este campo)
- *   [6]    Stealth      byte
- *   [7]    Data type    byte       (0x01=string 0x02=binary 0x03=int 0x04=double 0x05=long)
- *   [8+]   Block name   null-terminated ASCII
- *   [n+]   Value        según data type
- *
- * Bloque posinfo (data type 0x02, nombre "posinfo"):
- *   [0-7]   Longitude  double LITTLE-ENDIAN
- *   [8-15]  Latitude   double LITTLE-ENDIAN
- *   [16-23] Altitude   double LITTLE-ENDIAN
- *   [24-25] Speed      uint16 BIG-ENDIAN  (km/h)
- *   [26-27] Course     uint16 BIG-ENDIAN  (0-359°)
- *   [28]    Satellites byte
- * ─────────────────────────────────────────────────────────────────
- */
+const net     = require('net');
+const { createClient } = require('@supabase/supabase-js');
 
-const net      = require('net');
-const { pool } = require('./db/pool');
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 const TCP_PORT = parseInt(process.env.TCP_PORT || '9001', 10);
 
-// ── Parser principal ──────────────────────────────────────────────
-
-function parseWialonPacket(buf) {
+// ── Parser protocolo Wialon IPS ──────────────────────────────────────────────
+// Formato: #D#date;time;lat1;lat2;lon1;lon2;speed;course;alt;sats;hdop;inputs;outputs;adc;ibutton;params\r\n
+function parseWialonPacket(raw) {
   try {
-    if (buf.length < 14) return null;
+    const str = raw.toString('ascii').trim();
+    if (!str.startsWith('#')) return null;
 
-    let pos = 0;
+    const parts = str.split('#').filter(Boolean);
+    const type  = parts[0];  // D, SD, L, etc.
 
-    // Packet size (uint32 LE) — solo para validación
-    const pktSize = buf.readUInt32LE(pos); pos += 4;
-    if (pktSize === 0 || pktSize > 65536) {
-      console.warn('[tcp] Packet size inválido:', pktSize);
-      return null;
+    if (type === 'L') {
+      // Login packet: #L#imei;pass\r\n
+      const body = parts[1]?.split(';') || [];
+      return { type: 'login', imei: body[0]?.trim(), pass: body[1]?.trim() };
     }
 
-    // UID null-terminated
-    let uidEnd = pos;
-    while (uidEnd < buf.length && buf[uidEnd] !== 0x00) uidEnd++;
-    const unitId = buf.slice(pos, uidEnd).toString('ascii').trim();
-    pos = uidEnd + 1;
+    if (type === 'D' || type === 'SD') {
+      const body = parts[1]?.split(';') || [];
+      // date;time;lat1;lat2;lon1;lon2;speed;course;alt;sats;hdop;inputs;outputs;adc;ibutton;params
+      const [date, time, lat1, lat2, lon1, lon2, speed, course, alt, sats, hdop, inputs] = body;
 
-    if (!unitId) {
-      console.warn('[tcp] UID vacío, paquete ignorado');
-      return null;
-    }
+      const lat = parseFloat(lat1) + parseFloat(lat2) / 60;
+      const lon = parseFloat(lon1) + parseFloat(lon2) / 60;
 
-    if (buf.length < pos + 8) return null;
+      // Ignorar lecturas inválidas
+      if (isNaN(lat) || isNaN(lon)) return null;
 
-    // Timestamp (uint32 BE)
-    const ts = buf.readUInt32BE(pos); pos += 4;
+      // Detectar ignición en inputs (bit 0)
+      const inputsInt = parseInt(inputs || '0', 10);
+      const ignition  = !!(inputsInt & 1);
 
-    // Bitmask (uint32 BE)
-    const bitmask = buf.readUInt32BE(pos); pos += 4;
-
-    // Leer bloques buscando "posinfo"
-    let lat = null, lon = null, speed = null, heading = null, ignition = null;
-
-    while (pos + 6 < buf.length) {
-      const blkType = buf.readUInt16BE(pos); pos += 2;
-
-      if (blkType !== 0x0BBB) {
-        // Bloque desconocido — intentar saltar limpiamente
-        console.warn('[tcp] Block type inesperado:', '0x'+blkType.toString(16), '— saltando');
-        break;
-      }
-
-      const blkSize = buf.readUInt32BE(pos); pos += 4;
-      if (blkSize === 0 || pos + blkSize > buf.length) break;
-
-      const blk      = buf.slice(pos, pos + blkSize);
-      pos           += blkSize;
-
-      // stealth(1) + dataType(1) + name(null-term) + value
-      if (blk.length < 3) continue;
-      const dataType = blk[1];
-
-      let nameEnd = 2;
-      while (nameEnd < blk.length && blk[nameEnd] !== 0x00) nameEnd++;
-      const blockName = blk.slice(2, nameEnd).toString('ascii');
-      const valBuf    = blk.slice(nameEnd + 1);
-
-      if (blockName === 'posinfo' && dataType === 0x02) {
-        if (valBuf.length < 29) continue;
-
-        lon           = valBuf.readDoubleLE(0);
-        lat           = valBuf.readDoubleLE(8);
-        const alt     = valBuf.readDoubleLE(16);
-        speed         = valBuf.readUInt16BE(24);
-        heading       = valBuf.readUInt16BE(26);
-        const sats    = valBuf[28];
-
-        console.log(`[tcp] posinfo: lat:${lat} lon:${lon} alt:${alt} speed:${speed} course:${heading} sats:${sats}`);
-
-        // Validar coordenadas
-        if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
-          console.warn('[tcp] Coordenadas fuera de rango, descartando');
-          lat = null; lon = null;
+      // Parsear timestamp
+      let wialon_ts = null;
+      try {
+        if (date && time) {
+          const [d, m, y] = date.split('.');
+          const [h, mi, s] = time.split(':');
+          wialon_ts = new Date(`20${y}-${m}-${d}T${h}:${mi}:${s}Z`).toISOString();
         }
-        // Validar speed/heading
-        if (speed > 300)  speed   = null;
-        if (heading > 359) heading = null;
+      } catch (_) {}
 
-      } else if (blockName === 'ign') {
-        // Ignición: integer 0x03 o double 0x04
-        if (dataType === 0x03 && valBuf.length >= 4) {
-          ignition = valBuf.readUInt32BE(0) === 1;
-        } else if (dataType === 0x04 && valBuf.length >= 8) {
-          ignition = valBuf.readDoubleLE(0) === 1;
-        }
-      }
+      return {
+        type:      'data',
+        lat:       parseFloat(lat.toFixed(6)),
+        lon:       parseFloat(lon.toFixed(6)),
+        speed:     parseFloat(speed || '0'),
+        heading:   parseFloat(course || '0'),
+        ignition,
+        wialon_ts,
+        raw:       str,
+      };
     }
 
-    return { unitId, ts, lat, lon, speed, heading, ignition, raw: lat == null ? buf.toString('hex') : null };
-
-  } catch (e) {
-    console.error('[tcp] Error parseando paquete:', e.message,
-      '— hex:', buf.toString('hex').slice(0, 80));
+    return null;
+  } catch (err) {
+    console.error('[TCP] parseWialonPacket error:', err.message);
     return null;
   }
 }
 
-function buildAck() {
-  return Buffer.from([0x11]);
+// ── Buscar unidad por IMEI ───────────────────────────────────────────────────
+async function findUnit(imei) {
+  const { data, error } = await supabase
+    .from('units')
+    .select('imei, plate, name, enabled, cliente_id')
+    .eq('imei', imei)
+    .single();
+
+  if (error || !data) return null;
+  return data;
 }
 
-// ── Buscar unidad en BD ───────────────────────────────────────────
-
-async function findUnit(unitId) {
-  if (!unitId) return null;
-  const { rows } = await pool.query(
-    `SELECT plate, imei FROM public.units
-     WHERE UPPER(imei)  = UPPER($1)
-        OR UPPER(plate) = UPPER($1)
-        OR (LENGTH($1) >= 4 AND imei LIKE '%' || $1)
-     ORDER BY
-       CASE WHEN UPPER(imei)  = UPPER($1) THEN 0
-            WHEN UPPER(plate) = UPPER($1) THEN 1
-            ELSE 2 END
-     LIMIT 1`,
-    [unitId]
-  );
-  return rows[0] || null;
+// ── Guardar evento GPS ───────────────────────────────────────────────────────
+async function saveEvent(unit, parsed, destinationId, forwardOk, forwardResp) {
+  const { error } = await supabase.from('gps_events').insert({
+    plate:          unit.plate,
+    imei:           unit.imei,
+    lat:            parsed.lat,
+    lon:            parsed.lon,
+    speed:          parsed.speed,
+    heading:        parsed.heading,
+    ignition:       parsed.ignition,
+    wialon_ts:      parsed.wialon_ts,
+    destination_id: destinationId || null,
+    forward_ok:     forwardOk ?? null,
+    forward_resp:   forwardResp || null,
+    raw_hex:        parsed.raw || null,
+  });
+  if (error) console.error('[TCP] saveEvent error:', error.message);
 }
 
-// ── Guardar evento en Supabase ────────────────────────────────────
+// ── Construir headers de autenticación ──────────────────────────────────────
+// auth viene del campo JSONB destinations.auth
+function buildAuthHeaders(auth) {
+  if (!auth || !auth.type || auth.type === 'none') return {};
 
-async function saveEvent(parsed) {
-  try {
-    const unit  = await findUnit(parsed.unitId);
-    const plate = unit?.plate || parsed.unitId;
-    const imei  = unit?.imei  || null;
-
-    if (!unit) {
-      console.warn(`[tcp] Sin match en BD para unitId:"${parsed.unitId}" — guardando raw`);
-    }
-
-    await pool.query(
-      `INSERT INTO public.gps_events
-         (plate, imei, lat, lon, speed, heading, ignition, wialon_ts, received_at, raw_hex)
-       VALUES ($1,$2,$3,$4,$5,$6,$7, to_timestamp($8), now(), $9)`,
-      [
-        plate, imei,
-        parsed.lat, parsed.lon,
-        parsed.speed, parsed.heading,
-        parsed.ignition,
-        parsed.ts,
-        parsed.raw,
-      ]
-    );
-
-    const coords = parsed.lat != null
-      ? `lat:${parsed.lat} lon:${parsed.lon} speed:${parsed.speed} ign:${parsed.ignition}`
-      : 'sin GPS (telemetría)';
-    console.log(`[tcp] ✓ ${plate} | ${coords}`);
-    return plate;
-
-  } catch (e) {
-    console.error('[tcp] Error guardando en BD:', e.message);
-    return parsed.unitId;
-  }
-}
-
-// ── Reenviar a destinos ───────────────────────────────────────────
-
-async function forwardToDestinations(plate, parsed) {
-  if (!parsed.lat || !parsed.lon) return;
-
-  let destinations = [];
-  try {
-    const { rows } = await pool.query(
-      `SELECT d.api_url, d.name
-       FROM public.destinations d
-       WHERE d.enabled = true
-         AND EXISTS (
-           SELECT 1 FROM public.units u
-           WHERE UPPER(u.plate) = UPPER($1)
-             AND u.destinations @> jsonb_build_array(
-                   jsonb_build_object('destination_id', d.id::text)
-                 )
-         )`,
-      [plate]
-    );
-    destinations = rows;
-  } catch {
-    try {
-      const { rows } = await pool.query(
-        `SELECT api_url, name FROM public.destinations WHERE enabled = true`
-      );
-      destinations = rows;
-    } catch (e2) {
-      console.error('[tcp] Error obteniendo destinos:', e2.message);
-      return;
-    }
+  if (auth.type === 'bearer') {
+    return { Authorization: `Bearer ${auth.token}` };
   }
 
-  if (!destinations.length) return;
+  if (auth.type === 'basic') {
+    const b64 = Buffer.from(`${auth.username}:${auth.password}`).toString('base64');
+    return { Authorization: `Basic ${b64}` };
+  }
 
-  const token = process.env.SKYNAV_TOKEN;
-  if (!token) {
-    console.warn('[tcp] SKYNAV_TOKEN no configurado — omitiendo reenvío');
+  if (auth.type === 'apikey') {
+    return { [auth.header || 'X-Api-Key']: auth.value };
+  }
+
+  return {};
+}
+
+// ── Reenviar a destinos ──────────────────────────────────────────────────────
+// Query correcta: unit_destinations (JOIN) → destinations
+// Soporta múltiples destinos por unidad.
+async function forwardToDestinations(unit, parsed) {
+  // Buscar destinos activos asignados a esta unidad
+  const { data: assignments, error } = await supabase
+    .from('unit_destinations')
+    .select(`
+      enabled,
+      shadow,
+      notes,
+      destination:destination_id (
+        id,
+        name,
+        api_url,
+        driver_slug,
+        auth,
+        enabled
+      )
+    `)
+    .eq('imei', unit.imei)
+    .eq('enabled', true);
+
+  if (error) {
+    console.error('[TCP] forwardToDestinations query error:', error.message);
     return;
   }
 
-  const payload = {
-    plate,
-    imei:      parsed.unitId,
-    lat:       parsed.lat,
-    lon:       parsed.lon,
-    speed:     parsed.speed,
-    heading:   parsed.heading,
-    ignition:  parsed.ignition,
-    timestamp: new Date(parsed.ts * 1000).toISOString(),
-  };
+  if (!assignments || assignments.length === 0) {
+    console.log(`[TCP] ${unit.plate} — sin destinos asignados`);
+    return;
+  }
 
-  for (const dest of destinations) {
-    if (!dest.api_url) continue;
+  for (const row of assignments) {
+    const dest = row.destination;
+
+    // Saltar si el destino está deshabilitado globalmente
+    if (!dest || !dest.enabled || !dest.api_url) continue;
+
+    const isShadow = row.shadow === true;
+
+    // Payload GPS estándar
+    const payload = {
+      imei:     unit.imei,
+      plate:    unit.plate,
+      lat:      parsed.lat,
+      lon:      parsed.lon,
+      speed:    parsed.speed,
+      heading:  parsed.heading,
+      ignition: parsed.ignition,
+      ts:       parsed.wialon_ts,
+    };
+
+    if (isShadow) {
+      // Modo shadow: solo registrar, no enviar
+      console.log(`[TCP] ${unit.plate} → ${dest.name} [SHADOW] (no enviado)`);
+      await saveEvent(unit, parsed, dest.id, null, 'shadow');
+      continue;
+    }
+
+    // Construir headers: auth dinámica + content-type
+    const authHeaders = buildAuthHeaders(dest.auth);
+    const headers = {
+      'Content-Type': 'application/json',
+      ...authHeaders,
+    };
+
+    let forwardOk   = false;
+    let forwardResp = null;
+
     try {
       const res = await fetch(dest.api_url, {
         method:  'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        headers,
         body:    JSON.stringify(payload),
-        signal:  AbortSignal.timeout(8000),
+        signal:  AbortSignal.timeout(8000),  // 8s timeout
       });
-      console.log(`[tcp] → ${dest.name || dest.api_url}: ${res.status}`);
-    } catch (e) {
-      console.error(`[tcp] Error reenviando a ${dest.name || dest.api_url}:`, e.message);
+
+      forwardOk   = res.ok;
+      forwardResp = `${res.status} ${res.statusText}`.slice(0, 500);
+
+      console.log(`[TCP] ${unit.plate} → ${dest.name} ${forwardOk ? '✓' : '✗'} (${res.status})`);
+    } catch (err) {
+      forwardResp = err.message?.slice(0, 500) || 'error';
+      console.error(`[TCP] ${unit.plate} → ${dest.name} error:`, err.message);
     }
+
+    await saveEvent(unit, parsed, dest.id, forwardOk, forwardResp);
   }
 }
 
-// ── Servidor TCP ──────────────────────────────────────────────────
-
+// ── Servidor TCP ─────────────────────────────────────────────────────────────
 function startTcpServer() {
-  const server = net.createServer((socket) => {
-    const remote = `${socket.remoteAddress}:${socket.remotePort}`;
-    console.log(`[tcp] Conexión entrante: ${remote}`);
+  if (process.env.TCP_ENABLED !== 'true') {
+    console.log('[TCP] TCP_ENABLED no está en true — servidor no iniciado');
+    return;
+  }
 
-    let buffer = Buffer.alloc(0);
+  const server = net.createServer((socket) => {
+    let sessionImei = null;
+    let buffer      = '';
 
     socket.on('data', async (chunk) => {
-      buffer = Buffer.concat([buffer, chunk]);
-      console.log(`[tcp] Buffer (${buffer.length}b): ${buffer.toString('hex').slice(0, 200)}`);
+      buffer += chunk.toString('ascii');
+      const lines = buffer.split('\r\n');
+      buffer = lines.pop();  // guardar fragmento incompleto
 
-      const parsed = parseWialonPacket(buffer);
-      buffer = Buffer.alloc(0);
+      for (const line of lines) {
+        if (!line.trim()) continue;
 
-      if (!parsed) {
-        console.warn('[tcp] Paquete no parseable, ignorado.');
-        return;
-      }
+        const parsed = parseWialonPacket(line);
+        if (!parsed) continue;
 
-      socket.write(buildAck());
+        if (parsed.type === 'login') {
+          sessionImei = parsed.imei;
+          socket.write('#AL#1\r\n');  // respuesta de login OK
+          console.log(`[TCP] Login IMEI: ${sessionImei}`);
+          continue;
+        }
 
-      const plate = await saveEvent(parsed);
-      if (parsed.lat && parsed.lon) {
-        forwardToDestinations(plate, parsed).catch(e =>
-          console.error('[tcp] Error en forward:', e.message)
-        );
+        if (parsed.type === 'data') {
+          socket.write('#AD#1\r\n');  // ACK de datos
+
+          if (!sessionImei) {
+            console.warn('[TCP] Paquete de datos sin login previo');
+            continue;
+          }
+
+          const unit = await findUnit(sessionImei);
+          if (!unit) {
+            console.warn(`[TCP] IMEI ${sessionImei} no registrado`);
+            continue;
+          }
+
+          if (!unit.enabled) {
+            console.log(`[TCP] ${unit.plate} deshabilitada — ignorando`);
+            continue;
+          }
+
+          // Reenviar a todos los destinos asignados (multi-destino)
+          await forwardToDestinations(unit, parsed);
+        }
       }
     });
 
-    socket.on('error', (e) => console.error(`[tcp] Socket error (${remote}):`, e.message));
-    socket.on('close', () => console.log(`[tcp] Conexión cerrada: ${remote}`));
+    socket.on('error', (err) => {
+      console.error('[TCP] Socket error:', err.message);
+    });
 
-    socket.setTimeout(5 * 60 * 1000);
-    socket.on('timeout', () => {
-      console.warn(`[tcp] Timeout: ${remote}`);
-      socket.destroy();
+    socket.on('close', () => {
+      console.log(`[TCP] Conexión cerrada${sessionImei ? ' IMEI: ' + sessionImei : ''}`);
     });
   });
 
-  server.on('error', (e) => console.error('[tcp] Error servidor TCP:', e.message));
-
   server.listen(TCP_PORT, '0.0.0.0', () => {
-    console.log(`✓ TCP Wialon Retranslator escuchando en puerto ${TCP_PORT}`);
+    console.log(`[TCP] Servidor escuchando en puerto ${TCP_PORT}`);
+  });
+
+  server.on('error', (err) => {
+    console.error('[TCP] Server error:', err.message);
   });
 
   return server;
