@@ -94,7 +94,7 @@ async function getLastResponsesLocal(plate) {
        e.forward_ok    AS ok,
        e.forward_resp  AS response
      FROM public.gps_events e
-     LEFT JOIN public.destinations d ON d.id::text = e.destination_id
+     LEFT JOIN public.destinations d ON d.id = e.destination_id
      WHERE UPPER(e.plate) = UPPER($1)
      ORDER BY e.received_at DESC
      LIMIT $2`,
