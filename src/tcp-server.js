@@ -1,8 +1,10 @@
-// src/tcp-server.js
-// Servidor TCP Wialon IPS. Recibe paquetes GPS, guarda en gps_events
-// y reenvía a los destinos asignados via unit_destinations.
-//
-// Usa pool.js (pg / DATABASE_URL) — igual que el resto del proyecto.
+/**
+ * src/tcp-server.js
+ * Recibe paquetes Wialon IPS por TCP, los parsea, guarda en gps_events
+ * y reenvía a los destinos asignados vía unit_destinations.
+ *
+ * Usa pool.js (pg / DATABASE_URL) — igual que el resto del proyecto.
+ */
 
 'use strict';
 
@@ -11,7 +13,7 @@ const { query }   = require('./db/pool');
 
 const TCP_PORT = parseInt(process.env.TCP_PORT || '9001', 10);
 
-// ── Parser Wialon IPS ────────────────────────────────────────────────────────
+// — Parser Wialon IPS ─────────────────────────────────────────────────────
 // Formato: #D#date;time;lat1;lat2;lon1;lon2;speed;course;alt;sats;hdop;inputs;...
 function parseWialonPacket(raw) {
   try {
@@ -28,7 +30,7 @@ function parseWialonPacket(raw) {
 
     if (type === 'D' || type === 'SD') {
       const body = (parts[1] || '').split(';');
-      const [date, time, lat1, lat2, lon1, lon2, speed, course,,, , inputs] = body;
+      const [date, time, lat1, lat2, lon1, lon2, speed, course,,, inputs] = body;
 
       const lat = parseFloat(lat1) + parseFloat(lat2) / 60;
       const lon = parseFloat(lon1) + parseFloat(lon2) / 60;
@@ -46,14 +48,14 @@ function parseWialonPacket(raw) {
       } catch (_) {}
 
       return {
-        type:      'data',
-        lat:       parseFloat(lat.toFixed(6)),
-        lon:       parseFloat(lon.toFixed(6)),
-        speed:     parseFloat(speed || '0'),
-        heading:   parseFloat(course || '0'),
+        type:    'data',
+        lat:     parseFloat(lat.toFixed(6)),
+        lon:     parseFloat(lon.toFixed(6)),
+        speed:   parseFloat(speed || '0'),
+        heading: parseFloat(course || '0'),
         ignition,
         wialon_ts,
-        raw:       str,
+        raw:     str,
       };
     }
     return null;
@@ -63,7 +65,7 @@ function parseWialonPacket(raw) {
   }
 }
 
-// ── Buscar unidad por IMEI ───────────────────────────────────────────────────
+// — Buscar unidad por IMEI ─────────────────────────────────────────────────
 async function findUnit(imei) {
   const { rows } = await query(
     'SELECT imei, plate, name, enabled FROM public.units WHERE imei = $1',
@@ -72,7 +74,7 @@ async function findUnit(imei) {
   return rows[0] || null;
 }
 
-// ── Guardar evento GPS ───────────────────────────────────────────────────────
+// — Guardar evento GPS ─────────────────────────────────────────────────────
 async function saveEvent(unit, parsed, destinationId, forwardOk, forwardResp) {
   try {
     await query(`
@@ -85,16 +87,16 @@ async function saveEvent(unit, parsed, destinationId, forwardOk, forwardResp) {
       parsed.lat, parsed.lon, parsed.speed, parsed.heading, parsed.ignition,
       parsed.wialon_ts,
       destinationId || null,
-      forwardOk     ?? null,
-      forwardResp   || null,
-      parsed.raw    || null,
+      forwardOk  ?? null,
+      forwardResp  || null,
+      parsed.raw   || null,
     ]);
   } catch (err) {
     console.error('[TCP] saveEvent error:', err.message);
   }
 }
 
-// ── Construir headers de autenticación ──────────────────────────────────────
+// — Construir headers de autenticación ────────────────────────────────────
 function buildAuthHeaders(auth) {
   if (!auth || !auth.type || auth.type === 'none') return {};
   if (auth.type === 'bearer') {
@@ -110,8 +112,10 @@ function buildAuthHeaders(auth) {
   return {};
 }
 
-// ── Reenviar a destinos ──────────────────────────────────────────────────────
-// JOIN correcto: unit_destinations → destinations (por destination_id)
+// — Reenviar a destinos ────────────────────────────────────────────────────
+// NOTA: El SELECT no incluye d.auth directamente para ser compatible con la DB
+// antes y después de aplicar la migración 013 (ADD COLUMN auth JSONB).
+// En su lugar, se lee auth por separado con manejo de error graceful.
 async function forwardToDestinations(unit, parsed) {
   const { rows: assignments } = await query(`
     SELECT
@@ -120,19 +124,20 @@ async function forwardToDestinations(unit, parsed) {
       d.id          AS dest_id,
       d.name        AS dest_name,
       d.api_url,
-      d.enabled     AS dest_enabled,
-      d.auth
-    FROM public.unit_destinations ud
-    JOIN public.destinations d ON d.id = ud.destination_id
-    WHERE ud.imei = $1
-      AND ud.enabled = true
-      AND d.enabled  = true
-      AND d.api_url IS NOT NULL
-      AND d.api_url  <> ''
+      d.enabled     AS dest_enabled
+    FROM  public.unit_destinations ud
+    JOIN  public.destinations d ON d.id = ud.destination_id
+    WHERE ud.imei      = $1
+      AND ud.enabled   = true
+      AND d.enabled    = true
+      AND d.api_url    IS NOT NULL
+      AND d.api_url    <> ''
   `, [unit.imei]);
 
   if (!assignments.length) {
     console.log(`[TCP] ${unit.plate} — sin destinos activos asignados`);
+    // Guardar igualmente para mantener historial GPS
+    await saveEvent(unit, parsed, null, null, null);
     return;
   }
 
@@ -143,6 +148,20 @@ async function forwardToDestinations(unit, parsed) {
       console.log(`[TCP] ${unit.plate} → ${row.dest_name} [SHADOW]`);
       await saveEvent(unit, parsed, row.dest_id, null, 'shadow');
       continue;
+    }
+
+    // Leer auth del destino por separado — graceful si la columna no existe aún
+    let authHeaders = {};
+    try {
+      const { rows: destRows } = await query(
+        'SELECT auth FROM public.destinations WHERE id = $1',
+        [row.dest_id]
+      );
+      if (destRows[0]?.auth) {
+        authHeaders = buildAuthHeaders(destRows[0].auth);
+      }
+    } catch (_) {
+      // Columna auth no existe todavía — continúa sin headers de auth
     }
 
     const payload = {
@@ -156,7 +175,6 @@ async function forwardToDestinations(unit, parsed) {
       ts:       parsed.wialon_ts,
     };
 
-    const authHeaders = buildAuthHeaders(row.auth);
     let forwardOk   = false;
     let forwardResp = null;
 
@@ -179,7 +197,7 @@ async function forwardToDestinations(unit, parsed) {
   }
 }
 
-// ── Servidor TCP ─────────────────────────────────────────────────────────────
+// — Servidor TCP ──────────────────────────────────────────────────────────
 function startTcpServer() {
   if (process.env.TCP_ENABLED !== 'true') {
     console.log('[TCP] TCP_ENABLED != true — servidor no iniciado');
