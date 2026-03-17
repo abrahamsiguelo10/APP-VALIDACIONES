@@ -87,8 +87,10 @@ router.get('/audit', requireRole('admin'), async (req, res) => {
   } catch (err) {
     // Si la columna no existe aún, devolver estructura vacía en vez de error 500
     if (err.message?.includes('column') && err.message?.includes('does not exist')) {
-      return res.json({ rows: [], total: 0, limit: parseInt(limit), offset: 0,
-        warning: 'Ejecuta las migraciones pendientes para activar el historial.' });
+      return res.json({ rows: [], total: 0,
+        limit:  parseInt(req.query.limit  || 100),
+        offset: parseInt(req.query.offset || 0),
+        warning: 'Migraciones pendientes. Reinicia el servidor.' });
     }
     res.status(500).json({ error: err.message });
   }
