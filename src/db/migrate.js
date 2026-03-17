@@ -73,17 +73,22 @@ const migrations = [
         created_at TIMESTAMPTZ DEFAULT now()
       );
     ` },
-  { name: '014b_audit_log_add_columns',
+  { name: '014b_audit_log_before_data',
+    sql: `ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS before_data JSONB;` },
+  { name: '014c_audit_log_after_data',
+    sql: `ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS after_data JSONB;` },
+  { name: '014d_audit_log_user_id',
+    sql: `ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS user_id TEXT;` },
+  { name: '014e_audit_log_username',
+    sql: `ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS username TEXT;` },
+  { name: '014f_audit_log_role',
+    sql: `ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS role TEXT;` },
+  { name: '014g_audit_log_ip',
+    sql: `ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS ip TEXT;` },
+  { name: '014h_audit_log_indexes',
     sql: `
-      ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS before_data JSONB;
-      ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS after_data  JSONB;
-      ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS user_id     TEXT;
-      ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS username    TEXT;
-      ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS role        TEXT;
-      ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS ip          TEXT;
-      CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON public.audit_log(created_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_audit_log_action     ON public.audit_log(action);
-      CREATE INDEX IF NOT EXISTS idx_audit_log_username   ON public.audit_log(username);
+      CREATE INDEX IF NOT EXISTS idx_audit_log_action   ON public.audit_log(action);
+      CREATE INDEX IF NOT EXISTS idx_audit_log_username ON public.audit_log(username);
     ` },
 ];
 
