@@ -61,8 +61,14 @@ router.get('/audit', requireRole('admin'), async (req, res) => {
 
     const [rows, total] = await Promise.all([
       query(
-        `SELECT id, action, target, before_data, after_data,
-                user_id, username, role, ip, created_at
+        `SELECT
+           id, action, target, created_at,
+           COALESCE(user_id,  '')   AS user_id,
+           COALESCE(username, '—')  AS username,
+           COALESCE(role,     '')   AS role,
+           COALESCE(ip,       '')   AS ip,
+           before_data,
+           after_data
          FROM public.audit_log
          ${where}
          ORDER BY created_at DESC
@@ -79,6 +85,11 @@ router.get('/audit', requireRole('admin'), async (req, res) => {
       offset: parseInt(offset),
     });
   } catch (err) {
+    // Si la columna no existe aún, devolver estructura vacía en vez de error 500
+    if (err.message?.includes('column') && err.message?.includes('does not exist')) {
+      return res.json({ rows: [], total: 0, limit: parseInt(limit), offset: 0,
+        warning: 'Ejecuta las migraciones pendientes para activar el historial.' });
+    }
     res.status(500).json({ error: err.message });
   }
 });
