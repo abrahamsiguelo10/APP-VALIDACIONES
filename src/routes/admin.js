@@ -1,81 +1,85 @@
 /**
- * admin.js — Rutas de administración del sistema
- *
- * GET /admin/system-info  → información del servidor (solo admins)
+ * routes/admin.js
+ * GET /admin/system-info  — info del sistema
+ * GET /admin/audit        — historial de cambios (admin)
  */
 
-const express  = require('express');
-const os       = require('os');
-const { pool } = require('../db/pool');
+const router = require('express').Router();
+const { query } = require('../db/pool');
 const { requireAuth, requireRole } = require('../middleware/auth');
 
-const router = express.Router();
+router.use(requireAuth);
 
-/* ── GET /admin/system-info ────────────────────────────────────── */
-router.get('/system-info', requireAuth, requireRole('admin'), async (_req, res) => {
+/* ── GET /admin/system-info ──────────────────────────────────── */
+router.get('/system-info', requireRole('admin'), async (_req, res) => {
   try {
-    // Estadísticas de BD
-    const [unitsRes, clientesRes, destRes, certsRes, usersRes] = await Promise.all([
-      pool.query('SELECT COUNT(*) FROM units'),
-      pool.query('SELECT COUNT(*) FROM clientes'),
-      pool.query('SELECT COUNT(*) FROM destinations'),
-      pool.query("SELECT COUNT(*) FROM certificados WHERE estado = 'vigente'"),
-      pool.query('SELECT COUNT(*) FROM users'),
+    const [units, dests, users, events] = await Promise.all([
+      query('SELECT COUNT(*) FROM public.units'),
+      query('SELECT COUNT(*) FROM public.destinations'),
+      query('SELECT COUNT(*) FROM public.users'),
+      query('SELECT COUNT(*) FROM public.gps_events'),
     ]);
-
-    // Uptime en formato legible
-    const uptimeSec = process.uptime();
-    const h  = Math.floor(uptimeSec / 3600);
-    const m  = Math.floor((uptimeSec % 3600) / 60);
-    const s  = Math.floor(uptimeSec % 60);
-    const uptimeStr = `${h}h ${m}m ${s}s`;
-
-    // Memoria
-    const memUsed = process.memoryUsage();
-    const toMB    = (bytes) => (bytes / 1024 / 1024).toFixed(1) + ' MB';
-
     res.json({
-      // Servidor
-      version:    process.env.npm_package_version || '1.0.0',
-      node:       process.version,
-      env:        process.env.NODE_ENV || 'production',
-      platform:   process.platform,
-      uptime:     uptimeStr,
-      uptime_sec: Math.floor(uptimeSec),
-
-      // Memoria
-      memory: {
-        rss:        toMB(memUsed.rss),
-        heap_used:  toMB(memUsed.heapUsed),
-        heap_total: toMB(memUsed.heapTotal),
-      },
-
-      // SO
-      os: {
-        hostname: os.hostname(),
-        type:     os.type(),
-        arch:     os.arch(),
-        cpus:     os.cpus().length,
-        free_mem: toMB(os.freemem()),
-      },
-
-      // Conteos — estructura que espera el frontend (info.counts.*)
-      counts: {
-        units:          parseInt(unitsRes.rows[0].count),
-        clientes:       parseInt(clientesRes.rows[0].count),
-        users:          parseInt(usersRes.rows[0].count),
-        destinations:   parseInt(destRes.rows[0].count),
-        certs_vigentes: parseInt(certsRes.rows[0].count),
-      },
-
-      // DB status
-      db: 'connected',
-
+      units:  parseInt(units.rows[0].count),
+      dests:  parseInt(dests.rows[0].count),
+      users:  parseInt(users.rows[0].count),
+      events: parseInt(events.rows[0].count),
       ts: new Date().toISOString(),
     });
   } catch (err) {
-    console.error('[admin/system-info] Error:', err.message);
-    res.status(500).json({ error: 'No se pudo obtener información del sistema.' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── GET /admin/audit ────────────────────────────────────────── */
+router.get('/audit', requireRole('admin'), async (req, res) => {
+  try {
+    const {
+      limit  = 100,
+      offset = 0,
+      action,
+      username,
+      from,
+      to,
+      search,
+    } = req.query;
+
+    const conditions = [];
+    const values     = [];
+    let   i          = 1;
+
+    if (action)   { conditions.push(`action ILIKE $${i++}`);   values.push(`%${action}%`); }
+    if (username) { conditions.push(`username ILIKE $${i++}`); values.push(`%${username}%`); }
+    if (from)     { conditions.push(`created_at >= $${i++}`);  values.push(from); }
+    if (to)       { conditions.push(`created_at <= $${i++}`);  values.push(to); }
+    if (search)   {
+      conditions.push(`(action ILIKE $${i} OR target ILIKE $${i} OR username ILIKE $${i})`);
+      values.push(`%${search}%`); i++;
+    }
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const [rows, total] = await Promise.all([
+      query(
+        `SELECT id, action, target, before_data, after_data,
+                user_id, username, role, ip, created_at
+         FROM public.audit_log
+         ${where}
+         ORDER BY created_at DESC
+         LIMIT $${i++} OFFSET $${i++}`,
+        [...values, parseInt(limit), parseInt(offset)]
+      ),
+      query(`SELECT COUNT(*) FROM public.audit_log ${where}`, values),
+    ]);
+
+    res.json({
+      rows:  rows.rows,
+      total: parseInt(total.rows[0].count),
+      limit: parseInt(limit),
+      offset: parseInt(offset),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
