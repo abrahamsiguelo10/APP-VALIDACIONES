@@ -57,21 +57,30 @@ const migrations = [
   { name: '013_add_auth_to_destinations',
     sql: `ALTER TABLE public.destinations ADD COLUMN IF NOT EXISTS auth JSONB DEFAULT NULL;` },
 
-  // ── NUEVA: tabla audit_log completa ──────────────────────────
+  // ── NUEVA: asegurar columnas completas en audit_log ───────────
   { name: '014_create_audit_log',
     sql: `
       CREATE TABLE IF NOT EXISTS public.audit_log (
-        id        BIGSERIAL PRIMARY KEY,
-        action    TEXT NOT NULL,
-        target    TEXT,
+        id         BIGSERIAL PRIMARY KEY,
+        action     TEXT NOT NULL,
+        target     TEXT,
         before_data JSONB,
         after_data  JSONB,
-        user_id   TEXT,
-        username  TEXT,
-        role      TEXT,
-        ip        TEXT,
+        user_id    TEXT,
+        username   TEXT,
+        role       TEXT,
+        ip         TEXT,
         created_at TIMESTAMPTZ DEFAULT now()
       );
+    ` },
+  { name: '014b_audit_log_add_columns',
+    sql: `
+      ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS before_data JSONB;
+      ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS after_data  JSONB;
+      ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS user_id     TEXT;
+      ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS username    TEXT;
+      ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS role        TEXT;
+      ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS ip          TEXT;
       CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON public.audit_log(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_audit_log_action     ON public.audit_log(action);
       CREATE INDEX IF NOT EXISTS idx_audit_log_username   ON public.audit_log(username);
