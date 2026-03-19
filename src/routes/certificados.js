@@ -143,4 +143,80 @@ router.delete('/:id', requireAuth, requireRole('admin'), async (req, res) => {
 });
 
 
+/* ══════════════════════════════════════════════════════════
+   ENDPOINTS BULK
+══════════════════════════════════════════════════════════ */
+
+/* POST /certificados/bulk — crear varios certificados a la vez */
+router.post('/bulk', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { certificados } = req.body;
+    if (!Array.isArray(certificados) || !certificados.length)
+      return res.status(400).json({ error: 'certificados debe ser un array no vacío.' });
+    const emitido_por = req.user?.username || req.user?.sub || 'sistema';
+    const results = [], errors = [];
+    for (const c of certificados) {
+      const { patente, imei, empresa, rut_empresa, firmante, rut_firmante,
+              fecha_emision, fecha_vencimiento, validez_texto } = c;
+      if (!patente || !imei || !fecha_emision || !fecha_vencimiento) {
+        errors.push({ patente, error: 'Faltan campos obligatorios.' }); continue;
+      }
+      try {
+        const { rows } = await query(
+          `INSERT INTO public.certificados
+             (patente,imei,empresa,rut_empresa,firmante,rut_firmante,
+              fecha_emision,fecha_vencimiento,validez_texto,emitido_por)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+          [patente,imei,empresa||null,rut_empresa||null,firmante||null,
+           rut_firmante||null,fecha_emision,fecha_vencimiento,validez_texto||null,emitido_por]
+        );
+        results.push(rows[0]);
+      } catch (e) { errors.push({ patente, error: e.message }); }
+    }
+    res.status(201).json({ ok: true, created: results.length, errors, results });
+  } catch (err) {
+    res.status(500).json({ error: 'Error al crear certificados en lote.' });
+  }
+});
+
+/* PATCH /certificados/bulk/invalidar — invalidar varios */
+router.patch('/bulk/invalidar', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || !ids.length)
+      return res.status(400).json({ error: 'ids debe ser un array no vacío.' });
+    const invalidado_por = req.user?.username || req.user?.sub || 'admin';
+    const ph = ids.map((_,i) => `$${i+2}`).join(',');
+    const { rows } = await query(
+      `UPDATE public.certificados SET estado='invalidado', invalidado_por=$1, invalidado_at=now()
+       WHERE id IN (${ph}) AND estado!='invalidado' RETURNING id, patente, estado`,
+      [invalidado_por, ...ids]
+    );
+    res.json({ ok: true, updated: rows.length, rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Error al invalidar en lote.' });
+  }
+});
+
+/* DELETE /certificados/bulk — eliminar varios vencidos/invalidados */
+router.delete('/bulk', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || !ids.length)
+      return res.status(400).json({ error: 'ids debe ser un array no vacío.' });
+    const ph = ids.map((_,i) => `$${i+1}`).join(',');
+    const { rows } = await query(
+      `DELETE FROM public.certificados
+       WHERE id IN (${ph})
+         AND (estado='invalidado' OR estado='vencido'
+              OR (estado='vigente' AND fecha_vencimiento < now()))
+       RETURNING id, patente`,
+      ids
+    );
+    res.json({ ok: true, deleted: rows.length, rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Error al eliminar en lote.' });
+  }
+});
+
 module.exports = router;
