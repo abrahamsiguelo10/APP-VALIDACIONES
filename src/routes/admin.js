@@ -1,9 +1,6 @@
 /**
  * routes/admin.js
- * GET /admin/system-info  — info del sistema
- * GET /admin/audit        — historial de cambios (admin)
  */
-
 const router = require('express').Router();
 const { query } = require('../db/pool');
 const { requireAuth, requireRole } = require('../middleware/auth');
@@ -24,7 +21,9 @@ router.get('/system-info', requireRole('admin'), async (_req, res) => {
       dests:  parseInt(dests.rows[0].count),
       users:  parseInt(users.rows[0].count),
       events: parseInt(events.rows[0].count),
-      ts: new Date().toISOString(),
+      db:     'connected',
+      uptime: Math.floor(process.uptime()),
+      ts:     new Date().toISOString(),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -61,14 +60,8 @@ router.get('/audit', requireRole('admin'), async (req, res) => {
 
     const [rows, total] = await Promise.all([
       query(
-        `SELECT
-           id, action, target, created_at,
-           COALESCE(user_id,  '')   AS user_id,
-           COALESCE(username, '—')  AS username,
-           COALESCE(role,     '')   AS role,
-           COALESCE(ip,       '')   AS ip,
-           before_data,
-           after_data
+        `SELECT id, action, target, before_data, after_data,
+                user_id, username, role, ip, created_at
          FROM public.audit_log
          ${where}
          ORDER BY created_at DESC
@@ -78,23 +71,18 @@ router.get('/audit', requireRole('admin'), async (req, res) => {
       query(`SELECT COUNT(*) FROM public.audit_log ${where}`, values),
     ]);
 
-  // En GET /admin/system-info, cambiar la respuesta por:
-res.json({
-  units:  parseInt(units.rows[0].count),
-  dests:  parseInt(dests.rows[0].count),
-  users:  parseInt(users.rows[0].count),
-  events: parseInt(events.rows[0].count),
-  db:     'connected',          // ← agregar
-  uptime: process.uptime(),     // ← agregar
-  ts:     new Date().toISOString(),
-});
+    res.json({
+      rows:  rows.rows,
+      total: parseInt(total.rows[0].count),
+      limit: parseInt(limit),
+      offset: parseInt(offset),
+    });
   } catch (err) {
-    // Si la columna no existe aún, devolver estructura vacía en vez de error 500
     if (err.message?.includes('column') && err.message?.includes('does not exist')) {
       return res.json({ rows: [], total: 0,
         limit:  parseInt(req.query.limit  || 100),
         offset: parseInt(req.query.offset || 0),
-        warning: 'Migraciones pendientes. Reinicia el servidor.' });
+        warning: 'Migraciones pendientes.' });
     }
     res.status(500).json({ error: err.message });
   }
