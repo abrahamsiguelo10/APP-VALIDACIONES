@@ -85,6 +85,8 @@ const migrations = [
     sql: `ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS role TEXT;` },
   { name: '014g_audit_log_ip',
     sql: `ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS ip TEXT;` },
+  { name: '014i_audit_log_created_at',
+    sql: `ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();` },
   { name: '014h_audit_log_indexes',
     sql: `
       CREATE INDEX IF NOT EXISTS idx_audit_log_action   ON public.audit_log(action);
