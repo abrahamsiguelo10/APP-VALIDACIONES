@@ -87,6 +87,13 @@ const migrations = [
     sql: `ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS ip TEXT;` },
   { name: '014i_audit_log_created_at',
     sql: `ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();` },
+  { name: '014i_audit_log_created_at',
+    sql: `ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();` },
+  { name: '014j_audit_log_actor_nullable',
+    sql: `
+      -- Si existe columna 'actor' con NOT NULL, hacerla nullable
+      ALTER TABLE public.audit_log ALTER COLUMN actor DROP NOT NULL;
+    ` },
   { name: '014h_audit_log_indexes',
     sql: `
       CREATE INDEX IF NOT EXISTS idx_audit_log_action   ON public.audit_log(action);
