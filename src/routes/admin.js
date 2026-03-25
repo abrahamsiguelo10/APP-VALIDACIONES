@@ -78,12 +78,16 @@ router.get('/audit', requireRole('admin'), async (req, res) => {
       query(`SELECT COUNT(*) FROM public.audit_log ${where}`, values),
     ]);
 
-    res.json({
-      rows:  rows.rows,
-      total: parseInt(total.rows[0].count),
-      limit: parseInt(limit),
-      offset: parseInt(offset),
-    });
+  // En GET /admin/system-info, cambiar la respuesta por:
+res.json({
+  units:  parseInt(units.rows[0].count),
+  dests:  parseInt(dests.rows[0].count),
+  users:  parseInt(users.rows[0].count),
+  events: parseInt(events.rows[0].count),
+  db:     'connected',          // ← agregar
+  uptime: process.uptime(),     // ← agregar
+  ts:     new Date().toISOString(),
+});
   } catch (err) {
     // Si la columna no existe aún, devolver estructura vacía en vez de error 500
     if (err.message?.includes('column') && err.message?.includes('does not exist')) {
