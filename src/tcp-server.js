@@ -6,22 +6,18 @@
  * Wialon IPS:          primer byte = '#' (0x23)
  * Wialon Retranslator: primer 4 bytes = tamaño del paquete en Little Endian (binario)
  */
-
 'use strict';
 
-const net       = require('net');
+const net   = require('net');
 const { query } = require('./db/pool');
 
 const TCP_PORT = parseInt(process.env.TCP_PORT || '9001', 10);
 
 // ─── Parser Wialon IPS (texto) ────────────────────────────────────────────────
-// Formato Wialon: #D#DDMMYY;HHMMSS;DDMM.MMMM;NS;DDDMM.MMMM;EW;speed;course;alt;sats;...
-// Ejemplo real:   #D#160326;182342;3250.5190;S;07112.9180;W;0;0;0.000000;14;...
 function parseWialonIPS(raw) {
   try {
     const str = raw.toString('ascii').trim();
     if (!str.startsWith('#')) return null;
-
     const parts = str.split('#').filter(Boolean);
     const type  = parts[0];
 
@@ -32,11 +28,8 @@ function parseWialonIPS(raw) {
 
     if (type === 'D' || type === 'SD') {
       const body = (parts[1] || '').split(';');
-      // Campos: date;time;latDDMM;NS;lonDDDMM;EW;speed;course;alt;sats;hdop;inputs;...
       const [date, time, latRaw, latHem, lonRaw, lonHem, speed, course, alt, sats,, inputs] = body;
 
-      // Convertir DDMM.MMMM → decimal
-      // latRaw = "3250.5190" → 32° + 50.5190/60
       function nmea2dec(raw, hem) {
         const v = parseFloat(raw);
         if (isNaN(v)) return NaN;
@@ -51,39 +44,32 @@ function parseWialonIPS(raw) {
       const lon = nmea2dec(lonRaw, lonHem);
       if (isNaN(lat) || isNaN(lon)) return null;
 
-      // inputs puede ser "NA" o un número — bit 0 = ignición
-      const ignition = inputs && inputs !== 'NA'
-        ? !!(parseInt(inputs, 10) & 1)
-        : false;
+      const ignition = inputs && inputs !== 'NA' ? !!(parseInt(inputs, 10) & 1) : false;
 
       let wialon_ts = null;
       try {
         if (date && time) {
-          // date = "160326" → DD MM YY → 2026-03-16
           const dd = date.slice(0,2), mm = date.slice(2,4), yy = date.slice(4,6);
-          // time = "182342" → HH MM SS
           const hh = time.slice(0,2), mi = time.slice(2,4), ss = time.slice(4,6);
           wialon_ts = new Date(`20${yy}-${mm}-${dd}T${hh}:${mi}:${ss}Z`).toISOString();
         }
       } catch (_) {}
 
       return {
-        type:    'data',
-        lat:     parseFloat(lat.toFixed(6)),
-        lon:     parseFloat(lon.toFixed(6)),
-        speed:   parseFloat(speed || '0'),
-        heading: parseFloat(course || '0'),
+        type:      'data',
+        lat:       parseFloat(lat.toFixed(6)),
+        lon:       parseFloat(lon.toFixed(6)),
+        speed:     parseFloat(speed  || '0'),
+        heading:   parseFloat(course || '0'),
+        alt:       parseFloat(alt    || '0'),
+        sats:      parseInt(sats     || '0', 10),
         ignition,
         wialon_ts,
-        raw:     str,
+        raw:       str,
       };
     }
 
-    if (type === 'P') {
-      // Ping — responder #AP# y no hacer nada más
-      return { type: 'ping' };
-    }
-
+    if (type === 'P') return { type: 'ping' };
     return null;
   } catch (err) {
     console.error('[TCP] parseWialonIPS error:', err.message);
@@ -91,116 +77,65 @@ function parseWialonIPS(raw) {
   }
 }
 
-// ─── Parser Wialon Retranslator v1.0 (binario) ────────────────────────────────
-// Estructura del paquete:
-//   [4B LE]  Packet size (sin incluir estos 4 bytes)
-//   [N+1B]   UID string terminado en 0x00
-//   [4B]     Unix timestamp (Big Endian)
-//   [4B]     Bitmask (qué bloques siguen)
-//   [bloques] Cada bloque: [2B type 0x0BBB][4B size BE][size bytes de data]
-//
-// Bloque posinfo (type 0x0002 dentro del bloque):
-//   [8B double LE] Longitude
-//   [8B double LE] Latitude
-//   [8B double LE] Altitude
-//   [2B short  BE] Speed (km/h)
-//   [2B short  BE] Course (0-359)
-//   [1B byte]      Satellites
-//
-// Respuesta del servidor: 0x11 por cada paquete válido
-
+// ─── Parser Wialon Retranslator v1.0 (binario) ───────────────────────────────
 function parseRetranslatorPacket(buf) {
   try {
     if (buf.length < 8) return null;
-
-    // Tamaño del paquete (sin los 4 bytes del size)
     const packetSize = buf.readUInt32LE(0);
-    if (buf.length < packetSize + 4) return null; // paquete incompleto
+    if (buf.length < packetSize + 4) return null;
 
     let offset = 4;
-
-    // UID: string terminado en 0x00
     const nullIdx = buf.indexOf(0x00, offset);
     if (nullIdx === -1) return null;
     const uid = buf.slice(offset, nullIdx).toString('ascii');
     offset = nullIdx + 1;
 
     if (offset + 8 > buf.length) return null;
-
-    // Timestamp (4 bytes Big Endian)
-    const timestamp = buf.readUInt32BE(offset);
-    offset += 4;
-
-    // Bitmask (4 bytes) — indica qué bloques vienen
-    const bitmask = buf.readUInt32BE(offset);
-    offset += 4;
+    const timestamp = buf.readUInt32BE(offset); offset += 4;
+    offset += 4; // bitmask
 
     const wialon_ts = timestamp ? new Date(timestamp * 1000).toISOString() : null;
-
-    // Parsear bloques de datos
     let lat = null, lon = null, speed = null, heading = null, altitude = null, sats = null;
 
     while (offset + 6 <= packetSize + 4) {
-      // Cada bloque: 2 bytes tipo (siempre 0x0BBB) + 4 bytes tamaño
       if (offset + 6 > buf.length) break;
-
-      const blockType = buf.readUInt16BE(offset);
-      offset += 2;
-      const blockSize = buf.readUInt32BE(offset);
-      offset += 4;
-
-      if (blockType !== 0x0BBB) {
-        offset += blockSize;
-        continue;
-      }
-
+      const blockType = buf.readUInt16BE(offset); offset += 2;
+      const blockSize = buf.readUInt32BE(offset); offset += 4;
+      if (blockType !== 0x0BBB) { offset += blockSize; continue; }
       if (offset + blockSize > buf.length) break;
       const blockData = buf.slice(offset, offset + blockSize);
       offset += blockSize;
-
       if (blockSize < 1) continue;
-
-      // Security attribute (1 byte) + data type (1 byte) + nombre (hasta 0x00) + valor
       let bOff = 0;
-      bOff += 1; // security attribute — skip
-
-      if (bOff >= blockData.length) continue;
-      const dataType = blockData[bOff];
       bOff += 1;
-
-      // Nombre del bloque (string hasta 0x00)
+      const dataType = blockData[bOff]; bOff += 1;
       const nameNull = blockData.indexOf(0x00, bOff);
       if (nameNull === -1) continue;
       const blockName = blockData.slice(bOff, nameNull).toString('ascii');
       bOff = nameNull + 1;
-
       if (blockName === 'posinfo' && dataType === 0x02) {
-        // posinfo: lon(8) lat(8) alt(8) speed(2) course(2) sats(1)
         if (bOff + 27 <= blockData.length) {
-          lon      = blockData.readDoubleBE(bOff);     bOff += 8;
-          lat      = blockData.readDoubleBE(bOff);     bOff += 8;
-          altitude = blockData.readDoubleBE(bOff);     bOff += 8;
-          speed    = blockData.readInt16BE(bOff);      bOff += 2;
-          heading  = blockData.readInt16BE(bOff);      bOff += 2;
+          lon      = blockData.readDoubleBE(bOff); bOff += 8;
+          lat      = blockData.readDoubleBE(bOff); bOff += 8;
+          altitude = blockData.readDoubleBE(bOff); bOff += 8;
+          speed    = blockData.readInt16BE(bOff);  bOff += 2;
+          heading  = blockData.readInt16BE(bOff);  bOff += 2;
           sats     = blockData[bOff];
         }
       }
     }
 
     if (lat === null || lon === null) return null;
-
     return {
       type:       'retranslator_data',
-      uid,
-      timestamp,
-      wialon_ts,
+      uid, timestamp, wialon_ts,
       lat:        parseFloat(lat.toFixed(6)),
       lon:        parseFloat(lon.toFixed(6)),
-      speed:      speed ?? 0,
-      heading:    heading ?? 0,
-      altitude:   altitude ?? 0,
-      sats:       sats ?? 0,
-      ignition:   false, // no incluido en posinfo básico
+      speed:      speed    ?? 0,
+      heading:    heading  ?? 0,
+      alt:        altitude ?? 0,
+      sats:       sats     ?? 0,
+      ignition:   false,
       raw:        buf.slice(0, packetSize + 4).toString('hex').slice(0, 80),
       packetSize: packetSize + 4,
     };
@@ -210,10 +145,10 @@ function parseRetranslatorPacket(buf) {
   }
 }
 
-// ─── Buscar unidad por IMEI o UID ─────────────────────────────────────────────
+// ─── Buscar unidad ────────────────────────────────────────────────────────────
 async function findUnit(imei) {
   const { rows } = await query(
-    'SELECT imei, plate, name, enabled FROM public.units WHERE imei = $1',
+    'SELECT imei, plate, name, rut, enabled, cliente_id FROM public.units WHERE imei = $1',
     [imei]
   );
   return rows[0] || null;
@@ -224,17 +159,17 @@ async function saveEvent(unit, parsed, destinationId, forwardOk, forwardResp) {
   try {
     await query(`
       INSERT INTO public.gps_events
-        (plate, imei, lat, lon, speed, heading, ignition,
-         wialon_ts, destination_id, forward_ok, forward_resp, raw_hex)
+        (plate, imei, lat, lon, speed, heading, ignition, wialon_ts,
+         destination_id, forward_ok, forward_resp, raw_hex)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
     `, [
       unit.plate, unit.imei,
       parsed.lat, parsed.lon, parsed.speed, parsed.heading, parsed.ignition,
       parsed.wialon_ts,
-      destinationId  || null,
-      forwardOk      ?? null,
-      forwardResp    || null,
-      parsed.raw     || null,
+      destinationId || null,
+      forwardOk     ?? null,
+      forwardResp   || null,
+      parsed.raw    || null,
     ]);
   } catch (err) {
     console.error('[TCP] saveEvent error:', err.message);
@@ -244,26 +179,161 @@ async function saveEvent(unit, parsed, destinationId, forwardOk, forwardResp) {
 // ─── Headers de autenticación ─────────────────────────────────────────────────
 function buildAuthHeaders(auth) {
   if (!auth || !auth.type || auth.type === 'none') return {};
-  if (auth.type === 'bearer')  return { Authorization: `Bearer ${auth.token}` };
+  if (auth.type === 'bearer') return { Authorization: `Bearer ${auth.token}` };
   if (auth.type === 'basic') {
     const b64 = Buffer.from(`${auth.username}:${auth.password}`).toString('base64');
     return { Authorization: `Basic ${b64}` };
   }
-  if (auth.type === 'apikey')  return { [auth.header || 'X-Api-Key']: auth.value };
+  if (auth.type === 'apikey') return { [auth.header || 'X-Api-Key']: auth.value };
   return {};
+}
+
+// ─── Construir payload dinámico desde field_schema ────────────────────────────
+/**
+ * Resuelve el valor de cada campo GPS según su "source" configurado en la modal.
+ *
+ * Las fuentes disponibles coinciden con las opciones en orgs.js GPS_SOURCES:
+ *   plate, imei, lat, lon, speed, heading, ignition, ignition01,
+ *   wialon_ts, fecha_hora, fecha_slash, alt, sats, hdop, odometro
+ */
+function resolveSource(source, unit, parsed, clienteData) {
+  const pad = n => String(n).padStart(2, '0');
+  function toFecha(iso, sep) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (isNaN(d)) return iso;
+    return `${pad(d.getUTCDate())}${sep}${pad(d.getUTCMonth()+1)}${sep}${d.getUTCFullYear()} `
+         + `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+  }
+
+  switch (source) {
+    // ── Datos GPS (del dispositivo) ──────────────────────────────────────────
+    case 'lat':            return parsed.lat       ?? 0;
+    case 'lon':            return parsed.lon       ?? 0;
+    case 'speed':          return parsed.speed     ?? 0;
+    case 'heading':        return parsed.heading   ?? 0;
+    case 'ignition':       return parsed.ignition  ?? false;
+    case 'ignition01':     return parsed.ignition  ? 1 : 0;
+    case 'wialon_ts':      return parsed.wialon_ts || new Date().toISOString();
+    case 'fecha_hora':     return toFecha(parsed.wialon_ts, '-');
+    case 'fecha_slash':    return toFecha(parsed.wialon_ts, '/');
+    case 'alt':            return parsed.alt       ?? 0;
+    case 'sats':           return parsed.sats      ?? 0;
+    case 'hdop':           return parsed.hdop      ?? 0;
+    case 'odometro':       return parsed.odometro  ?? 0;
+
+    // ── Datos de la unidad (de la DB) ────────────────────────────────────────
+    case 'unit_plate':     return unit.plate       || '';
+    case 'unit_imei':      return unit.imei        || '';
+    case 'unit_name':      return unit.name        || '';
+    case 'unit_rut':       return unit.rut         || '';
+    case 'cliente_nombre': return clienteData?.nombre || '';
+    case 'cliente_rut':    return clienteData?.rut    || '';
+
+    // ── Retrocompatibilidad con fuentes antiguas ─────────────────────────────
+    case 'plate':          return unit.plate || '';
+    case 'imei':           return unit.imei  || '';
+
+    default:               return null;
+  }
+}
+
+/**
+ * Construye el payload para un destino a partir de su field_schema.
+ *
+ * Si el destino tiene campos con "source" configurado → payload mapeado.
+ * Si todos los campos tienen source vacío o no hay campos → payload genérico.
+ *
+ * El resultado siempre es un ARRAY (como requieren la mayoría de APIs GPS).
+ * Si el destino necesita un objeto en vez de array, se puede configurar
+ * agregando un campo especial con apiKey="__format__" y source="object".
+ */
+function buildPayload(fieldSchema, unit, parsed, clienteData) {
+  const fields = (fieldSchema || [])
+    .filter(f => f.apiKey && (f.source || f.source === 'fixed'))
+    .sort((a, b) => (a.order || 0) - (b.order || 0));
+
+  // Sin campos mapeados → payload genérico (retrocompatibilidad)
+  if (!fields.length) {
+    return {
+      payload: [{
+        imei:     unit.imei,
+        plate:    unit.plate,
+        lat:      parsed.lat,
+        lon:      parsed.lon,
+        speed:    parsed.speed,
+        heading:  parsed.heading,
+        ignition: parsed.ignition,
+        ts:       parsed.wialon_ts,
+      }],
+      missing: [],    // sin campos requeridos faltantes
+      warnings: [],
+    };
+  }
+
+  const obj      = {};
+  const missing  = [];   // campos required sin valor
+  const warnings = [];   // campos opcionales sin valor
+
+  for (const f of fields) {
+    let val;
+
+    if (f.source === 'fixed') {
+      val = (f.fixedValue !== undefined && f.fixedValue !== null && f.fixedValue !== '')
+        ? f.fixedValue
+        : null;
+    } else {
+      val = resolveSource(f.source, unit, parsed, clienteData);
+    }
+
+    // Valor nulo o string vacío → campo sin datos
+    const isEmpty = val === null || val === undefined || val === '';
+
+    if (isEmpty) {
+      if (f.required) {
+        missing.push({ apiKey: f.apiKey, source: f.source, label: f.label });
+      } else {
+        warnings.push({ apiKey: f.apiKey, source: f.source });
+        // Incluir igual con null para que el destino decida qué hacer
+        obj[f.apiKey] = null;
+      }
+    } else {
+      obj[f.apiKey] = val;
+    }
+  }
+
+  return { payload: [obj], missing, warnings };
 }
 
 // ─── Reenviar a destinos ──────────────────────────────────────────────────────
 async function forwardToDestinations(unit, parsed) {
+  // Leer destinos asignados CON su field_schema y auth
+  // Cargar datos del cliente de la unidad (para fuentes cliente_nombre, cliente_rut)
+  let clienteData = {};
+  try {
+    if (unit.cliente_id) {
+      const { rows: cr } = await query(
+        'SELECT nombre, rut FROM public.clientes WHERE id = $1', [unit.cliente_id]
+      );
+      if (cr[0]) clienteData = cr[0];
+    }
+  } catch (_) {}
+
   const { rows: assignments } = await query(`
-    SELECT ud.shadow, d.id AS dest_id, d.name AS dest_name, d.api_url
-    FROM  public.unit_destinations ud
-    JOIN  public.destinations d ON d.id = ud.destination_id
+    SELECT
+      ud.shadow,
+      d.id          AS dest_id,
+      d.name        AS dest_name,
+      d.api_url,
+      d.field_schema,
+      d.auth
+    FROM public.unit_destinations ud
+    JOIN public.destinations d ON d.id = ud.destination_id
     WHERE ud.imei    = $1
       AND ud.enabled = true
       AND d.enabled  = true
-      AND d.api_url  IS NOT NULL
-      AND d.api_url  <> ''
+      AND d.api_url IS NOT NULL
+      AND d.api_url <> ''
   `, [unit.imei]);
 
   if (!assignments.length) {
@@ -273,38 +343,57 @@ async function forwardToDestinations(unit, parsed) {
   }
 
   for (const row of assignments) {
+    // ── Shadow: registrar sin enviar ─────────────────────────────────────────
     if (row.shadow) {
       console.log(`[TCP] ${unit.plate} → ${row.dest_name} [SHADOW]`);
       await saveEvent(unit, parsed, row.dest_id, null, 'shadow');
       continue;
     }
 
-    // Leer auth por separado — graceful si columna no existe
-    let authHeaders = {};
+    // ── Construir payload usando field_schema del destino ────────────────────
+    let fieldSchema = [];
     try {
-      const { rows: dr } = await query(
-        'SELECT auth FROM public.destinations WHERE id = $1', [row.dest_id]
-      );
-      if (dr[0]?.auth) authHeaders = buildAuthHeaders(dr[0].auth);
+      fieldSchema = typeof row.field_schema === 'string'
+        ? JSON.parse(row.field_schema)
+        : (row.field_schema || []);
     } catch (_) {}
 
-    const payload = {
-      imei:     unit.imei,
-      plate:    unit.plate,
-      lat:      parsed.lat,
-      lon:      parsed.lon,
-      speed:    parsed.speed,
-      heading:  parsed.heading,
-      ignition: parsed.ignition,
-      ts:       parsed.wialon_ts,
-    };
+    const { payload: payloadArray, missing, warnings } = buildPayload(fieldSchema, unit, parsed, clienteData);
 
+    // ── Campos requeridos faltantes → no enviar ───────────────────────────────
+    if (missing.length > 0) {
+      const faltantes = missing.map(f => `${f.apiKey}(${f.source})`).join(', ');
+      const errMsg    = `CAMPOS_FALTANTES: ${faltantes}`;
+      console.error(`[TCP] ${unit.plate} → ${row.dest_name} ✗ ${errMsg}`);
+      await saveEvent(unit, parsed, row.dest_id, false, errMsg);
+      continue;
+    }
+
+    // ── Advertencias de campos opcionales vacíos ─────────────────────────────
+    if (warnings.length > 0) {
+      const warnFields = warnings.map(f => f.apiKey).join(', ');
+      console.warn(`[TCP] ${unit.plate} → ${row.dest_name} ⚠ campos opcionales vacíos: ${warnFields}`);
+    }
+
+    // ── Auth headers ─────────────────────────────────────────────────────────
+    let auth = null;
+    try {
+      auth = typeof row.auth === 'string' ? JSON.parse(row.auth) : row.auth;
+    } catch (_) {}
+    const authHeaders = buildAuthHeaders(auth);
+
+    // Loguear modo
+    const mappedFields = fieldSchema.filter(f => f.source).length;
+    const mode = mappedFields > 0 ? `mapeo(${mappedFields} campos)` : 'genérico';
+    console.log(`[TCP] ${unit.plate} → ${row.dest_name} [${mode}]`);
+
+    // ── Enviar ───────────────────────────────────────────────────────────────
     let forwardOk = false, forwardResp = null;
     try {
       const res = await fetch(row.api_url, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders },
-        body:    JSON.stringify(payload),
+        body:    JSON.stringify(payloadArray),
         signal:  AbortSignal.timeout(8000),
       });
       forwardOk   = res.ok;
@@ -327,15 +416,14 @@ function startTcpServer() {
   }
 
   const server = net.createServer((socket) => {
-    const remoteAddr  = socket.remoteAddress || '?';
-    let sessionImei   = null;
-    let protocol      = null; // 'ips' | 'retranslator' | null
-    let ipsBuffer     = '';
-    let rtBuffer      = Buffer.alloc(0);
+    const remoteAddr = socket.remoteAddress || '?';
+    let sessionImei = null;
+    let protocol    = null; // 'ips' | 'retranslator' | null
+    let ipsBuffer   = '';
+    let rtBuffer    = Buffer.alloc(0);
 
     console.log(`[TCP] Nueva conexión desde ${remoteAddr}`);
 
-    // Timeout: si en 20s no llega ningún byte, cerrar
     const noDataTimer = setTimeout(() => {
       console.warn(`[TCP] Sin datos en 20s desde ${remoteAddr} — cerrando`);
       socket.destroy();
@@ -344,7 +432,7 @@ function startTcpServer() {
     socket.on('data', async (chunk) => {
       clearTimeout(noDataTimer);
 
-      // Detectar protocolo por el primer byte recibido
+      // Detectar protocolo por el primer byte
       if (protocol === null) {
         const firstByte = chunk[0];
         if (firstByte === 0x23) { // '#'
@@ -356,20 +444,17 @@ function startTcpServer() {
         }
       }
 
-      // ── Protocolo Wialon IPS ──────────────────────────────────────────────
+      // ── Wialon IPS ─────────────────────────────────────────────────────────
       if (protocol === 'ips') {
         ipsBuffer += chunk.toString('ascii');
         const lines = ipsBuffer.split('\r\n');
-        ipsBuffer = lines.pop();
+        ipsBuffer   = lines.pop();
 
         for (const line of lines) {
           if (!line.trim()) continue;
           console.log(`[TCP-IPS] RAW: ${line.slice(0, 100)}`);
           const parsed = parseWialonIPS(line);
-          if (!parsed) {
-            console.warn(`[TCP-IPS] Línea no reconocida: ${line.slice(0, 80)}`);
-            continue;
-          }
+          if (!parsed) { console.warn(`[TCP-IPS] Línea no reconocida: ${line.slice(0, 80)}`); continue; }
 
           if (parsed.type === 'login') {
             sessionImei = parsed.imei;
@@ -377,12 +462,7 @@ function startTcpServer() {
             console.log(`[TCP-IPS] Login IMEI: ${sessionImei}`);
             continue;
           }
-
-          if (parsed.type === 'ping') {
-            socket.write('#AP#\r\n');
-            continue;
-          }
-
+          if (parsed.type === 'ping') { socket.write('#AP#\r\n'); continue; }
           if (parsed.type === 'data') {
             socket.write('#AD#1\r\n');
             if (!sessionImei) { console.warn('[TCP-IPS] Datos sin login'); continue; }
@@ -394,62 +474,45 @@ function startTcpServer() {
         }
       }
 
-      // ── Protocolo Wialon Retranslator ─────────────────────────────────────
+      // ── Wialon Retranslator ─────────────────────────────────────────────────
       if (protocol === 'retranslator') {
         rtBuffer = Buffer.concat([rtBuffer, chunk]);
 
-        // Procesar todos los paquetes completos en el buffer
         while (rtBuffer.length >= 4) {
           const packetSize = rtBuffer.readUInt32LE(0);
-
-          // Esperar hasta tener el paquete completo
           if (rtBuffer.length < packetSize + 4) break;
 
           const packetBuf = rtBuffer.slice(0, packetSize + 4);
-          rtBuffer = rtBuffer.slice(packetSize + 4); // consumir del buffer
+          rtBuffer        = rtBuffer.slice(packetSize + 4);
 
           console.log(`[TCP-RT] Paquete recibido: ${packetSize + 4} bytes desde ${remoteAddr}`);
-
           const parsed = parseRetranslatorPacket(packetBuf);
 
           if (!parsed) {
-            console.warn(`[TCP-RT] Paquete no parseable desde ${remoteAddr}: ${packetBuf.slice(0,20).toString('hex')}`);
-            // Responder 0x11 igual para no bloquear al retransmisor
+            console.warn(`[TCP-RT] Paquete no parseable desde ${remoteAddr}`);
             socket.write(Buffer.from([0x11]));
             continue;
           }
 
           console.log(`[TCP-RT] UID: ${parsed.uid} | lat: ${parsed.lat} lon: ${parsed.lon} speed: ${parsed.speed}`);
-
-          // Responder 0x11 inmediatamente (ACK del protocolo Retranslator)
           socket.write(Buffer.from([0x11]));
 
-          // Buscar la unidad por el UID del retransmisor
-          // El UID en Wialon Retranslator es el IMEI del dispositivo
           const unit = await findUnit(parsed.uid);
-          if (!unit) {
-            console.warn(`[TCP-RT] UID/IMEI ${parsed.uid} no registrado en la DB`);
-            continue;
-          }
-          if (!unit.enabled) {
-            console.log(`[TCP-RT] ${unit.plate} deshabilitada`);
-            continue;
-          }
+          if (!unit)         { console.warn(`[TCP-RT] UID/IMEI ${parsed.uid} no registrado`); continue; }
+          if (!unit.enabled) { console.log(`[TCP-RT] ${unit.plate} deshabilitada`); continue; }
 
           sessionImei = parsed.uid;
-
-          // Normalizar el parsed para reutilizar forwardToDestinations
-          const normalizedParsed = {
+          await forwardToDestinations(unit, {
             lat:       parsed.lat,
             lon:       parsed.lon,
             speed:     parsed.speed,
             heading:   parsed.heading,
+            alt:       parsed.alt,
+            sats:      parsed.sats,
             ignition:  parsed.ignition,
             wialon_ts: parsed.wialon_ts,
             raw:       parsed.raw,
-          };
-
-          await forwardToDestinations(unit, normalizedParsed);
+          });
         }
       }
     });
@@ -461,7 +524,7 @@ function startTcpServer() {
 
     socket.on('close', () => {
       clearTimeout(noDataTimer);
-      console.log(`[TCP] Conexión cerrada${sessionImei ? ' UID/IMEI:' + sessionImei : ''} (${remoteAddr}) protocolo:${protocol || 'desconocido'}`);
+      console.log(`[TCP] Conexión cerrada${sessionImei ? ' IMEI:' + sessionImei : ''} (${remoteAddr}) protocolo:${protocol || 'desconocido'}`);
     });
   });
 
