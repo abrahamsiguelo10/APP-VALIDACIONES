@@ -227,8 +227,8 @@ function resolveSource(source, unit, parsed, clienteData) {
     case 'unit_imei':      return unit.imei        || '';
     case 'unit_name':      return unit.name        || '';
     case 'unit_rut':       return unit.rut         || '';
-    case 'cliente_nombre': return clienteData?.nombre || '';
-    case 'cliente_rut':    return clienteData?.rut    || '';
+    case 'cliente_nombre': return clienteData?.nombre || unit.name  || null;
+    case 'cliente_rut':    return clienteData?.rut    || unit.rut   || null;
 
     // ── Retrocompatibilidad con fuentes antiguas ─────────────────────────────
     case 'plate':          return unit.plate || '';
@@ -381,6 +381,8 @@ async function forwardToDestinations(unit, parsed) {
       auth = typeof row.auth === 'string' ? JSON.parse(row.auth) : row.auth;
     } catch (_) {}
     const authHeaders = buildAuthHeaders(auth);
+    // LOG DIAGNÓSTICO — remover cuando se resuelva el 401
+    console.log(`[AUTH-DEBUG] ${row.dest_name} | type=${auth?.type} | token_len=${auth?.token?.length} | headers=${JSON.stringify(authHeaders).slice(0,80)}`);
 
     // Loguear modo
     const mappedFields = fieldSchema.filter(f => f.source).length;
