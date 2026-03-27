@@ -8,6 +8,15 @@
  */
 'use strict';
 
+// ── Handlers globales de error — evitan que el proceso muera por errores no capturados ──
+process.on('uncaughtException', (err) => {
+  console.error('[TCP] uncaughtException:', err.message, err.stack?.split('\n')[1] || '');
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[TCP] unhandledRejection:', reason?.message || reason);
+});
+
 const net   = require('net');
 const { query } = require('./db/pool');
 
@@ -381,8 +390,7 @@ async function forwardToDestinations(unit, parsed) {
       auth = typeof row.auth === 'string' ? JSON.parse(row.auth) : row.auth;
     } catch (_) {}
     const authHeaders = buildAuthHeaders(auth);
-    // LOG DIAGNÓSTICO — remover cuando se resuelva el 401
-    console.log(`[AUTH-DEBUG] ${row.dest_name} | type=${auth?.type} | token_len=${auth?.token?.length} | headers=${JSON.stringify(authHeaders).slice(0,80)}`);
+
 
     // Loguear modo
     const mappedFields = fieldSchema.filter(f => f.source).length;
@@ -396,7 +404,7 @@ async function forwardToDestinations(unit, parsed) {
         method:  'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders },
         body:    JSON.stringify(payloadArray),
-        signal:  AbortSignal.timeout(8000),
+        signal:  AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
       });
       forwardOk   = res.ok;
       forwardResp = `${res.status} ${res.statusText}`.slice(0, 500);
