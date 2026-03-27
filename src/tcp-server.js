@@ -405,11 +405,25 @@ async function forwardToDestinations(unit, parsed) {
 
     // ── Enviar ───────────────────────────────────────────────────────────────
     let forwardOk = false, forwardResp = null;
+
+    // Para APIs con auth 'basic' que requieren credenciales en el body (ej: Ziyu)
+    // intentar primero con credentials en body si el header Basic falla
+    let finalBody = payloadArray;
+    if (auth?.type === 'basic' && auth.username && auth.password) {
+      // Algunas APIs esperan username/password dentro del JSON payload
+      finalBody = payloadArray.map(item => ({
+        username: auth.username,
+        password: auth.password,
+        ...item,
+      }));
+      console.log(`[TCP] ${unit.plate} → ${row.dest_name} [basic-in-body] probando credenciales en payload`);
+    }
+
     try {
       const res = await fetch(row.api_url, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders },
-        body:    JSON.stringify(payloadArray),
+        body:    JSON.stringify(finalBody),
         signal:  AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
       });
       forwardOk   = res.ok;
