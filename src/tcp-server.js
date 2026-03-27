@@ -188,6 +188,8 @@ async function saveEvent(unit, parsed, destinationId, forwardOk, forwardResp) {
 // ─── Headers de autenticación ─────────────────────────────────────────────────
 function buildAuthHeaders(auth) {
   if (!auth || !auth.type || auth.type === 'none') return {};
+
+  // ── Tipos clásicos (retrocompatibilidad) ──────────────────────────────────
   if (auth.type === 'bearer') {
     return { Authorization: `Bearer ${auth.token}` };
   }
@@ -196,10 +198,34 @@ function buildAuthHeaders(auth) {
     return { Authorization: `Basic ${b64}` };
   }
   if (auth.type === 'bearer+basic') {
-    // Bearer token en header + credenciales básicas también en header
     return { Authorization: `Bearer ${auth.token}` };
   }
-  if (auth.type === 'apikey') return { [auth.header || 'X-Api-Key']: auth.value };
+  if (auth.type === 'apikey') {
+    return { [auth.header || 'X-Api-Key']: auth.value };
+  }
+
+  // ── custom-headers legacy (objeto con username_header/password_header) ────
+  if (auth.type === 'custom-headers' && !Array.isArray(auth.headers)) {
+    const headers = {};
+    if (auth.username_header && auth.username) headers[auth.username_header] = auth.username;
+    if (auth.password_header && auth.password) headers[auth.password_header] = auth.password;
+    if (auth.token_header  && auth.token)    headers[auth.token_header]    = auth.token;
+    return headers;
+  }
+
+  // ── custom-headers NUEVO: array de {key, value} ───────────────────────────
+  // Cualquier combinación de headers arbitrarios configurable desde la UI
+  // Ejemplo: [{ key: "Username", value: "siguelo" }, { key: "Password", value: "xxx" }]
+  if (auth.type === 'custom-headers' && Array.isArray(auth.headers)) {
+    const headers = {};
+    for (const h of auth.headers) {
+      if (h.key && h.value !== undefined && h.value !== '') {
+        headers[h.key] = h.value;
+      }
+    }
+    return headers;
+  }
+
   return {};
 }
 
