@@ -397,6 +397,12 @@ async function forwardToDestinations(unit, parsed) {
     const mode = mappedFields > 0 ? `mapeo(${mappedFields} campos)` : 'genérico';
     console.log(`[TCP] ${unit.plate} → ${row.dest_name} [${mode}]`);
 
+    // ── Log de diagnóstico ───────────────────────────────────────────────────
+    if (process.env.DEBUG_AUTH) {
+      console.log(`[AUTH-DEBUG] ${row.dest_name} | type=${auth?.type} | token_len=${auth?.token?.length} | token_end=${auth?.token?.slice(-8)}`);
+      console.log(`[PAYLOAD-DEBUG] ${unit.plate} | url=${row.api_url} | body=${JSON.stringify(payloadArray).slice(0,300)}`);
+    }
+
     // ── Enviar ───────────────────────────────────────────────────────────────
     let forwardOk = false, forwardResp = null;
     try {
@@ -407,8 +413,13 @@ async function forwardToDestinations(unit, parsed) {
         signal:  AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
       });
       forwardOk   = res.ok;
+      const respBody = await res.text().catch(()=>'');
       forwardResp = `${res.status} ${res.statusText}`.slice(0, 500);
-      console.log(`[TCP] ${unit.plate} → ${row.dest_name} ${forwardOk ? '✓' : '✗'} (${res.status})`);
+      if (!forwardOk) {
+        console.error(`[TCP] ${unit.plate} → ${row.dest_name} ✗ (${res.status}) body: ${respBody.slice(0,200)}`);
+      } else {
+        console.log(`[TCP] ${unit.plate} → ${row.dest_name} ✓ (${res.status})`);
+      }
     } catch (err) {
       forwardResp = err.message?.slice(0, 500) || 'error';
       console.error(`[TCP] ${unit.plate} → ${row.dest_name} error:`, err.message);
