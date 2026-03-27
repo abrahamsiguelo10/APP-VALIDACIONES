@@ -188,13 +188,39 @@ async function saveEvent(unit, parsed, destinationId, forwardOk, forwardResp) {
 // ─── Headers de autenticación ─────────────────────────────────────────────────
 function buildAuthHeaders(auth) {
   if (!auth || !auth.type || auth.type === 'none') return {};
-  if (auth.type === 'bearer') return { Authorization: `Bearer ${auth.token}` };
+  if (auth.type === 'bearer') {
+    return { Authorization: `Bearer ${auth.token}` };
+  }
   if (auth.type === 'basic') {
     const b64 = Buffer.from(`${auth.username}:${auth.password}`).toString('base64');
     return { Authorization: `Basic ${b64}` };
   }
+  if (auth.type === 'bearer+basic') {
+    // Bearer token en header + credenciales básicas también en header
+    return { Authorization: `Bearer ${auth.token}` };
+  }
   if (auth.type === 'apikey') return { [auth.header || 'X-Api-Key']: auth.value };
   return {};
+}
+
+/**
+ * Agrega credenciales al body del payload según el tipo de auth.
+ * - basic-in-body: username/password van dentro del JSON (no en header)
+ * - bearer+basic:  Bearer en header + username/password en body
+ */
+function injectAuthInBody(auth, payloadArray) {
+  if (!auth) return payloadArray;
+  const inject = {};
+  if (auth.type === 'basic-in-body') {
+    if (auth.username) inject.username = auth.username;
+    if (auth.password) inject.password = auth.password;
+  }
+  if (auth.type === 'bearer+basic') {
+    if (auth.username) inject.username = auth.username;
+    if (auth.password) inject.password = auth.password;
+  }
+  if (!Object.keys(inject).length) return payloadArray;
+  return payloadArray.map(item => ({ ...inject, ...item }));
 }
 
 // ─── Construir payload dinámico desde field_schema ────────────────────────────
@@ -406,18 +432,8 @@ async function forwardToDestinations(unit, parsed) {
     // ── Enviar ───────────────────────────────────────────────────────────────
     let forwardOk = false, forwardResp = null;
 
-    // Para APIs con auth 'basic' que requieren credenciales en el body (ej: Ziyu)
-    // intentar primero con credentials en body si el header Basic falla
-    let finalBody = payloadArray;
-    if (auth?.type === 'basic' && auth.username && auth.password) {
-      // Algunas APIs esperan username/password dentro del JSON payload
-      finalBody = payloadArray.map(item => ({
-        username: auth.username,
-        password: auth.password,
-        ...item,
-      }));
-      console.log(`[TCP] ${unit.plate} → ${row.dest_name} [basic-in-body] probando credenciales en payload`);
-    }
+    // Inyectar credenciales en el body si el tipo de auth lo requiere
+    const finalBody = injectAuthInBody(auth, payloadArray);
 
     try {
       const res = await fetch(row.api_url, {
