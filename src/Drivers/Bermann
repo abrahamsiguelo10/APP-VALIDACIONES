@@ -1,4 +1,3 @@
-
 /**
  * src/drivers/bermann.js
  * Driver Bermann GPS v3.4 — adaptado para tcp-server.js (CommonJS)
@@ -170,6 +169,10 @@ async function send({ event, unit } = {}) {
 
   const ev = computeEvent(imei, speed, estadoMotor);
 
+  const alt   = asNum(event?.alt,     0);
+  const hdop  = asNum(event?.hdop,    null);
+  const sats  = asNum(event?.sats,    null);
+
   const payload = {
     fecha:                formatUtc(tsMs),
     imei,
@@ -177,9 +180,12 @@ async function send({ event, unit } = {}) {
     latitud:              String(lat),
     longitud:             String(lng),
     orientacion:          Math.trunc(heading),
+    altitud:              Number(alt),
     velocidad:            Number(speed),
     id_cliente_externo:   clientId,
     ...(estadoMotor !== null ? { estado_motor: estadoMotor } : {}),
+    ...(hdop  !== null ? { hdop }     : {}),
+    ...(sats  !== null ? { num_sat: sats } : {}),
     evento: {
       id_cliente_externo: clientId,
       codigo_evento:      ev.codigo_evento,
