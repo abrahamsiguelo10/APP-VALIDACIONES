@@ -297,6 +297,15 @@ function resolveSource(source, unit, parsed, clienteData) {
     case 'wialon_ts':      return parsed.wialon_ts || new Date().toISOString();
     case 'fecha_hora':     return toFecha(parsed.wialon_ts, '-');
     case 'fecha_slash':    return toFecha(parsed.wialon_ts, '/');
+    case 'fecha_utc_off': {
+      // Formato: "YYYY-MM-DD HH:MM:SS +00:00" (UTC con offset explícito)
+      const iso = parsed.wialon_ts || new Date().toISOString();
+      const d   = new Date(iso);
+      if (isNaN(d)) return iso;
+      const p = n => String(n).padStart(2, '0');
+      return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ` +
+             `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} +00:00`;
+    }
     case 'alt':            return parsed.alt       ?? 0;
     case 'sats':           return parsed.sats      ?? 0;
     case 'hdop':           return parsed.hdop      ?? 0;
