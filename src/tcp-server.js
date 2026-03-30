@@ -249,6 +249,25 @@ function injectAuthInBody(auth, payloadArray) {
   return payloadArray.map(item => ({ ...inject, ...item }));
 }
 
+
+// ── Cargador de drivers externos ─────────────────────────────────────────────
+const _driverCache = {};
+
+function loadDriver(slug) {
+  if (_driverCache[slug]) return _driverCache[slug];
+  const candidates = [
+    require.resolve ? (() => { try { return require('./drivers/' + slug); } catch(_) { return null; } })() : null,
+  ];
+  const driver = candidates.find(Boolean);
+  if (!driver) {
+    console.warn(`[TCP] Driver "${slug}" no encontrado en ./drivers/`);
+    return null;
+  }
+  _driverCache[slug] = driver;
+  console.log(`[TCP] Driver "${slug}" cargado`);
+  return driver;
+}
+
 // ─── Construir payload dinámico desde field_schema ────────────────────────────
 /**
  * Resuelve el valor de cada campo GPS según su "source" configurado en la modal.
@@ -387,7 +406,8 @@ async function forwardToDestinations(unit, parsed) {
       d.name        AS dest_name,
       d.api_url,
       d.field_schema,
-      d.auth
+      d.auth,
+      d.driver_slug
     FROM public.unit_destinations ud
     JOIN public.destinations d ON d.id = ud.destination_id
     WHERE ud.imei    = $1
@@ -409,6 +429,54 @@ async function forwardToDestinations(unit, parsed) {
       console.log(`[TCP] ${unit.plate} → ${row.dest_name} [SHADOW]`);
       await saveEvent(unit, parsed, row.dest_id, null, 'shadow');
       continue;
+    }
+
+    // ── Driver externo: si el destino tiene driver_slug, delegar ─────────────
+    if (row.driver_slug) {
+      let forwardOk = false, forwardResp = null;
+      try {
+        const driver = loadDriver(row.driver_slug);
+        if (!driver) throw new Error(`Driver "${row.driver_slug}" no encontrado`);
+
+        const driverEvent = {
+          imei:       unit.imei,
+          lat:        parsed.lat,
+          lon:        parsed.lon,
+          speed:      parsed.speed,
+          heading:    parsed.heading,
+          alt:        parsed.alt   || 0,
+          ignition:   parsed.ignition,
+          engineOn:   parsed.ignition,
+          wialon_ts:  parsed.wialon_ts,
+          time_epoch: parsed.wialon_ts
+            ? Math.floor(new Date(parsed.wialon_ts).getTime() / 1000)
+            : Math.floor(Date.now() / 1000),
+        };
+        const driverUnit = {
+          imei:   unit.imei,
+          plate:  unit.plate,
+          name:   unit.name,
+          rut:    unit.rut,
+        };
+        const driverRoute = { destination_id: row.dest_id };
+
+        console.log(`[TCP] ${unit.plate} → ${row.dest_name} [driver:${row.driver_slug}]`);
+        const result = await driver.send({ event: driverEvent, unit: driverUnit, route: driverRoute });
+
+        forwardOk   = result.ok === true;
+        forwardResp = `${result.http_status || 0} ${result.status || ''} ${result.response_http || ''}`.trim().slice(0, 500);
+
+        if (forwardOk) {
+          console.log(`[TCP] ${unit.plate} → ${row.dest_name} ✓ (${result.http_status})`);
+        } else {
+          console.error(`[TCP] ${unit.plate} → ${row.dest_name} ✗ (${result.http_status}) ${result.response_http?.slice(0,150) || ''}`);
+        }
+      } catch (err) {
+        forwardResp = err.message?.slice(0, 500) || 'driver_error';
+        console.error(`[TCP] ${unit.plate} → ${row.dest_name} driver error:`, err.message);
+      }
+      await saveEvent(unit, parsed, row.dest_id, forwardOk, forwardResp);
+      continue; // saltar el flow genérico de field_schema
     }
 
     // ── Construir payload usando field_schema del destino ────────────────────
