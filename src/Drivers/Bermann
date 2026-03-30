@@ -1,1 +1,220 @@
 
+/**
+ * src/drivers/bermann.js
+ * Driver Bermann GPS v3.4 — adaptado para tcp-server.js (CommonJS)
+ *
+ * Flujo:
+ *  1. POST /api/auth  → obtiene Bearer token (cache 58 min)
+ *  2. POST /api/data/insert con el token
+ *  3. Retry automático si 401 (refresh token)
+ *
+ * Configuración via variables de entorno Railway:
+ *   BERMANN_CLIENT_ID   — número de cliente externo
+ *   BERMANN_USER        — usuario API
+ *   BERMANN_PASS        — contraseña API
+ */
+
+'use strict';
+
+const BASE_URL   = 'https://concentrador.bermann.cl/integracion_bermann';
+const AUTH_URL   = BASE_URL + '/api/auth';
+const INSERT_URL = BASE_URL + '/api/data/insert';
+
+// ── Token cache (por proceso, compartido entre todas las unidades) ──
+const tokenState = { token: '', expiresAtMs: 0 };
+
+// ── Memoria por IMEI: último timestamp y último estado de ignición ──
+// Necesario para detectar transiciones Encendido/Apagado y correlatividad
+const lastByImei = new Map();
+
+// ── Helpers ───────────────────────────────────────────────────────
+function pad2(n) { return String(n).padStart(2, '0'); }
+
+// Bermann exige GMT0 "YYYY-MM-DD HH:MM:SS"
+function formatUtc(tsMs) {
+  const d = new Date(tsMs);
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth()+1)}-${pad2(d.getUTCDate())} ` +
+         `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`;
+}
+
+function asNum(x, fallback) {
+  const n = typeof x === 'string' ? Number(x) : x;
+  return Number.isFinite(n) ? n : (fallback !== undefined ? fallback : null);
+}
+
+function assertConfig() {
+  const id   = Number(process.env.BERMANN_CLIENT_ID || 0);
+  const user = (process.env.BERMANN_USER || '').trim();
+  const pass = (process.env.BERMANN_PASS || '').trim();
+  if (!id || !Number.isFinite(id)) throw new Error('BERMANN_CLIENT_ID faltante o inválido');
+  if (!user) throw new Error('BERMANN_USER faltante');
+  if (!pass) throw new Error('BERMANN_PASS faltante');
+  return { id, user, pass };
+}
+
+// ── Calcular código de evento ─────────────────────────────────────
+// 1=Movimiento, 6=Detenido, 2=Encendido (0→1), 3=Apagado (1→0)
+function computeEvent(imei, speed, ignition) {
+  const prev = lastByImei.get(imei) || { lastIgn: null };
+  const ign  = ignition === 1 || ignition === true  ? 1
+             : ignition === 0 || ignition === false ? 0
+             : null;
+  const spd  = asNum(speed, 0);
+
+  if (prev.lastIgn !== null && ign !== null) {
+    if (prev.lastIgn === 0 && ign === 1) return { codigo_evento: 2, descripcion_evento: 'Encendido' };
+    if (prev.lastIgn === 1 && ign === 0) return { codigo_evento: 3, descripcion_evento: 'Apagado' };
+  }
+  return spd > 0
+    ? { codigo_evento: 1, descripcion_evento: 'Movimiento' }
+    : { codigo_evento: 6, descripcion_evento: 'Detenido' };
+}
+
+// ── Obtener / cachear token ───────────────────────────────────────
+async function getToken() {
+  const now = Date.now();
+  if (tokenState.token && now < tokenState.expiresAtMs) return tokenState.token;
+
+  const { id, user, pass } = assertConfig();
+
+  const res  = await fetch(AUTH_URL, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({
+      id_cliente_externo: id,
+      nombre_usuario:     user,
+      password_usuario:   pass,
+    }),
+  });
+
+  const text = await res.text().catch(() => '');
+  if (res.status !== 201) {
+    console.error(`[bermann] auth fallo HTTP ${res.status}: ${text.slice(0,300)}`);
+    throw new Error(`BERMANN_AUTH_FAILED_${res.status}`);
+  }
+
+  let json = null;
+  try { json = JSON.parse(text); } catch (_) {}
+
+  const token = json?.token || json?.access_token || json?.accessToken || '';
+  if (!token) throw new Error('BERMANN_AUTH_NO_TOKEN');
+
+  // Cache 58 minutos (token válido 1h, guardamos con margen)
+  tokenState.token       = token;
+  tokenState.expiresAtMs = Date.now() + 58 * 60 * 1000;
+
+  console.log('[bermann] token obtenido OK');
+  return token;
+}
+
+// ── POST insert ───────────────────────────────────────────────────
+async function postInsert(payload, token) {
+  const t0  = Date.now();
+  const res = await fetch(INSERT_URL, {
+    method:  'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + token,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const body     = await res.text().catch(() => '');
+  const bodyUC   = String(body || '').trim().toUpperCase();
+  // Bermann responde 201 o 200 "OK" en éxito
+  const ok = res.status === 201 || (res.status === 200 && bodyUC === 'OK');
+
+  return { ok, http_status: res.status, latency_ms: Date.now() - t0, response_http: body };
+}
+
+// ── Función principal — interfaz compatible con tcp-server.js ─────
+async function send({ event, unit } = {}) {
+  const { id: clientId } = assertConfig();
+
+  const imei    = String(event?.imei  || unit?.imei  || '').trim();
+  const patente = String(unit?.plate  || unit?.name  || event?.imei || '').trim();
+
+  if (!imei) {
+    console.warn('[bermann] IMEI faltante — skip');
+    return { ok: true, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'no_imei' };
+  }
+
+  // Timestamp
+  const timeEpoch = Number.isFinite(Number(event?.time_epoch))
+    ? Number(event.time_epoch)
+    : Math.floor(Date.now() / 1000);
+  const tsMs = timeEpoch * 1000;
+
+  // Correlatividad: descartar paquetes fuera de orden
+  const prev = lastByImei.get(imei);
+  if (prev && tsMs < prev.lastTsMs) {
+    console.warn(`[bermann] paquete fuera de orden ${imei} — skip`);
+    return { ok: true, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'out_of_order' };
+  }
+
+  const lat     = asNum(event?.lat,     null);
+  const lng     = asNum(event?.lon,     null);
+  const speed   = asNum(event?.speed,   0);
+  const heading = asNum(event?.heading, 0);
+
+  if (lat === null || lng === null) {
+    console.warn(`[bermann] lat/lon faltante ${imei} — skip`);
+    return { ok: true, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'no_coords' };
+  }
+
+  // Estado motor: engineOn (booleano) o ignition (bool/int)
+  const ignRaw      = event?.engineOn ?? event?.ignition;
+  const estadoMotor = ignRaw === true || ignRaw === 1 ? 1
+                    : ignRaw === false || ignRaw === 0 ? 0
+                    : null;
+
+  const ev = computeEvent(imei, speed, estadoMotor);
+
+  const payload = {
+    fecha:                formatUtc(tsMs),
+    imei,
+    patente,
+    latitud:              String(lat),
+    longitud:             String(lng),
+    orientacion:          Math.trunc(heading),
+    velocidad:            Number(speed),
+    id_cliente_externo:   clientId,
+    ...(estadoMotor !== null ? { estado_motor: estadoMotor } : {}),
+    evento: {
+      id_cliente_externo: clientId,
+      codigo_evento:      ev.codigo_evento,
+      descripcion_evento: ev.descripcion_evento,
+    },
+  };
+
+  // Token + insert + retry 401
+  let token = await getToken();
+  let r     = await postInsert(payload, token);
+
+  if (!r.ok && r.http_status === 401) {
+    console.warn('[bermann] 401 — refresh token y retry');
+    tokenState.token       = '';
+    tokenState.expiresAtMs = 0;
+    token = await getToken();
+    r     = await postInsert(payload, token);
+  }
+
+  // Actualizar memoria solo si el envío fue exitoso
+  if (r.ok) {
+    lastByImei.set(imei, {
+      lastTsMs: tsMs,
+      lastIgn:  estadoMotor !== null ? estadoMotor : (prev?.lastIgn ?? null),
+    });
+  }
+
+  return {
+    ok:            r.ok,
+    status:        r.ok ? 'sent' : 'failed',
+    http_status:   r.http_status,
+    latency_ms:    r.latency_ms,
+    response_http: r.response_http,
+  };
+}
+
+// CommonJS exports — compatible con require() en tcp-server.js
+module.exports = { send, name: 'bermann' };
