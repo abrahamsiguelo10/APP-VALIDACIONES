@@ -99,6 +99,17 @@ const migrations = [
       CREATE INDEX IF NOT EXISTS idx_audit_log_action   ON public.audit_log(action);
       CREATE INDEX IF NOT EXISTS idx_audit_log_username ON public.audit_log(username);
     ` },
+  { name: '015a_users_unique_username',
+    sql: `
+      -- Eliminar duplicados dejando el más antiguo antes de crear el constraint
+      DELETE FROM public.users u1
+      USING public.users u2
+      WHERE u1.id > u2.id
+        AND u1.username = u2.username;
+      -- Agregar constraint UNIQUE si no existe
+      ALTER TABLE public.users
+        ADD CONSTRAINT IF NOT EXISTS users_username_unique UNIQUE (username);
+    ` },
 ];
 
 async function runMigrations() {
