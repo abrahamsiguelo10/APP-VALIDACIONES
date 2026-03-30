@@ -101,14 +101,19 @@ const migrations = [
     ` },
   { name: '015a_users_unique_username',
     sql: `
-      -- Eliminar duplicados dejando el más antiguo antes de crear el constraint
       DELETE FROM public.users u1
       USING public.users u2
       WHERE u1.id > u2.id
         AND u1.username = u2.username;
-      -- Agregar constraint UNIQUE si no existe
       ALTER TABLE public.users
         ADD CONSTRAINT IF NOT EXISTS users_username_unique UNIQUE (username);
+    ` },
+  { name: '015b_destinations_driver_slug',
+    sql: `
+      ALTER TABLE public.destinations
+        ADD COLUMN IF NOT EXISTS driver_slug TEXT DEFAULT NULL;
+      COMMENT ON COLUMN public.destinations.driver_slug IS
+        'Nombre del driver JS externo (ej: bermann, skynav). NULL = usar field_schema genérico.';
     ` },
 ];
 
