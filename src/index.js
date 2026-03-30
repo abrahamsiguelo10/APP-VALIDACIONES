@@ -1,25 +1,12 @@
 /**
  * index.js — Servidor principal Síguelo API
- *
- * Orden de arranque:
- *  1. Cargar .env
- *  2. Conectar DB y correr migraciones
- *  3. Montar middlewares globales
- *  4. Montar rutas
- *  5. Error handler global
- *  6. Escuchar puerto
  */
-
 require('dotenv').config();
-
 const express = require('express');
 const cors    = require('cors');
-
 const { pool }          = require('./db/pool');
 const { runMigrations } = require('./db/migrate');
-
 const { startTcpServer } = require('./tcp-server');
-
 const authRoutes      = require('./routes/auth');
 const userRoutes      = require('./routes/users');
 const destRoutes      = require('./routes/destinations');
@@ -29,18 +16,40 @@ const clienteRoutes   = require('./routes/clientes');
 const validadorRoutes = require('./routes/validador');
 const gpsProxyRoutes  = require('./routes/gps-proxy');
 const certRoutes      = require('./routes/certificados');
-const adminRoutes = require('./routes/admin'); 
+const adminRoutes     = require('./routes/admin');
+
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── Confiar en el proxy de Railway para leer la IP real del cliente ──
-// Sin esto todos los usuarios aparecen como la misma IP interna (100.64.x.x)
-// lo que dispara el rate limit de Railway para todos simultáneamente
 app.set('trust proxy', 1);
 
 /* ── CORS ─────────────────────────────────────────────────────── */
+// Orígenes permitidos: variable de entorno + siempre el .vercel.app base
+const _corsOrigins = (process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
+
+function isOriginAllowed(origin) {
+  if (!origin) return true; // server-to-server sin Origin
+  if (_corsOrigins.includes('*')) return true;
+  if (_corsOrigins.includes(origin)) return true;
+  // Permitir cualquier subdominio de siguelogps.com
+  if (/^https:\/\/[a-z0-9-]+\.siguelogps\.com$/.test(origin)) return true;
+  // Permitir el dominio de Vercel del proyecto
+  if (/^https:\/\/app-validaciones[a-z0-9-]*\.vercel\.app$/.test(origin)) return true;
+  return false;
+}
+
 app.use(cors({
-  origin: process.env.CORS_ORIGIN?.split(',') ?? '*',
+  origin: (origin, callback) => {
+    if (isOriginAllowed(origin)) {
+      callback(null, origin || '*');
+    } else {
+      console.warn(`[CORS] Origen bloqueado: ${origin}`);
+      callback(new Error(`Origen no permitido por CORS: ${origin}`));
+    }
+  },
   methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
@@ -49,7 +58,7 @@ app.use(cors({
 /* ── Body parser ──────────────────────────────────────────────── */
 app.use(express.json({ limit: '1mb' }));
 
-/* ── Health check (Railway lo usa para saber si está vivo) ─────── */
+/* ── Health check ─────────────────────────────────────────────── */
 app.get('/health', async (_req, res) => {
   try {
     await pool.query('SELECT 1');
@@ -69,9 +78,7 @@ app.use('/clientes',     clienteRoutes);
 app.use('/validador',    validadorRoutes);
 app.use('/gps',          gpsProxyRoutes);
 app.use('/certificados', certRoutes);
-
-
-app.use('/admin', adminRoutes);                 // montaje
+app.use('/admin',        adminRoutes);
 
 /* ── 404 ──────────────────────────────────────────────────────── */
 app.use((_req, res) => {
@@ -89,20 +96,16 @@ app.use((err, _req, res, _next) => {
   });
 });
 
-
-
 /* ── Arranque ─────────────────────────────────────────────────── */
 async function start() {
   try {
     await runMigrations();
-
-    // Arrancar servidor TCP Wialon Retranslator (si está habilitado)
     if (process.env.TCP_ENABLED !== 'false') {
       startTcpServer();
     }
-
     app.listen(PORT, () => {
       console.log(`✓ Síguelo API escuchando en puerto ${PORT}`);
+      console.log(`  CORS orígenes: ${_corsOrigins.join(', ') || '(solo siguelogps.com y vercel.app)'}`);
       console.log(`  NODE_ENV: ${process.env.NODE_ENV ?? 'development'}`);
     });
   } catch (err) {
@@ -110,5 +113,4 @@ async function start() {
     process.exit(1);
   }
 }
-
 start();
