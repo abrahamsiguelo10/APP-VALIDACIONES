@@ -294,6 +294,16 @@ function resolveSource(source, unit, parsed, clienteData) {
     case 'heading':        return parsed.heading   ?? 0;
     case 'ignition':       return parsed.ignition  ?? false;
     case 'ignition01':     return parsed.ignition  ? 1 : 0;
+    case 'skynav_evento': {
+      // 41 = Ignición ON + Movimiento
+      // 42 = Ignición OFF + Detenido
+      // 51 = Ignición ON + Detenido
+      // 52 = Ignición OFF + Movimiento
+      const ign    = parsed.ignition === true || parsed.ignition === 1;
+      const moving = Number(parsed.speed || 0) > 0;
+      if (moving)  return ign ? 41 : 52;
+      return ign ? 51 : 42;
+    }
     case 'wialon_ts':      return parsed.wialon_ts || new Date().toISOString();
     case 'fecha_hora':     return toFecha(parsed.wialon_ts, '-');
     case 'fecha_slash':    return toFecha(parsed.wialon_ts, '/');
