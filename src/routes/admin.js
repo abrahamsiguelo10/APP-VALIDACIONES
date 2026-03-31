@@ -12,7 +12,7 @@ router.get('/system-info', requireRole('admin'), async (_req, res) => {
   try {
     const [units, dests, users, events] = await Promise.all([
       query('SELECT COUNT(*) FROM public.units'),
-      query('SELECT COUNT(*) FROM public.destinations'),
+      query('SELECT COUNT(*) FROM public.unit_destinations WHERE enabled = true'),
       query('SELECT COUNT(*) FROM public.users'),
       query('SELECT COUNT(*) FROM public.gps_events'),
     ]);
@@ -84,6 +84,33 @@ router.get('/audit', requireRole('admin'), async (req, res) => {
         offset: parseInt(req.query.offset || 0),
         warning: 'Migraciones pendientes.' });
     }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── POST /admin/test-token — prueba un token contra una URL externa ── */
+router.post('/test-token', requireRole('admin'), async (req, res) => {
+  const { url, token, payload } = req.body;
+  if (!url || !token) return res.status(400).json({ error: 'url y token requeridos.' });
+
+  const testPayload = payload || [{
+    fechaHora: new Date().toISOString().slice(0,19).replace('T',' '),
+    latitud: -32.8, longitud: -71.2,
+    patente: 'TEST01', provider: 'siguelo_gps',
+    imei: '000000000000001',
+    evento: 42, velocidad: 0, heading: 0, ignicion: 0,
+  }];
+
+  try {
+    const r = await fetch(url, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+      body:    JSON.stringify(testPayload),
+      signal:  AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined,
+    });
+    const body = await r.text().catch(() => '');
+    res.json({ http_status: r.status, ok: r.ok, body: body.slice(0, 500) });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
