@@ -488,6 +488,12 @@ async function forwardToDestinations(unit, parsed) {
 
     // ── Driver externo: si el destino tiene driver_slug, delegar ─────────────
     if (row.driver_slug) {
+      // Filtrar coordenadas 0,0 también para drivers
+      if (parsed.lat === 0 && parsed.lon === 0) {
+        console.warn(`[TCP] ${unit.plate} → ${row.dest_name} ⚠ coordenadas 0,0 — paquete descartado`);
+        await saveEvent(unit, parsed, row.dest_id, false, 'invalid_coords_0_0');
+        continue;
+      }
       let forwardOk = false, forwardResp = null;
       try {
         const driver = loadDriver(row.driver_slug);
@@ -550,6 +556,13 @@ async function forwardToDestinations(unit, parsed) {
       const errMsg    = `CAMPOS_FALTANTES: ${faltantes}`;
       console.error(`[TCP] ${unit.plate} → ${row.dest_name} ✗ ${errMsg}`);
       await saveEvent(unit, parsed, row.dest_id, false, errMsg);
+      continue;
+    }
+
+    // ── Coordenadas inválidas (0,0) → skip ──────────────────────────────────
+    if (parsed.lat === 0 && parsed.lon === 0) {
+      console.warn(`[TCP] ${unit.plate} → ${row.dest_name} ⚠ coordenadas 0,0 — paquete descartado`);
+      await saveEvent(unit, parsed, row.dest_id, false, 'invalid_coords_0_0');
       continue;
     }
 
