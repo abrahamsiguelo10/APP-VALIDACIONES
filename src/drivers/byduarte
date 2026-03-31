@@ -1,0 +1,186 @@
+/**
+ * src/drivers/byduarte.js
+ * Driver Transportes Duarte — Samtech SOAP/ASMX
+ * Método: Post_XML con XML como CDATA
+ *
+ * Variables de entorno Railway:
+ *   BYDUARTE_URL      — URL WebService (default: http://wspos.samtech.cl/WSP.asmx)
+ *   BYDUARTE_USER     — Login WS
+ *   BYDUARTE_PASS     — Clave WS
+ *   BYDUARTE_PGPS     — Nombre proveedor GPS (default: SigueloGPS)
+ *   BYDUARTE_EMPRESA  — Nombre servicio (default: dduarte)
+ */
+
+'use strict';
+
+const DEFAULT_URL    = 'http://wspos.samtech.cl/WSP.asmx';
+const SOAP_ACTION    = 'samtechGPS/Post_XML';
+
+function xmlEscape(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+}
+
+function toInt(v, fb) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.trunc(n) : (fb !== undefined ? fb : 0);
+}
+
+function toDec(v, fb) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : (fb !== undefined ? fb : 0);
+}
+
+function stripPlate(plate) {
+  return String(plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+// Fecha UTC+0 en formato "DD/MM/YYYY HH:mm:ss"
+function formatUtc(isoStr) {
+  const d = isoStr ? new Date(isoStr) : new Date();
+  const p = n => String(n).padStart(2, '0');
+  return `${p(d.getUTCDate())}/${p(d.getUTCMonth()+1)}/${d.getUTCFullYear()} ` +
+         `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+
+// Construir el XML interno (datos GPS)
+function buildInnerXml(fields) {
+  return '<?xml version="1.0" encoding="ISO-8859-1"?>' +
+    '<datos>' +
+      '<movil>' +
+        '<pgps>'      + xmlEscape(fields.pgps)      + '</pgps>'      +
+        '<empresa>'   + xmlEscape(fields.empresa)   + '</empresa>'   +
+        '<tercero>'   + xmlEscape(fields.tercero)   + '</tercero>'   +
+        '<pat>'       + xmlEscape(fields.pat)       + '</pat>'       +
+        '<fn>'        + xmlEscape(fields.fn)        + '</fn>'        +
+        '<lat>'       + fields.lat                  + '</lat>'       +
+        '<lon>'       + fields.lon                  + '</lon>'       +
+        '<ori>'       + fields.ori                  + '</ori>'       +
+        '<vel>'       + fields.vel                  + '</vel>'       +
+        '<mot>'       + fields.mot                  + '</mot>'       +
+        '<hdop>'      + fields.hdop                 + '</hdop>'      +
+        '<odo>'       + fields.odo                  + '</odo>'       +
+        '<eve>'       + fields.eve                  + '</eve>'       +
+        '<conductor>' + xmlEscape(fields.conductor) + '</conductor>' +
+        '<numSAT>'    + fields.numSAT               + '</numSAT>'    +
+        '<sens1>'     + fields.sens1                + '</sens1>'     +
+        '<sens2>'     + fields.sens2                + '</sens2>'     +
+      '</movil>' +
+      '<usuario xmlns="user">' +
+        '<login>' + xmlEscape(fields.login) + '</login>' +
+        '<clave>' + xmlEscape(fields.clave) + '</clave>' +
+      '</usuario>' +
+    '</datos>';
+}
+
+// Envelope SOAP 1.2 con XML como CDATA dentro de <xmldoc>
+function buildSoapEnvelope(innerXml) {
+  return '<?xml version="1.0" encoding="utf-8"?>' +
+    '<soap12:Envelope ' +
+      'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" ' +
+      'xmlns:xsd="http://www.w3.org/2001/XMLSchema" ' +
+      'xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">' +
+      '<soap12:Body>' +
+        '<Post_XML xmlns="samtechGPS">' +
+          '<xmldoc><![CDATA[' + innerXml + ']]></xmldoc>' +
+        '</Post_XML>' +
+      '</soap12:Body>' +
+    '</soap12:Envelope>';
+}
+
+async function send({ event, unit } = {}) {
+  const url     = (process.env.BYDUARTE_URL     || DEFAULT_URL).trim();
+  const login   = (process.env.BYDUARTE_USER    || '').trim();
+  const clave   = (process.env.BYDUARTE_PASS    || '').trim();
+  const pgps    = (process.env.BYDUARTE_PGPS    || 'SigueloGPS').trim();
+  const empresa = (process.env.BYDUARTE_EMPRESA || 'dduarte').trim();
+
+  if (!login || !clave) {
+    console.warn('[byduarte] credenciales faltantes (BYDUARTE_USER / BYDUARTE_PASS)');
+    return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_credentials' };
+  }
+
+  const imei  = String(event?.imei  || unit?.imei  || '').trim();
+  const plate = stripPlate(unit?.plate || unit?.name || '') || 'SINPLACA';
+  const lat   = toDec(event?.lat, null);
+  const lng   = toDec(event?.lon, null);
+
+  if (!imei) {
+    console.warn('[byduarte] IMEI faltante — skip');
+    return { ok: true, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'no_imei' };
+  }
+  if (lat === null || lng === null) {
+    console.warn(`[byduarte] coordenadas faltantes ${imei} — skip`);
+    return { ok: true, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'no_coords' };
+  }
+
+  const ignicion = (event?.ignition === true || event?.ignition === 1) ? 1 : 0;
+  const tercero  = unit?.name || unit?.cliente_nombre || 'No Asignado';
+
+  const fields = {
+    pgps,
+    empresa,
+    tercero,
+    pat:       plate,
+    fn:        formatUtc(event?.wialon_ts),
+    lat:       lat.toFixed(6),
+    lon:       lng.toFixed(6),
+    ori:       toInt(event?.heading, 0),
+    vel:       toInt(event?.speed,   0),
+    mot:       ignicion,
+    hdop:      String(toInt(event?.hdop, 0)).padStart(3, '0'),
+    odo:       toInt(event?.odometro, 0),
+    eve:       ignicion ? 46 : 47, // 46=encendido/movimiento, 47=apagado/detenido
+    conductor: 'No Asignado',
+    numSAT:    toInt(event?.sats, 0),
+    sens1:     0,
+    sens2:     0,
+    login,
+    clave,
+  };
+
+  const innerXml = buildInnerXml(fields);
+  const envelope = buildSoapEnvelope(innerXml);
+
+  console.log(`[byduarte] enviando imei=${imei} plate=${plate} fn=${fields.fn}`);
+
+  const t0 = Date.now();
+  let res, body;
+  try {
+    res  = await fetch(url, {
+      method:  'POST',
+      headers: {
+        'Content-Type': 'application/soap+xml; charset=utf-8',
+        'SOAPAction':   SOAP_ACTION,
+      },
+      body:   envelope,
+      signal: AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined,
+    });
+    body = await res.text().catch(() => '');
+  } catch (err) {
+    console.error(`[byduarte] error de red ${imei}:`, err.message);
+    return { ok: false, status: 'failed', http_status: 0, latency_ms: Date.now()-t0, response_http: err.message };
+  }
+
+  const latency_ms = Date.now() - t0;
+  // Respuesta OK = texto "OK" en el body
+  const ok = res.ok && /\bOK\b/i.test(body) && !/error/i.test(body);
+
+  if (ok) {
+    console.log(`[byduarte] ✓ (${res.status})`);
+  } else {
+    console.warn(`[byduarte] ✗ (${res.status}) ${body.slice(0,200)}`);
+  }
+
+  return {
+    ok,
+    status:        ok ? 'sent' : 'failed',
+    http_status:   res.status,
+    latency_ms,
+    response_http: body.slice(0, 2000),
+    error:         ok ? null : `http_${res.status}`,
+  };
+}
+
+module.exports = { send, name: 'byduarte' };
