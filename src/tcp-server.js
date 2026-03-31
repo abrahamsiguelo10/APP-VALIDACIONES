@@ -307,6 +307,24 @@ function resolveSource(source, unit, parsed, clienteData) {
     case 'wialon_ts':      return parsed.wialon_ts || new Date().toISOString();
     case 'fecha_hora':     return toFecha(parsed.wialon_ts, '-');
     case 'fecha_slash':    return toFecha(parsed.wialon_ts, '/');
+    case 'fecha_chile': {
+      // Fecha/hora local Chile (America/Santiago): "DD-MM-YYYY HH:MM:SS"
+      const iso = parsed.wialon_ts || new Date().toISOString();
+      try {
+        const d   = new Date(new Date(iso).toLocaleString('en-US', { timeZone: 'America/Santiago' }));
+        const p   = n => String(n).padStart(2, '0');
+        return `${p(d.getDate())}-${p(d.getMonth()+1)}-${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+      } catch (_) { return iso; }
+    }
+    case 'fecha_chile_iso': {
+      // Fecha/hora local Chile ISO: "YYYY-MM-DD HH:MM:SS"
+      const iso = parsed.wialon_ts || new Date().toISOString();
+      try {
+        const d   = new Date(new Date(iso).toLocaleString('en-US', { timeZone: 'America/Santiago' }));
+        const p   = n => String(n).padStart(2, '0');
+        return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+      } catch (_) { return iso; }
+    }
     case 'fecha_utc_off': {
       // Formato: "YYYY-MM-DD HH:MM:SS +00:00" (UTC con offset explícito)
       const iso = parsed.wialon_ts || new Date().toISOString();
@@ -315,6 +333,24 @@ function resolveSource(source, unit, parsed, clienteData) {
       const p = n => String(n).padStart(2, '0');
       return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ` +
              `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} +00:00`;
+    }
+    case 'fecha_chile': {
+      // Hora local de Chile (America/Santiago) — corrige UTC a zona horaria chilena
+      const iso = parsed.wialon_ts || new Date().toISOString();
+      const d   = new Date(iso);
+      if (isNaN(d)) return iso;
+      try {
+        const loc = new Date(d.toLocaleString('en-US', { timeZone: 'America/Santiago' }));
+        const p   = n => String(n).padStart(2, '0');
+        return `${loc.getFullYear()}-${p(loc.getMonth()+1)}-${p(loc.getDate())} ` +
+               `${p(loc.getHours())}:${p(loc.getMinutes())}:${p(loc.getSeconds())}`;
+      } catch (_) {
+        // Fallback manual: UTC-3
+        const loc = new Date(d.getTime() - 3 * 3600 * 1000);
+        const p   = n => String(n).padStart(2, '0');
+        return `${loc.getUTCFullYear()}-${p(loc.getUTCMonth()+1)}-${p(loc.getUTCDate())} ` +
+               `${p(loc.getUTCHours())}:${p(loc.getUTCMinutes())}:${p(loc.getUTCSeconds())}`;
+      }
     }
     case 'alt':            return parsed.alt       ?? 0;
     case 'sats':           return parsed.sats      ?? 0;
