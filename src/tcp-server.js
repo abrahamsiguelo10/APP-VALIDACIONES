@@ -358,7 +358,14 @@ function resolveSource(source, unit, parsed, clienteData) {
     case 'odometro':       return parsed.odometro  ?? 0;
 
     // ── Datos de la unidad (de la DB) ────────────────────────────────────────
-    case 'unit_plate':     return unit.plate       || '';
+    case 'unit_plate':     return unit.plate || '';
+    case 'unit_plate_guion': {
+      // Formatea la patente con guiones: ABCD12 → AB-CD-12
+      const p = (unit.plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+      if (p.length === 6) return `${p.slice(0,2)}-${p.slice(2,4)}-${p.slice(4,6)}`;
+      if (p.length === 5) return `${p.slice(0,2)}-${p.slice(2,4)}-${p.slice(4,5)}`;
+      return p; // si no tiene 6 chars, devolver sin formato
+    }
     case 'unit_imei':      return unit.imei        || '';
     case 'unit_name':      return unit.name        || '';
     case 'unit_rut':       return unit.rut         || '';
