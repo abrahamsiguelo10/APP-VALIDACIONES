@@ -86,7 +86,7 @@ function buildSoapEnvelope(user, pass, datosXml) {
       '</soap:Header>' +
       '<soap:Body>' +
         '<WM_INS_REPORTE_CLASS xmlns="http://tempuri.org/">' +
-          '<Tabla>' + datosXml + '</Tabla>' +
+          '<Tabla><NewDataSet>' + datosXml + '</NewDataSet></Tabla>' +
         '</WM_INS_REPORTE_CLASS>' +
       '</soap:Body>' +
     '</soap:Envelope>';
@@ -148,7 +148,7 @@ async function send({ event, unit } = {}) {
       method:  'POST',
       headers: {
         'Content-Type': 'text/xml; charset=utf-8',
-        'SOAPAction':   SOAP_ACTION,
+        'SOAPAction':   '"' + SOAP_ACTION + '"',  // SOAP 1.1 requiere comillas en SOAPAction
         'User-Agent':   'integraciones-siguelogps/1.0',
       },
       body:   envelope,
