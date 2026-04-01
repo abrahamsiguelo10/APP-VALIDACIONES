@@ -12,7 +12,7 @@
 
 'use strict';
 
-const DEFAULT_ENDPOINT = process.env.QMGPS_ENDPOINT || 'http://ww3.qanalytics.cl/gps_test/service.asmx';
+const DEFAULT_ENDPOINT = process.env.QMGPS_ENDPOINT || 'https://ww3.qanalytics.cl/gps_test/service.asmx';
 const SOAP_ACTION      = 'http://tempuri.org/WM_INS_REPORTE_CLASS';
 
 function xmlEscape(s) {
@@ -50,7 +50,15 @@ function toChileLocal(isoStr) {
 }
 
 function buildDatosXml(row) {
-  return '<Datos>' +
+  // Campos nillable — enviar con xsi:nil="true" cuando no aplican
+  const nil = '<SENSORA_2 xsi:nil="true"/><SENSORA_3 xsi:nil="true"/><SENSORA_4 xsi:nil="true"/>' +
+              '<SENSORA_5 xsi:nil="true"/><SENSORA_6 xsi:nil="true"/><SENSORA_7 xsi:nil="true"/>' +
+              '<SENSORA_8 xsi:nil="true"/><SENSORA_9 xsi:nil="true"/><SENSORA_10 xsi:nil="true"/>' +
+              '<SENSORD_2 xsi:nil="true"/><SENSORD_3 xsi:nil="true"/><SENSORD_4 xsi:nil="true"/>' +
+              '<SENSORD_5 xsi:nil="true"/><SENSORD_6 xsi:nil="true"/><SENSORD_7 xsi:nil="true"/>' +
+              '<SENSORD_8 xsi:nil="true"/><SENSORD_9 xsi:nil="true"/>';
+
+  return '<Datos xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">' +
     '<ID_REG>'         + xmlEscape(row.ID_REG)  + '</ID_REG>'         +
     '<LATITUD>'        + row.LATITUD             + '</LATITUD>'        +
     '<LONGITUD>'       + row.LONGITUD            + '</LONGITUD>'       +
@@ -59,16 +67,17 @@ function buildDatosXml(row) {
     '<FH_DATO>'        + xmlEscape(row.FH_DATO)  + '</FH_DATO>'        +
     '<PLACA>'          + xmlEscape(row.PLACA)    + '</PLACA>'          +
     '<CANT_SATELITES>' + row.CANT_SATELITES      + '</CANT_SATELITES>' +
-    '<HDOP>'           + row.HDOP               + '</HDOP>'           +
-    '<TEMP1>'          + row.TEMP1              + '</TEMP1>'          +
-    '<TEMP2>'          + row.TEMP2              + '</TEMP2>'          +
-    '<TEMP3>'          + row.TEMP3              + '</TEMP3>'          +
-    '<SENSORA_1>'      + row.SENSORA_1          + '</SENSORA_1>'      +
-    '<AP>'             + row.AP                 + '</AP>'             +
-    '<IGNICION>'       + row.IGNICION           + '</IGNICION>'       +
-    '<PANICO>'         + row.PANICO             + '</PANICO>'         +
-    '<SENSORD_1>'      + row.SENSORD_1          + '</SENSORD_1>'      +
-    '<TRANS>'          + xmlEscape(row.TRANS)   + '</TRANS>'          +
+    '<HDOP>'           + row.HDOP                + '</HDOP>'           +
+    '<TEMP1>'          + row.TEMP1               + '</TEMP1>'          +
+    '<TEMP2>'          + row.TEMP2               + '</TEMP2>'          +
+    '<TEMP3>'          + row.TEMP3               + '</TEMP3>'          +
+    '<SENSORA_1>'      + row.SENSORA_1           + '</SENSORA_1>'      +
+    '<AP>'             + row.AP                  + '</AP>'             +
+    '<IGNICION>'       + row.IGNICION            + '</IGNICION>'       +
+    '<PANICO>'         + row.PANICO              + '</PANICO>'         +
+    '<SENSORD_1>'      + row.SENSORD_1           + '</SENSORD_1>'      +
+    '<TRANS>'          + xmlEscape(row.TRANS)    + '</TRANS>'          +
+    nil +
     '</Datos>';
 }
 
@@ -86,7 +95,7 @@ function buildSoapEnvelope(user, pass, datosXml) {
       '</soap:Header>' +
       '<soap:Body>' +
         '<WM_INS_REPORTE_CLASS xmlns="http://tempuri.org/">' +
-          '<Tabla><NewDataSet>' + datosXml + '</NewDataSet></Tabla>' +
+          '<Tabla>' + datosXml + '</Tabla>' +
         '</WM_INS_REPORTE_CLASS>' +
       '</soap:Body>' +
     '</soap:Envelope>';
@@ -148,7 +157,7 @@ async function send({ event, unit } = {}) {
       method:  'POST',
       headers: {
         'Content-Type': 'text/xml; charset=utf-8',
-        'SOAPAction':   '"' + SOAP_ACTION + '"',  // SOAP 1.1 requiere comillas en SOAPAction
+        'SOAPAction':   '"' + SOAP_ACTION + '"',
         'User-Agent':   'integraciones-siguelogps/1.0',
       },
       body:   envelope,
