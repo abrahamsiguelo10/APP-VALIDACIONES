@@ -88,6 +88,80 @@ router.get('/audit', requireRole('admin'), async (req, res) => {
   }
 });
 
+/* ── GET /admin/qmgps-sample — genera XML de ejemplo para QAnalytics ── */
+router.get('/qmgps-sample', requireRole('admin'), async (_req, res) => {
+  const url  = process.env.QMGPS_ENDPOINT || 'https://ww3.qanalytics.cl/gps_test/service.asmx';
+  const user = process.env.QMGPS_USER     || 'WS_test';
+  const soap = 'http://tempuri.org/WM_INS_REPORTE_CLASS';
+
+  const xmlBody = `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Header>
+    <Authentication xmlns="http://tempuri.org/">
+      <Usuario>${user}</Usuario>
+      <Clave>**********</Clave>
+    </Authentication>
+  </soap:Header>
+  <soap:Body>
+    <WM_INS_REPORTE_CLASS xmlns="http://tempuri.org/">
+      <Tabla>
+        <Datos xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+          <ID_REG>865468051217506</ID_REG>
+          <LATITUD>-32.841983</LATITUD>
+          <LONGITUD>-71.215300</LONGITUD>
+          <VELOCIDAD>60</VELOCIDAD>
+          <SENTIDO>270</SENTIDO>
+          <FH_DATO>31-03-2026 15:30:00</FH_DATO>
+          <PLACA>STDY42</PLACA>
+          <CANT_SATELITES>8</CANT_SATELITES>
+          <HDOP>1</HDOP>
+          <TEMP1>999</TEMP1>
+          <TEMP2>999</TEMP2>
+          <TEMP3>999</TEMP3>
+          <SENSORA_1>999</SENSORA_1>
+          <AP>-1</AP>
+          <IGNICION>1</IGNICION>
+          <PANICO>-1</PANICO>
+          <SENSORD_1>-1</SENSORD_1>
+          <TRANS>N/A</TRANS>
+          <SENSORA_2 xsi:nil="true"/>
+          <SENSORA_3 xsi:nil="true"/>
+          <SENSORA_4 xsi:nil="true"/>
+          <SENSORA_5 xsi:nil="true"/>
+          <SENSORA_6 xsi:nil="true"/>
+          <SENSORA_7 xsi:nil="true"/>
+          <SENSORA_8 xsi:nil="true"/>
+          <SENSORA_9 xsi:nil="true"/>
+          <SENSORA_10 xsi:nil="true"/>
+          <SENSORD_2 xsi:nil="true"/>
+          <SENSORD_3 xsi:nil="true"/>
+          <SENSORD_4 xsi:nil="true"/>
+          <SENSORD_5 xsi:nil="true"/>
+          <SENSORD_6 xsi:nil="true"/>
+          <SENSORD_7 xsi:nil="true"/>
+          <SENSORD_8 xsi:nil="true"/>
+          <SENSORD_9 xsi:nil="true"/>
+        </Datos>
+      </Tabla>
+    </WM_INS_REPORTE_CLASS>
+  </soap:Body>
+</soap:Envelope>`;
+
+  res.json({
+    url,
+    method:      'POST',
+    soapAction:  soap,
+    headers: {
+      'Content-Type': 'text/xml; charset=utf-8',
+      'SOAPAction':   `"${soap}"`,
+    },
+    body: xmlBody,
+    nota: 'La contraseña se muestra como ******. El XML real incluye la contraseña configurada en las variables de entorno.',
+  });
+});
+
 /* ── POST /admin/test-token — prueba un token contra una URL externa ── */
 router.post('/test-token', requireRole('admin'), async (req, res) => {
   const { url, token, payload } = req.body;
