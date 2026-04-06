@@ -371,6 +371,27 @@ function resolveSource(source, unit, parsed, clienteData) {
     }
     case 'numero_actividad': {
       // ID único por evento: timestamp_ms + últimos 6 dígitos del IMEI
+      const ts         = parsed.wialon_ts ? new Date(parsed.wialon_ts).getTime() : Date.now();
+      const imeiSuffix = String(unit.imei || '000000').slice(-6);
+      return Number(`${ts}${imeiSuffix}`) || ts;
+    }
+    case 'sitrack_evento': {
+      // Codificación Sitrack Blue Express:
+      // 163 = Ignition ON, 164 = Ignition OFF, 2 = Reporte por tiempo
+      const ign = parsed.ignition === true || parsed.ignition === 1;
+      return ign ? 163 : 164;
+    }
+    case 'fecha_gmt': {
+      // Formato OWL/Codelco: "YYYY-MM-DD HH:MM:SS GMT"
+      const iso = parsed.wialon_ts || new Date().toISOString();
+      const d   = new Date(iso);
+      if (isNaN(d)) return iso;
+      const p = n => String(n).padStart(2, '0');
+      return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ` +
+             `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} GMT`;
+    }
+    case 'numero_actividad': {
+      // ID único por evento: timestamp_ms + últimos 6 dígitos del IMEI
       const ts    = parsed.wialon_ts ? new Date(parsed.wialon_ts).getTime() : Date.now();
       const imeiSuffix = String(unit.imei || '000000').slice(-6);
       return Number(`${ts}${imeiSuffix}`) || ts;
@@ -655,6 +676,81 @@ async function forwardToDestinations(unit, parsed) {
   }
 }
 
+// ─── Buffer FIFO por IMEI — ordena eventos antes de reenviar ─────────────────
+/**
+ * Solo activo cuando se detectan eventos fuera de orden.
+ * Si los eventos llegan en orden, se despachan inmediatamente sin latencia.
+ *
+ * Lógica:
+ *  1. Al recibir un evento, comparar su wialon_ts con el último ts visto para ese IMEI.
+ *  2. Si llega EN ORDEN → despachar inmediatamente (sin buffer).
+ *  3. Si llega FUERA DE ORDEN → activar buffer para ese IMEI durante BUFFER_WINDOW_MS.
+ *     Todos los eventos del IMEI se acumulan en el buffer y se ordenan al vencer la ventana.
+ *  4. Al vencer la ventana → ordenar por wialon_ts y despachar en orden.
+ */
+
+const BUFFER_WINDOW_MS = 3000; // 3 segundos
+
+// Map<imei, { events: [], timer: Timeout, lastTs: number }>
+const _fifoBuffers = new Map();
+
+function _tsMs(wialon_ts) {
+  if (!wialon_ts) return Date.now();
+  const t = new Date(wialon_ts).getTime();
+  return isNaN(t) ? Date.now() : t;
+}
+
+async function _flushBuffer(imei) {
+  const buf = _fifoBuffers.get(imei);
+  if (!buf) return;
+  _fifoBuffers.delete(imei);
+
+  // Ordenar por timestamp GPS ascendente
+  buf.events.sort((a, b) => _tsMs(a.parsed.wialon_ts) - _tsMs(b.parsed.wialon_ts));
+  console.log(`[FIFO] ${imei} — flush ${buf.events.length} eventos ordenados`);
+
+  for (const { unit, parsed } of buf.events) {
+    await forwardToDestinations(unit, parsed);
+  }
+}
+
+async function enqueueEvent(unit, parsed) {
+  const imei  = unit.imei;
+  const tsMs  = _tsMs(parsed.wialon_ts);
+  const buf   = _fifoBuffers.get(imei);
+
+  // Sin buffer activo — verificar si el evento llega en orden
+  if (!buf) {
+    // Primer evento de este IMEI o llegó en orden → despachar inmediatamente
+    // Guardar el ts para comparar el siguiente
+    _fifoBuffers.set(imei, { lastTs: tsMs, events: null, timer: null });
+    await forwardToDestinations(unit, parsed);
+    return;
+  }
+
+  // Buffer activo (hay acumulación en curso) → agregar al buffer
+  if (buf.events) {
+    buf.events.push({ unit, parsed });
+    // Reiniciar timer: esperar BUFFER_WINDOW_MS desde el último evento recibido
+    clearTimeout(buf.timer);
+    buf.timer = setTimeout(() => _flushBuffer(imei), BUFFER_WINDOW_MS);
+    return;
+  }
+
+  // No hay buffer activo pero hay lastTs → verificar orden
+  if (tsMs < buf.lastTs - 1000) {
+    // Llegó fuera de orden (más de 1s antes del último) → activar buffer
+    console.warn(`[FIFO] ${imei} evento fuera de orden (ts=${new Date(tsMs).toISOString()} < last=${new Date(buf.lastTs).toISOString()}) — activando buffer`);
+    buf.events = [{ unit, parsed }];
+    buf.timer  = setTimeout(() => _flushBuffer(imei), BUFFER_WINDOW_MS);
+    return;
+  }
+
+  // Llegó en orden → despachar inmediatamente y actualizar lastTs
+  buf.lastTs = Math.max(buf.lastTs, tsMs);
+  await forwardToDestinations(unit, parsed);
+}
+
 // ─── Servidor TCP ─────────────────────────────────────────────────────────────
 function startTcpServer() {
   if (process.env.TCP_ENABLED !== 'true') {
@@ -716,7 +812,7 @@ function startTcpServer() {
             const unit = await findUnit(sessionImei);
             if (!unit)         { console.warn(`[TCP-IPS] IMEI ${sessionImei} no registrado`); continue; }
             if (!unit.enabled) { console.log(`[TCP-IPS] ${unit.plate} deshabilitada`); continue; }
-            await forwardToDestinations(unit, parsed);
+            await enqueueEvent(unit, parsed);
           }
         }
       }
@@ -749,7 +845,7 @@ function startTcpServer() {
           if (!unit.enabled) { console.log(`[TCP-RT] ${unit.plate} deshabilitada`); continue; }
 
           sessionImei = parsed.uid;
-          await forwardToDestinations(unit, {
+          await enqueueEvent(unit, {
             lat:       parsed.lat,
             lon:       parsed.lon,
             speed:     parsed.speed,
