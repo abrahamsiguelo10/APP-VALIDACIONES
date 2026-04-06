@@ -381,6 +381,9 @@ function resolveSource(source, unit, parsed, clienteData) {
       const ign = parsed.ignition === true || parsed.ignition === 1;
       return ign ? 163 : 164;
     }
+    case 'timezone_chile':
+      // Timezone fijo para APIs que lo requieren como campo
+      return 'America/Santiago';
     case 'fecha_gmt': {
       // Formato OWL/Codelco: "YYYY-MM-DD HH:MM:SS GMT"
       const iso = parsed.wialon_ts || new Date().toISOString();
