@@ -360,6 +360,29 @@ function resolveSource(source, unit, parsed, clienteData) {
     case 'sats':           return parsed.sats      ?? 0;
     case 'hdop':           return parsed.hdop      ?? 0;
     case 'odometro':       return parsed.odometro  ?? 0;
+    case 'fecha_gmt': {
+      // Formato OWL/Codelco: "YYYY-MM-DD HH:MM:SS GMT"
+      const iso = parsed.wialon_ts || new Date().toISOString();
+      const d   = new Date(iso);
+      if (isNaN(d)) return iso;
+      const p = n => String(n).padStart(2, '0');
+      return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ` +
+             `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} GMT`;
+    }
+    case 'numero_actividad': {
+      // ID único por evento: timestamp_ms + últimos 6 dígitos del IMEI
+      const ts    = parsed.wialon_ts ? new Date(parsed.wialon_ts).getTime() : Date.now();
+      const imeiSuffix = String(unit.imei || '000000').slice(-6);
+      return Number(`${ts}${imeiSuffix}`) || ts;
+    }
+    case 'sitrack_evento': {
+      // Codificación Sitrack Blue Express:
+      // 163 = Ignition ON
+      // 164 = Ignition OFF
+      //   2 = Reporte por tiempo (normal)
+      const ign = parsed.ignition === true || parsed.ignition === 1;
+      return ign ? 163 : 164;
+    }
 
     // ── Datos de la unidad (de la DB) ────────────────────────────────────────
     case 'unit_plate':     return unit.plate || '';
