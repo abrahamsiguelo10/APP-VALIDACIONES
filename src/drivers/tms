@@ -1,0 +1,138 @@
+'use strict';
+
+/**
+ * src/drivers/tms.js
+ * ─────────────────────────────────────────────────────────────────
+ * Driver REST/JSON para TMS GPS (GPS Smart / Wing).
+ *
+ * Endpoint: POST https://servicesproveedores.wing.cl/tracking/receiver/hub/v2
+ * Auth:     Authorization: Bearer TOKEN
+ *
+ * Variables de entorno Railway:
+ *   TMS_TOKEN — Bearer token entregado por West Ingeniería / TMS
+ *   TMS_URL   — URL del endpoint (default: producción)
+ */
+
+const ENDPOINT = process.env.TMS_URL   || 'https://servicesproveedores.wing.cl/tracking/receiver/hub/v2';
+const TOKEN    = process.env.TMS_TOKEN || '';
+
+// ── Helpers ───────────────────────────────────────────────────────
+
+/**
+ * Formatea fecha en UTC: "YYYY-MM-DD HH:MM:SS"
+ */
+function toFechaUTC(wialon_ts) {
+  const d = wialon_ts ? new Date(wialon_ts) : new Date();
+  if (isNaN(d)) return new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ` +
+         `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+
+// ── Función principal del driver ──────────────────────────────────
+/**
+ * @param {object} options
+ * @param {object} options.event  — datos GPS del evento
+ * @param {object} options.unit   — datos de la unidad (imei, plate, ...)
+ * @param {object} options.route  — datos del destino
+ */
+async function send({ event, unit }) {
+  const token = TOKEN;
+  if (!token) {
+    console.error('[tms] ❌ TMS_TOKEN no configurado');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing TMS_TOKEN' };
+  }
+
+  const plate = (unit.plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (!plate) {
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing plate' };
+  }
+
+  // ── Objeto de telemetría tv ───────────────────────────────────
+  // Solo incluir campos que tenemos disponibles, omitir los demás
+  const ignition = event.ignition === true || event.ignition === 1 ? 1 : 0;
+  const tv = {
+    me: ignition,                          // motor encendido (0/1)
+    ...(event.sats    != null && { r: 0 }), // rpm — no disponible, omitir
+    ...(event.alt     != null && {}),
+    ...(event.odometro != null && { od: Math.round(Number(event.odometro) || 0) }),
+  };
+
+  // Limpiar tv — si queda vacío o solo con me, igual mandarlo
+  const tvFinal = {
+    me: ignition,
+    ...(event.odometro != null ? { od: Math.round(Number(event.odometro) || 0) } : {}),
+  };
+
+  // ── Payload principal ─────────────────────────────────────────
+  const payload = {
+    pv: plate,
+    fh: toFechaUTC(event.wialon_ts),
+    lt: event.lat     ?? 0,
+    ln: event.lon     ?? event.lng ?? 0,
+    vg: Math.round(Number(event.speed   || 0)),
+    c:  Math.round(Number(event.heading || 0)),
+    ph: Number(event.hdop || 0),
+    tv: tvFinal,
+    s:  {},  // sensores vacíos — no tenemos datos de sensores del dispositivo
+  };
+
+  const t0 = Date.now();
+
+  try {
+    const res = await fetch(ENDPOINT, {
+      method:  'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body:   JSON.stringify(payload),
+      signal: AbortSignal.timeout(10000),
+    });
+
+    const latency = Date.now() - t0;
+    const resText = await res.text().catch(() => '');
+
+    // TMS retorna {"status": 200, "msg": "...", "nInserted": N}
+    let ok       = res.ok;
+    let inserted = 0;
+    try {
+      const json = JSON.parse(resText);
+      ok       = json?.status === 200 && (json?.nInserted ?? 0) > 0;
+      inserted = json?.nInserted ?? 0;
+
+      // Loguear patentes no registradas si las hay
+      if (json?.nUnRegistered > 0) {
+        const unreg = (json?.unRegistered || []).map(u => `${u.pv}: ${u.error}`).join(', ');
+        console.warn(`[tms] ⚠ ${json.nUnRegistered} trama(s) no registrada(s): ${unreg}`);
+      }
+    } catch (_) {}
+
+    if (ok) {
+      console.log(`[tms] ✓ plate=${plate} nInserted=${inserted} (${latency}ms)`);
+    } else {
+      console.error(`[tms] ✗ plate=${plate} http=${res.status} resp=${resText.slice(0, 200)}`);
+    }
+
+    return {
+      ok,
+      http_status:   res.status,
+      status:        ok ? 'ok' : 'failed',
+      response_http: resText.slice(0, 500),
+      latency_ms:    latency,
+    };
+
+  } catch (err) {
+    const latency = Date.now() - t0;
+    console.error(`[tms] Error fetch:`, err.message);
+    return {
+      ok:            false,
+      http_status:   0,
+      status:        'failed',
+      response_http: err.message?.slice(0, 500) || 'fetch_error',
+      latency_ms:    latency,
+    };
+  }
+}
+
+module.exports = { send };
