@@ -1,0 +1,210 @@
+'use strict';
+
+/**
+ * src/drivers/tracktec.js
+ * ─────────────────────────────────────────────────────────────────
+ * Driver SOAP/XML para TrackTec — Hub de Gestión Vial (Escondida BHP)
+ *
+ * Método:  Post_XMLRequest (SOAP 1.1)
+ * WSDL QA: https://qa-wshub.tracktec.cl/ws/wspos.wsdl
+ * WSDL PR: https://wshub.tracktec.cl/ws/wspos.wsdl
+ *
+ * El XML de datos viaja como CDATA dentro del campo <wsp:xmldoc>.
+ * Las credenciales van dentro del XML en <usuario><login><clave>.
+ *
+ * Variables de entorno Railway:
+ *   TRACKTEC_URL      — endpoint SOAP (default: producción)
+ *   TRACKTEC_USER     — login de acceso al WS
+ *   TRACKTEC_PASS     — clave de acceso al WS
+ *   TRACKTEC_PGPS     — nombre del proveedor GPS (ej: SIGUELOGPS)
+ *   TRACKTEC_TERCERO  — nombre transportista/cliente (ej: TRANSPORTES XYZ)
+ *   TRACKTEC_EMPRESA  — siempre "controlsellos" (default fijo)
+ *   TRACKTEC_EVENTO   — código de evento por defecto (default: 46)
+ */
+
+const ENDPOINT = process.env.TRACKTEC_URL     || 'https://wshub.tracktec.cl/ws/wspos';
+const USER     = process.env.TRACKTEC_USER    || '';
+const PASS     = process.env.TRACKTEC_PASS    || '';
+const PGPS     = process.env.TRACKTEC_PGPS    || 'SIGUELOGPS';
+const TERCERO  = process.env.TRACKTEC_TERCERO || '';
+const EMPRESA  = process.env.TRACKTEC_EMPRESA || 'controlsellos';
+const EVE_DEF  = process.env.TRACKTEC_EVENTO  || '46';
+
+const SOAP_ACTION = 'http://wspos.tracktec.cl/wspos/Post_XMLRequest';
+
+// ── Helpers ───────────────────────────────────────────────────────
+function esc(v) {
+  return String(v ?? '')
+    .replace(/&/g,  '&amp;')
+    .replace(/</g,  '&lt;')
+    .replace(/>/g,  '&gt;')
+    .replace(/"/g,  '&quot;')
+    .replace(/'/g,  '&apos;');
+}
+
+function pad2(n) { return String(n).padStart(2, '0'); }
+
+/**
+ * Formato Local Chile: "DD/MM/YYYY HH:MM:SS"
+ * TrackTec acepta fecha local Chile (UTC-3/UTC-4) por defecto.
+ */
+function toFechaChile(wialon_ts) {
+  const iso = wialon_ts || new Date().toISOString();
+  try {
+    const d   = new Date(new Date(iso).toLocaleString('en-US', { timeZone: 'America/Santiago' }));
+    const p   = n => String(n).padStart(2, '0');
+    return `${p(d.getDate())}/${p(d.getMonth()+1)}/${d.getFullYear()} ` +
+           `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  } catch (_) {
+    // Fallback UTC-4
+    const d = new Date(new Date(iso).getTime() - 4 * 3600 * 1000);
+    return `${pad2(d.getUTCDate())}/${pad2(d.getUTCMonth()+1)}/${d.getUTCFullYear()} ` +
+           `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`;
+  }
+}
+
+// ── Construir XML interno (va en CDATA) ───────────────────────────
+function buildDatosXml({ pgps, tercero, empresa, pat, fn, lat, lon,
+                          ori, vel, mot, hdop, odo, eve,
+                          conductor, numSAT, sens1, sens2,
+                          user, pass }) {
+  return `<?xml version="1.0" encoding="ISO-8859-1"?><datos>` +
+    `<movil>` +
+      `<pgps>${esc(pgps)}</pgps>` +
+      `<tercero>${esc(tercero)}</tercero>` +
+      `<empresa>${esc(empresa)}</empresa>` +
+      `<pat>${esc(pat)}</pat>` +
+      `<fn>${esc(fn)}</fn>` +
+      `<lat>${lat}</lat>` +
+      `<lon>${lon}</lon>` +
+      `<ori>${ori}</ori>` +
+      `<vel>${vel}</vel>` +
+      `<mot>${mot}</mot>` +
+      `<hdop>${hdop}</hdop>` +
+      `<odo>${odo}</odo>` +
+      `<eve>${esc(eve)}</eve>` +
+      `<conductor>${esc(conductor)}</conductor>` +
+      `<numSAT>${numSAT}</numSAT>` +
+      `<sens1>${sens1}</sens1>` +
+      `<sens2>${sens2}</sens2>` +
+    `</movil>` +
+    `<usuario xmlns="user">` +
+      `<login>${esc(user)}</login>` +
+      `<clave>${esc(pass)}</clave>` +
+    `</usuario>` +
+  `</datos>`;
+}
+
+// ── Construir envelope SOAP con CDATA ─────────────────────────────
+function buildEnvelope(datosXml) {
+  return `<?xml version="1.0" encoding="utf-8"?>` +
+    `<soapenv:Envelope ` +
+      `xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" ` +
+      `xmlns:wsp="http://wspos.tracktec.cl/wspos">` +
+      `<soapenv:Header/>` +
+      `<soapenv:Body>` +
+        `<wsp:Post_XMLRequest>` +
+          `<wsp:xmldoc><![CDATA[${datosXml}]]></wsp:xmldoc>` +
+        `</wsp:Post_XMLRequest>` +
+      `</soapenv:Body>` +
+    `</soapenv:Envelope>`;
+}
+
+// ── Función principal del driver ──────────────────────────────────
+async function send({ event, unit }) {
+  if (!USER || !PASS) {
+    console.error('[tracktec] ❌ TRACKTEC_USER / TRACKTEC_PASS no configurados');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing credentials' };
+  }
+  if (!TERCERO) {
+    console.error('[tracktec] ❌ TRACKTEC_TERCERO no configurado');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing TRACKTEC_TERCERO' };
+  }
+
+  const pat = (unit.plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (!pat) {
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing plate' };
+  }
+
+  const mot    = (event.ignition === true || event.ignition === 1) ? 1 : 0;
+  const vel    = Math.round(Number(event.speed   || 0));
+  const ori    = Math.round(Number(event.heading || 0));
+  const hdop   = Math.round(Number(event.hdop    || 0));
+  const odo    = Number(event.odometro || 0).toFixed(2);
+  const numSAT = Math.round(Number(event.sats    || 0));
+  const sens1  = 0;  // horómetro en minutos — no disponible
+  const sens2  = 0;
+
+  const datosXml = buildDatosXml({
+    pgps:      PGPS,
+    tercero:   TERCERO,
+    empresa:   EMPRESA,
+    pat,
+    fn:        toFechaChile(event.wialon_ts),
+    lat:       event.lat ?? 0,
+    lon:       event.lon ?? event.lng ?? 0,
+    ori,
+    vel,
+    mot,
+    hdop,
+    odo,
+    eve:       EVE_DEF,
+    conductor: 'No Asignado',
+    numSAT,
+    sens1,
+    sens2,
+    user:      USER,
+    pass:      PASS,
+  });
+
+  const envelope = buildEnvelope(datosXml);
+  const t0       = Date.now();
+
+  try {
+    const res = await fetch(ENDPOINT, {
+      method:  'POST',
+      headers: {
+        'Content-Type': 'text/xml; charset=utf-8',
+        'SOAPAction':   `"${SOAP_ACTION}"`,
+      },
+      body:   envelope,
+      signal: AbortSignal.timeout(10000),
+    });
+
+    const latency = Date.now() - t0;
+    const resText = await res.text().catch(() => '');
+
+    // Respuesta exitosa contiene: <Post_XMLResult>OK</Post_XMLResult>
+    const ok = res.ok && /Post_XMLResult[^>]*>OK</i.test(resText);
+
+    if (ok) {
+      console.log(`[tracktec] ✓ pat=${pat} (${latency}ms)`);
+    } else {
+      // Extraer mensaje de error del XML de respuesta si existe
+      const errMatch = resText.match(/Post_XMLResult[^>]*>([^<]+)</i);
+      const errMsg   = errMatch ? errMatch[1] : resText.slice(0, 200);
+      console.error(`[tracktec] ✗ pat=${pat} http=${res.status} err=${errMsg}`);
+    }
+
+    return {
+      ok,
+      http_status:   res.status,
+      status:        ok ? 'ok' : 'failed',
+      response_http: resText.slice(0, 500),
+      latency_ms:    latency,
+    };
+
+  } catch (err) {
+    const latency = Date.now() - t0;
+    console.error(`[tracktec] Error fetch:`, err.message);
+    return {
+      ok:            false,
+      http_status:   0,
+      status:        'failed',
+      response_http: err.message?.slice(0, 500) || 'fetch_error',
+      latency_ms:    latency,
+    };
+  }
+}
+
+module.exports = { send };
