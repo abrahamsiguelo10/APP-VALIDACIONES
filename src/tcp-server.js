@@ -384,6 +384,26 @@ function resolveSource(source, unit, parsed, clienteData) {
     case 'timezone_chile':
       // Timezone fijo para APIs que lo requieren como campo
       return 'America/Santiago';
+    case 'wialon_ts_offset': {
+      // Formato MovUP/ALTO: "YYYY-MM-DDTHH:MM:SS-0400" (Chile UTC-4 con offset explícito)
+      const iso = parsed.wialon_ts || new Date().toISOString();
+      try {
+        const d   = new Date(new Date(iso).toLocaleString('en-US', { timeZone: 'America/Santiago' }));
+        const utc = new Date(iso);
+        const off = Math.round((d - utc) / 3600000); // offset en horas
+        const sign = off >= 0 ? '+' : '-';
+        const absOff = String(Math.abs(off)).padStart(2, '0');
+        const p = n => String(n).padStart(2, '0');
+        return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}` +
+               `T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}${sign}${absOff}00`;
+      } catch (_) {
+        // Fallback UTC-4
+        const d = new Date(new Date(iso).getTime() - 4 * 3600 * 1000);
+        const p = n => String(n).padStart(2, '0');
+        return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())}` +
+               `T${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}-0400`;
+      }
+    }
     case 'fecha_gmt': {
       // Formato OWL/Codelco: "YYYY-MM-DD HH:MM:SS GMT"
       const iso = parsed.wialon_ts || new Date().toISOString();
