@@ -8,19 +8,18 @@
  * Endpoint: POST https://servicesproveedores.wing.cl/tracking/receiver/hub/v2
  * Auth:     Authorization: Bearer TOKEN
  *
- * Variables de entorno Railway:
- *   TMS_TOKEN — Bearer token entregado por West Ingeniería / TMS
- *   TMS_URL   — URL del endpoint (default: producción)
+ * Variables de entorno Railway (valores globales por defecto):
+ *   TMS_TOKEN — Bearer token por defecto
+ *   TMS_URL   — URL por defecto
+ *
+ * Para múltiples clientes Wing, configurar en el field_schema del destino:
+ *   apiKey: tms_token  → source: fixed → token del cliente
+ *   apiKey: tms_url    → source: fixed → URL del cliente
  */
 
 const ENDPOINT = process.env.TMS_URL   || 'https://servicesproveedores.wing.cl/tracking/receiver/hub/v2';
 const TOKEN    = process.env.TMS_TOKEN || '';
 
-// ── Helpers ───────────────────────────────────────────────────────
-
-/**
- * Formatea fecha en UTC: "YYYY-MM-DD HH:MM:SS"
- */
 function toFechaUTC(wialon_ts) {
   const d = wialon_ts ? new Date(wialon_ts) : new Date();
   if (isNaN(d)) return new Date().toISOString().replace('T', ' ').slice(0, 19);
@@ -29,18 +28,24 @@ function toFechaUTC(wialon_ts) {
          `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
 }
 
-// ── Función principal del driver ──────────────────────────────────
-/**
- * @param {object} options
- * @param {object} options.event  — datos GPS del evento
- * @param {object} options.unit   — datos de la unidad (imei, plate, ...)
- * @param {object} options.route  — datos del destino
- */
-async function send({ event, unit }) {
-  const token = TOKEN;
+async function send({ event, unit, route }) {
+  // Leer token y URL desde field_schema si están configurados como fixed
+  // Permite múltiples destinos Wing con distintos tokens y URLs sin tocar Railway
+  let token    = TOKEN;
+  let endpoint = ENDPOINT;
+  try {
+    const schema = route?.field_schema || [];
+    for (const f of schema) {
+      if (f.source === 'fixed' && f.fixedValue) {
+        if (f.apiKey === 'tms_token') token    = f.fixedValue;
+        if (f.apiKey === 'tms_url')   endpoint = f.fixedValue;
+      }
+    }
+  } catch (_) {}
+
   if (!token) {
-    console.error('[tms] ❌ TMS_TOKEN no configurado');
-    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing TMS_TOKEN' };
+    console.error('[tms] ❌ Token no configurado (ni TMS_TOKEN env ni campo fijo tms_token)');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing token' };
   }
 
   const plate = (unit.plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -48,23 +53,13 @@ async function send({ event, unit }) {
     return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing plate' };
   }
 
-  // ── Objeto de telemetría tv ───────────────────────────────────
-  // Solo incluir campos que tenemos disponibles, omitir los demás
   const ignition = event.ignition === true || event.ignition === 1 ? 1 : 0;
-  const tv = {
-    me: ignition,                          // motor encendido (0/1)
-    ...(event.sats    != null && { r: 0 }), // rpm — no disponible, omitir
-    ...(event.alt     != null && {}),
-    ...(event.odometro != null && { od: Math.round(Number(event.odometro) || 0) }),
-  };
 
-  // Limpiar tv — si queda vacío o solo con me, igual mandarlo
   const tvFinal = {
     me: ignition,
     ...(event.odometro != null ? { od: Math.round(Number(event.odometro) || 0) } : {}),
   };
 
-  // ── Payload principal ─────────────────────────────────────────
   const payload = {
     pv: plate,
     fh: toFechaUTC(event.wialon_ts),
@@ -74,13 +69,13 @@ async function send({ event, unit }) {
     c:  Math.round(Number(event.heading || 0)),
     ph: Number(event.hdop || 0),
     tv: tvFinal,
-    s:  {},  // sensores vacíos — no tenemos datos de sensores del dispositivo
+    s:  {},
   };
 
   const t0 = Date.now();
 
   try {
-    const res = await fetch(ENDPOINT, {
+    const res = await fetch(endpoint, {
       method:  'POST',
       headers: {
         'Content-Type':  'application/json',
@@ -93,15 +88,11 @@ async function send({ event, unit }) {
     const latency = Date.now() - t0;
     const resText = await res.text().catch(() => '');
 
-    // TMS retorna {"status": 200, "msg": "...", "nInserted": N}
-    let ok       = res.ok;
-    let inserted = 0;
+    let ok = res.ok, inserted = 0;
     try {
       const json = JSON.parse(resText);
       ok       = json?.status === 200 && (json?.nInserted ?? 0) > 0;
       inserted = json?.nInserted ?? 0;
-
-      // Loguear patentes no registradas si las hay
       if (json?.nUnRegistered > 0) {
         const unreg = (json?.unRegistered || []).map(u => `${u.pv}: ${u.error}`).join(', ');
         console.warn(`[tms] ⚠ ${json.nUnRegistered} trama(s) no registrada(s): ${unreg}`);
