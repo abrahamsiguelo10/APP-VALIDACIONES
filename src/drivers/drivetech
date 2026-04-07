@@ -1,0 +1,136 @@
+'use strict';
+
+/**
+ * src/drivers/drivetech.js
+ * ─────────────────────────────────────────────────────────────────
+ * Driver REST/JSON para Drivetech GPS API.
+ *
+ * Endpoint: POST https://api.drivetech.pro/provider/event/new/
+ * Auth:     Authorization: Bearer TOKEN
+ *
+ * Variables de entorno Railway:
+ *   DRIVETECH_TOKEN — Bearer token entregado por Drivetech
+ *   DRIVETECH_URL   — URL del endpoint (default: producción)
+ */
+
+const ENDPOINT = process.env.DRIVETECH_URL || 'https://api.drivetech.pro/provider/event/new/';
+const TOKEN    = process.env.DRIVETECH_TOKEN || '';
+
+// ── Helpers ───────────────────────────────────────────────────────
+
+/**
+ * Formatea fecha en ISO 8601 UTC compatible con Drivetech:
+ * "YYYY-MM-DDTHH:MM:SS.000Z"
+ */
+function toDatetime(wialon_ts) {
+  const d = wialon_ts ? new Date(wialon_ts) : new Date();
+  if (isNaN(d)) return new Date().toISOString();
+  return d.toISOString(); // "2024-02-14T11:58:44.063Z"
+}
+
+/**
+ * Determina el estado del vehículo según ignición y velocidad.
+ * Opciones: IgnitionOnMoving | IgnitionOnRest | IgnitionOffRest | Idling
+ */
+function resolveState(ignition, speed) {
+  const ign    = ignition === true || ignition === 1;
+  const moving = Number(speed || 0) > 0;
+
+  if (!ign)   return 'IgnitionOffRest';
+  if (moving) return 'IgnitionOnMoving';
+  return 'IgnitionOnRest'; // encendido pero detenido → puede ser Idling
+  // Nota: Idling requiere 2+ min detenido con motor encendido.
+  // Sin estado previo no podemos determinarlo, usamos IgnitionOnRest como fallback.
+}
+
+// ── Función principal del driver ──────────────────────────────────
+/**
+ * @param {object} options
+ * @param {object} options.event  — datos GPS del evento
+ * @param {object} options.unit   — datos de la unidad (imei, plate, ...)
+ * @param {object} options.route  — datos del destino
+ */
+async function send({ event, unit }) {
+  const token = TOKEN;
+  if (!token) {
+    console.error('[drivetech] ❌ DRIVETECH_TOKEN no configurado');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing DRIVETECH_TOKEN' };
+  }
+
+  const plate = (unit.plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (!plate) {
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing plate' };
+  }
+
+  const ignition = event.ignition === true || event.ignition === 1;
+  const speed    = Number(event.speed ?? 0);
+  const state    = resolveState(event.ignition, speed);
+
+  const payload = {
+    plate,
+    buff:      false,
+    datetime:  toDatetime(event.wialon_ts),
+    latitude:  event.lat       ?? 0,
+    longitude: event.lon       ?? event.lng ?? 0,
+    speed,
+    azimuth:   event.heading   ?? 0,
+    altitude:  event.alt       ?? 0,
+    state,
+    event:     { type: 'GPS' },
+    ign_input: ignition,
+    doors:     false,
+    gps_status: true,
+    odometer:  event.odometro  ?? 0,
+  };
+
+  const t0 = Date.now();
+
+  try {
+    const res = await fetch(ENDPOINT, {
+      method:  'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body:   JSON.stringify(payload),
+      signal: AbortSignal.timeout(10000),
+    });
+
+    const latency  = Date.now() - t0;
+    const resText  = await res.text().catch(() => '');
+
+    // Drivetech retorna {"status": true, "description": "..."} en éxito
+    let ok = res.ok;
+    try {
+      const json = JSON.parse(resText);
+      ok = json?.status === true;
+    } catch (_) {}
+
+    if (ok) {
+      console.log(`[drivetech] ✓ plate=${plate} state=${state} (${latency}ms)`);
+    } else {
+      console.error(`[drivetech] ✗ plate=${plate} http=${res.status} resp=${resText.slice(0, 200)}`);
+    }
+
+    return {
+      ok,
+      http_status:   res.status,
+      status:        ok ? 'ok' : 'failed',
+      response_http: resText.slice(0, 500),
+      latency_ms:    latency,
+    };
+
+  } catch (err) {
+    const latency = Date.now() - t0;
+    console.error(`[drivetech] Error fetch:`, err.message);
+    return {
+      ok:            false,
+      http_status:   0,
+      status:        'failed',
+      response_http: err.message?.slice(0, 500) || 'fetch_error',
+      latency_ms:    latency,
+    };
+  }
+}
+
+module.exports = { send };
