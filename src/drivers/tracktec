@@ -126,7 +126,26 @@ async function send({ event, unit }) {
     return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing plate' };
   }
 
-  const mot    = (event.ignition === true || event.ignition === 1) ? 1 : 0;
+  // Leer overrides desde field_schema si están configurados como fixed
+  // Permite tener múltiples destinos TrackTec con distintos tercero/pgps/eve
+  let pgps    = PGPS;
+  let tercero = TERCERO;
+  let eve     = EVE_DEF;
+  try {
+    const schema = (route?.field_schema) || [];
+    for (const f of schema) {
+      if (f.source === 'fixed' && f.fixedValue) {
+        if (f.apiKey === 'pgps')    pgps    = f.fixedValue;
+        if (f.apiKey === 'tercero') tercero = f.fixedValue;
+        if (f.apiKey === 'eve')     eve     = f.fixedValue;
+      }
+    }
+  } catch (_) {}
+
+  if (!tercero) {
+    console.error('[tracktec] ❌ TRACKTEC_TERCERO no configurado (ni en env ni en field_schema)');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing tercero' };
+  }
   const vel    = Math.round(Number(event.speed   || 0));
   const ori    = Math.round(Number(event.heading || 0));
   const hdop   = Math.round(Number(event.hdop    || 0));
@@ -136,8 +155,8 @@ async function send({ event, unit }) {
   const sens2  = 0;
 
   const datosXml = buildDatosXml({
-    pgps:      PGPS,
-    tercero:   TERCERO,
+    pgps,
+    tercero,
     empresa:   EMPRESA,
     pat,
     fn:        toFechaChile(event.wialon_ts),
@@ -148,7 +167,7 @@ async function send({ event, unit }) {
     mot,
     hdop,
     odo,
-    eve:       EVE_DEF,
+    eve,
     conductor: 'No Asignado',
     numSAT,
     sens1,
