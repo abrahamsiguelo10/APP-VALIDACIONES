@@ -706,7 +706,7 @@ async function forwardToDestinations(unit, parsed) {
         method:  'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders },
         body:    JSON.stringify(finalBody),
-        signal:  AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
+        signal:  AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined,
       });
       forwardOk   = res.ok;
       const respBody = await res.text().catch(()=>'');
