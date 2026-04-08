@@ -41,7 +41,7 @@ function isOriginAllowed(origin) {
   return false;
 }
 
-app.use(cors({
+const _corsOptions = {
   origin: (origin, callback) => {
     if (isOriginAllowed(origin)) {
       callback(null, origin || '*');
@@ -53,7 +53,12 @@ app.use(cors({
   methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
-}));
+  optionsSuccessStatus: 204,
+};
+
+// Manejar preflight OPTIONS explícitamente para TODOS los endpoints
+app.options('*', cors(_corsOptions));
+app.use(cors(_corsOptions));
 
 /* ── Body parser ──────────────────────────────────────────────── */
 app.use(express.json({ limit: '1mb' }));
