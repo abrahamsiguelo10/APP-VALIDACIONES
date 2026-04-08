@@ -11,6 +11,9 @@ const { query } = require('../db/pool');
  * requireAuth — valida JWT y adjunta req.user
  */
 async function requireAuth(req, res, next) {
+  // Dejar pasar preflight OPTIONS — CORS lo maneja el middleware global de index.js
+  if (req.method === 'OPTIONS') return next();
+
   const header = req.headers.authorization;
   if (!header?.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Token requerido.' });
