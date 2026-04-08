@@ -1,14 +1,14 @@
 /**
- * src/drivers/byduarte.js
+ * src/drivers/dduarte.js
  * Driver Transportes Duarte — Samtech SOAP/ASMX
  * Método: Post_XML con XML como CDATA
  *
  * Variables de entorno Railway:
- *   BYDUARTE_URL      — URL WebService (default: http://wspos.samtech.cl/WSP.asmx)
- *   BYDUARTE_USER     — Login WS
- *   BYDUARTE_PASS     — Clave WS
- *   BYDUARTE_PGPS     — Nombre proveedor GPS (default: SigueloGPS)
- *   BYDUARTE_EMPRESA  — Nombre servicio (default: dduarte)
+ *   dduarte_URL      — URL WebService (default: http://wspos.samtech.cl/WSP.asmx)
+ *   dduarte_USER     — Login WS
+ *   dduarte_PASS     — Clave WS
+ *   dduarte_PGPS     — Nombre proveedor GPS (default: SigueloGPS)
+ *   dduarte_EMPRESA  — Nombre servicio (default: dduarte)
  */
 
 'use strict';
@@ -90,11 +90,11 @@ function buildSoapEnvelope(innerXml) {
 }
 
 async function send({ event, unit, route } = {}) {
-  let url     = (process.env.BYDUARTE_URL     || DEFAULT_URL).trim();
-  let login   = (process.env.BYDUARTE_USER    || '').trim();
-  let clave   = (process.env.BYDUARTE_PASS    || '').trim();
-  let pgps    = (process.env.BYDUARTE_PGPS    || 'SigueloGPS').trim();
-  let empresa = (process.env.BYDUARTE_EMPRESA || 'dduarte').trim();
+  let url     = (process.env.dduarte_URL     || DEFAULT_URL).trim();
+  let login   = (process.env.dduarte_USER    || '').trim();
+  let clave   = (process.env.dduarte_PASS    || '').trim();
+  let pgps    = (process.env.dduarte_PGPS    || 'SigueloGPS').trim();
+  let empresa = (process.env.dduarte_EMPRESA || 'dduarte').trim();
 
   // Leer overrides desde field_schema — permite múltiples destinos Samtech
   // sin tocar Railway. Campos fijos a agregar en la UI:
@@ -117,7 +117,7 @@ async function send({ event, unit, route } = {}) {
   } catch (_) {}
 
   if (!login || !clave) {
-    console.warn('[byduarte] credenciales faltantes (BYDUARTE_USER / BYDUARTE_PASS)');
+    console.warn('[dduarte] credenciales faltantes (dduarte_USER / dduarte_PASS)');
     return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_credentials' };
   }
 
@@ -127,11 +127,11 @@ async function send({ event, unit, route } = {}) {
   const lng   = toDec(event?.lon, null);
 
   if (!imei) {
-    console.warn('[byduarte] IMEI faltante — skip');
+    console.warn('[dduarte] IMEI faltante — skip');
     return { ok: true, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'no_imei' };
   }
   if (lat === null || lng === null) {
-    console.warn(`[byduarte] coordenadas faltantes ${imei} — skip`);
+    console.warn(`[dduarte] coordenadas faltantes ${imei} — skip`);
     return { ok: true, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'no_coords' };
   }
 
@@ -163,7 +163,7 @@ async function send({ event, unit, route } = {}) {
   const innerXml = buildInnerXml(fields);
   const envelope = buildSoapEnvelope(innerXml);
 
-  console.log(`[byduarte] enviando imei=${imei} plate=${plate} fn=${fields.fn}`);
+  console.log(`[dduarte] enviando imei=${imei} plate=${plate} fn=${fields.fn}`);
 
   const t0 = Date.now();
   let res, body;
@@ -179,7 +179,7 @@ async function send({ event, unit, route } = {}) {
     });
     body = await res.text().catch(() => '');
   } catch (err) {
-    console.error(`[byduarte] error de red ${imei}:`, err.message);
+    console.error(`[dduarte] error de red ${imei}:`, err.message);
     return { ok: false, status: 'failed', http_status: 0, latency_ms: Date.now()-t0, response_http: err.message };
   }
 
@@ -188,9 +188,9 @@ async function send({ event, unit, route } = {}) {
   const ok = res.ok && /\bOK\b/i.test(body) && !/error/i.test(body);
 
   if (ok) {
-    console.log(`[byduarte] ✓ (${res.status})`);
+    console.log(`[dduarte] ✓ (${res.status})`);
   } else {
-    console.warn(`[byduarte] ✗ (${res.status}) ${body.slice(0,200)}`);
+    console.warn(`[dduarte] ✗ (${res.status}) ${body.slice(0,200)}`);
   }
 
   return {
@@ -203,4 +203,4 @@ async function send({ event, unit, route } = {}) {
   };
 }
 
-module.exports = { send, name: 'byduarte' };
+module.exports = { send, name: 'dduarte' };
