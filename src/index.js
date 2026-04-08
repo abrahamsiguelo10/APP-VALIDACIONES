@@ -23,6 +23,26 @@ const PORT = process.env.PORT || 3000;
 
 app.set('trust proxy', 1);
 
+/* ── Forzar headers CORS antes de cualquier middleware ────────── */
+// Esto asegura que OPTIONS siempre reciba los headers correctos
+// independiente de proxies o middlewares que puedan interceptar
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && isOriginAllowed(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+
+  // Responder preflight inmediatamente
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+  next();
+});
+
 /* ── CORS ─────────────────────────────────────────────────────── */
 // Orígenes permitidos: variable de entorno + siempre el .vercel.app base
 const _corsOrigins = (process.env.CORS_ORIGIN || '')
@@ -41,7 +61,7 @@ function isOriginAllowed(origin) {
   return false;
 }
 
-const _corsOptions = {
+app.use(cors({
   origin: (origin, callback) => {
     if (isOriginAllowed(origin)) {
       callback(null, origin || '*');
@@ -53,12 +73,7 @@ const _corsOptions = {
   methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
-  optionsSuccessStatus: 204,
-};
-
-// Manejar preflight OPTIONS explícitamente para TODOS los endpoints
-app.options('*', cors(_corsOptions));
-app.use(cors(_corsOptions));
+}));
 
 /* ── Body parser ──────────────────────────────────────────────── */
 app.use(express.json({ limit: '1mb' }));
