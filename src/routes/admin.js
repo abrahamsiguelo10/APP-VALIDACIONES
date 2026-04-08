@@ -2,7 +2,7 @@
  * routes/admin.js
  */
 const router = require('express').Router();
-const { query } = require('../db/pool');
+const { query, pool } = require('../db/pool');
 const { requireAuth, requireRole } = require('../middleware/auth');
 
 router.use(requireAuth);
@@ -188,5 +188,89 @@ router.post('/test-token', requireRole('admin'), async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+/* ── POST /admin/purge-gps-events ───────────────────────────── */
+// Borra eventos de gps_events más viejos que N días en lotes
+// Body: { days: 15, batch: 5000 } — ambos opcionales
+router.post('/purge-gps-events', requireRole('admin'), async (req, res) => {
+  const days    = Math.max(1,   Math.min(365,   parseInt(req.body?.days  ?? 15,   10)));
+  const batchSz = Math.max(100, Math.min(10000, parseInt(req.body?.batch ?? 5000, 10)));
+
+  let totalDeleted = 0;
+  let iterations   = 0;
+  const maxIter    = 500;
+
+  console.log(`[purge] iniciando — días a conservar: ${days}, lote: ${batchSz}`);
+
+  try {
+    while (iterations < maxIter) {
+      const { rowCount } = await pool.query(
+        `DELETE FROM public.gps_events
+         WHERE id IN (
+           SELECT id FROM public.gps_events
+           WHERE received_at < NOW() - ($1 || ' days')::INTERVAL
+           LIMIT $2
+         )`,
+        [days, batchSz]
+      );
+
+      totalDeleted += rowCount;
+      iterations++;
+      console.log(`[purge] lote ${iterations}: ${rowCount} eliminadas (total: ${totalDeleted})`);
+
+      if (rowCount === 0) break;
+    }
+
+    console.log(`[purge] ✅ completado — ${totalDeleted} eventos eliminados en ${iterations} lotes`);
+    res.json({ ok: true, deleted: totalDeleted, iterations, days_kept: days });
+
+  } catch (e) {
+    console.error('[purge] ❌ error:', e.message);
+    res.status(500).json({ error: e.message, deleted_so_far: totalDeleted });
+  }
+});
+
+/* ── Auto-purge al arrancar el servidor ──────────────────────── */
+// Se ejecuta 30 segundos después del arranque para no impactar el inicio
+// y luego cada 24 horas automáticamente
+const AUTO_PURGE_DAYS  = parseInt(process.env.GPS_RETENTION_DAYS || '15', 10);
+const AUTO_PURGE_BATCH = 5000;
+const AUTO_PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 horas
+
+async function runAutoPurge() {
+  let totalDeleted = 0;
+  let iterations   = 0;
+  console.log(`[auto-purge] iniciando — conservando últimos ${AUTO_PURGE_DAYS} días`);
+  try {
+    while (iterations < 500) {
+      const { rowCount } = await pool.query(
+        `DELETE FROM public.gps_events
+         WHERE id IN (
+           SELECT id FROM public.gps_events
+           WHERE received_at < NOW() - ($1 || ' days')::INTERVAL
+           LIMIT $2
+         )`,
+        [AUTO_PURGE_DAYS, AUTO_PURGE_BATCH]
+      );
+      totalDeleted += rowCount;
+      iterations++;
+      if (rowCount === 0) break;
+    }
+    if (totalDeleted > 0) {
+      console.log(`[auto-purge] ✅ ${totalDeleted} eventos eliminados en ${iterations} lotes`);
+    } else {
+      console.log(`[auto-purge] ✅ nada que eliminar`);
+    }
+  } catch (e) {
+    console.error('[auto-purge] ❌ error:', e.message);
+  }
+}
+
+// Arranque diferido: espera 30s para no impactar el inicio del servidor
+setTimeout(() => {
+  runAutoPurge();
+  // Repetir cada 24 horas
+  setInterval(runAutoPurge, AUTO_PURGE_INTERVAL_MS);
+}, 30 * 1000);
 
 module.exports = router;
