@@ -360,6 +360,15 @@ function resolveSource(source, unit, parsed, clienteData) {
     case 'sats':           return parsed.sats      ?? 0;
     case 'hdop':           return parsed.hdop      ?? 0;
     case 'odometro':       return parsed.odometro  ?? 0;
+    case 'unix_timestamp': {
+      // Unix timestamp en segundos (project44 y otros)
+      const ts = parsed.wialon_ts ? new Date(parsed.wialon_ts).getTime() : Date.now();
+      return Math.floor(ts / 1000);
+    }
+    case 'moving': {
+      // Boolean: true si velocidad > 0
+      return Number(parsed.speed || 0) > 0;
+    }
     case 'fecha_gmt': {
       // Formato OWL/Codelco: "YYYY-MM-DD HH:MM:SS GMT"
       const iso = parsed.wialon_ts || new Date().toISOString();
@@ -488,6 +497,24 @@ function buildPayload(fieldSchema, unit, parsed, clienteData) {
   const missing  = [];   // campos required sin valor
   const warnings = [];   // campos opcionales sin valor
 
+  /**
+   * Asigna un valor usando notación de punto en apiKey.
+   * Ejemplo: setNested(obj, 'position.latitude', -33.4)
+   *   → obj.position = { latitude: -33.4 }
+   */
+  function setNested(target, keyPath, value) {
+    const parts = keyPath.split('.');
+    if (parts.length === 1) { target[keyPath] = value; return; }
+    let cur = target;
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (cur[parts[i]] === undefined || cur[parts[i]] === null || typeof cur[parts[i]] !== 'object') {
+        cur[parts[i]] = {};
+      }
+      cur = cur[parts[i]];
+    }
+    cur[parts[parts.length - 1]] = value;
+  }
+
   for (const f of fields) {
     let val;
 
@@ -507,11 +534,10 @@ function buildPayload(fieldSchema, unit, parsed, clienteData) {
         missing.push({ apiKey: f.apiKey, source: f.source, label: f.label });
       } else {
         warnings.push({ apiKey: f.apiKey, source: f.source });
-        // Incluir igual con null para que el destino decida qué hacer
-        obj[f.apiKey] = null;
+        setNested(obj, f.apiKey, null);
       }
     } else {
-      obj[f.apiKey] = val;
+      setNested(obj, f.apiKey, val);
     }
   }
 
