@@ -89,12 +89,32 @@ function buildSoapEnvelope(innerXml) {
     '</soap12:Envelope>';
 }
 
-async function send({ event, unit } = {}) {
-  const url     = (process.env.BYDUARTE_URL     || DEFAULT_URL).trim();
-  const login   = (process.env.BYDUARTE_USER    || '').trim();
-  const clave   = (process.env.BYDUARTE_PASS    || '').trim();
-  const pgps    = (process.env.BYDUARTE_PGPS    || 'SigueloGPS').trim();
-  const empresa = (process.env.BYDUARTE_EMPRESA || 'dduarte').trim();
+async function send({ event, unit, route } = {}) {
+  let url     = (process.env.BYDUARTE_URL     || DEFAULT_URL).trim();
+  let login   = (process.env.BYDUARTE_USER    || '').trim();
+  let clave   = (process.env.BYDUARTE_PASS    || '').trim();
+  let pgps    = (process.env.BYDUARTE_PGPS    || 'SigueloGPS').trim();
+  let empresa = (process.env.BYDUARTE_EMPRESA || 'dduarte').trim();
+
+  // Leer overrides desde field_schema — permite múltiples destinos Samtech
+  // sin tocar Railway. Campos fijos a agregar en la UI:
+  //   samtech_empresa → dduarte | samtech | etc.
+  //   samtech_pgps    → SigueloGPS
+  //   samtech_login   → usuario WS
+  //   samtech_clave   → clave WS
+  //   samtech_url     → URL del endpoint (si difiere)
+  try {
+    const schema = route?.field_schema || [];
+    for (const f of schema) {
+      if (f.source === 'fixed' && f.fixedValue) {
+        if (f.apiKey === 'samtech_empresa') empresa = f.fixedValue;
+        if (f.apiKey === 'samtech_pgps')    pgps    = f.fixedValue;
+        if (f.apiKey === 'samtech_login')   login   = f.fixedValue;
+        if (f.apiKey === 'samtech_clave')   clave   = f.fixedValue;
+        if (f.apiKey === 'samtech_url')     url     = f.fixedValue;
+      }
+    }
+  } catch (_) {}
 
   if (!login || !clave) {
     console.warn('[byduarte] credenciales faltantes (BYDUARTE_USER / BYDUARTE_PASS)');
