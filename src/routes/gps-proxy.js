@@ -19,36 +19,37 @@ console.log(`[gps-proxy] Modo: ${GPS_SOURCE.toUpperCase()}`);
 // ── Local: estado de transmisión ──────────────────────────────────
 
 async function getUnitStatusLocal(plate) {
-  // Último evento TCP
-  const { rows } = await pool.query(
-    `SELECT
-       e.received_at,
-       e.wialon_ts,
-       EXTRACT(EPOCH FROM (now() - e.received_at)) / 60 AS age_minutes,
-       u.imei
-     FROM public.gps_events e
-     JOIN public.units u ON UPPER(u.plate) = UPPER(e.plate)
-     WHERE UPPER(e.plate) = UPPER($1)
-     ORDER BY e.received_at DESC
-     LIMIT 1`,
-    [plate]
-  );
+  // Una sola query: último evento + imei + destinos en paralelo
+  const [eventResult, destResult] = await Promise.all([
+    pool.query(
+      `SELECT
+         e.received_at,
+         e.wialon_ts,
+         EXTRACT(EPOCH FROM (now() - e.received_at)) / 60 AS age_minutes,
+         u.imei
+       FROM public.gps_events e
+       JOIN public.units u ON u.imei = e.imei
+       WHERE UPPER(e.plate) = UPPER($1)
+       ORDER BY e.received_at DESC
+       LIMIT 1`,
+      [plate]
+    ),
+    pool.query(
+      `SELECT d.name
+       FROM public.unit_destinations ud
+       JOIN public.units u ON u.imei = ud.imei
+       JOIN public.destinations d ON d.id = ud.destination_id
+       WHERE UPPER(u.plate) = UPPER($1)
+         AND ud.enabled = true
+       ORDER BY d.name`,
+      [plate]
+    ).catch(() => ({ rows: [] })),
+  ]);
 
-  // Nombres de destinos asignados (tabla unit_destinations)
-  const { rows: dRows } = await pool.query(
-    `SELECT d.name
-     FROM public.unit_destinations ud
-     JOIN public.units u ON u.imei = ud.imei
-     JOIN public.destinations d ON d.id = ud.destination_id
-     WHERE UPPER(u.plate) = UPPER($1)
-     ORDER BY d.name`,
-    [plate]
-  ).catch(() => ({ rows: [] }));
+  const targets = destResult.rows.map(r => r.name);
 
-  const targets = dRows.map(r => r.name);
-
-  if (!rows.length) {
-    // Sin eventos TCP — buscar imei igual
+  if (!eventResult.rows.length) {
+    // Sin eventos TCP — buscar imei desde units directamente
     const { rows: uRows } = await pool.query(
       `SELECT imei FROM public.units WHERE UPPER(plate) = UPPER($1) LIMIT 1`,
       [plate]
@@ -63,7 +64,7 @@ async function getUnitStatusLocal(plate) {
     };
   }
 
-  const r      = rows[0];
+  const r      = eventResult.rows[0];
   const ageMin = parseFloat(r.age_minutes);
   return {
     isTransmitting:      ageMin <= TX_ACTIVE_MINUTES,
@@ -78,43 +79,44 @@ async function getUnitStatusLocal(plate) {
 // ── Local: historial de eventos ───────────────────────────────────
 
 async function getLastResponsesLocal(plate) {
-  const { rows } = await pool.query(
-    `SELECT
-       e.id,
-       e.plate,
-       e.lat,
-       e.lon,
-       e.speed,
-       e.heading,
-       e.ignition,
-       e.wialon_ts,
-       e.received_at,
-       e.destination_id,
-       d.name          AS destination_name,
-       e.forward_ok    AS ok,
-       e.forward_resp  AS response
-     FROM public.gps_events e
-     LEFT JOIN public.destinations d ON d.id = e.destination_id
-     WHERE UPPER(e.plate) = UPPER($1)
-     ORDER BY e.received_at DESC
-     LIMIT $2`,
-    [plate, HISTORY_LIMIT]
-  );
+  // Historial y destinos asignados en paralelo
+  const [histResult, assignedResult] = await Promise.all([
+    pool.query(
+      `SELECT
+         e.id,
+         e.plate,
+         e.lat,
+         e.lon,
+         e.speed,
+         e.heading,
+         e.ignition,
+         e.wialon_ts,
+         e.received_at,
+         e.destination_id,
+         d.name          AS destination_name,
+         e.forward_ok    AS ok,
+         e.forward_resp  AS response
+       FROM public.gps_events e
+       LEFT JOIN public.destinations d ON d.id = e.destination_id
+       WHERE UPPER(e.plate) = UPPER($1)
+       ORDER BY e.received_at DESC
+       LIMIT $2`,
+      [plate, HISTORY_LIMIT]
+    ),
+    pool.query(
+      `SELECT d.id::text AS id, d.name
+       FROM public.destinations d
+       JOIN public.unit_destinations ud ON ud.destination_id = d.id
+       JOIN public.units u ON u.imei = ud.imei
+       WHERE d.enabled  = true
+         AND ud.enabled = true
+         AND UPPER(u.plate) = UPPER($1)`,
+      [plate]
+    ).catch(() => ({ rows: [] })),
+  ]);
 
-  // Destinos asignados (para semáforo aunque no haya forwards aún)
-  const { rows: assignedDests } = await pool.query(
-    `SELECT d.id::text AS id, d.name
-     FROM public.destinations d
-     WHERE d.enabled = true
-       AND EXISTS (
-         SELECT 1 FROM public.units u
-         WHERE UPPER(u.plate) = UPPER($1)
-           AND u.destinations @> jsonb_build_array(
-                 jsonb_build_object('destination_id', d.id::text)
-               )
-       )`,
-    [plate]
-  ).catch(() => ({ rows: [] }));
+  const rows         = histResult.rows;
+  const assignedDests = assignedResult.rows;
 
   const results = rows.map(r => ({
     at:             r.received_at,
