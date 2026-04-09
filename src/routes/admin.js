@@ -233,7 +233,7 @@ router.post('/purge-gps-events', requireRole('admin'), async (req, res) => {
 /* ── Auto-purge al arrancar el servidor ──────────────────────── */
 // Se ejecuta 30 segundos después del arranque para no impactar el inicio
 // y luego cada 24 horas automáticamente
-const AUTO_PURGE_DAYS  = parseInt(process.env.GPS_RETENTION_DAYS || '2', 10);
+const AUTO_PURGE_DAYS  = parseInt(process.env.GPS_RETENTION_DAYS || '15', 10);
 const AUTO_PURGE_BATCH = 5000;
 const AUTO_PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 horas
 
@@ -266,11 +266,15 @@ async function runAutoPurge() {
   }
 }
 
-// Arranque diferido: espera 30s para no impactar el inicio del servidor
-setTimeout(() => {
-  runAutoPurge();
-  // Repetir cada 24 horas
-  setInterval(runAutoPurge, AUTO_PURGE_INTERVAL_MS);
-}, 30 * 1000);
+// Arranque diferido: espera 5 minutos para no competir con el inicio del servidor
+// Solo activo si GPS_AUTO_PURGE !== 'false'
+if (process.env.GPS_AUTO_PURGE !== 'false') {
+  setTimeout(() => {
+    runAutoPurge();
+    setInterval(runAutoPurge, AUTO_PURGE_INTERVAL_MS);
+  }, 5 * 60 * 1000); // 5 minutos — da tiempo para que el pool se estabilice
+} else {
+  console.log('[auto-purge] deshabilitado (GPS_AUTO_PURGE=false)');
+}
 
 module.exports = router;
