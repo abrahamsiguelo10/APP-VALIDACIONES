@@ -266,6 +266,85 @@ async function runAutoPurge() {
   }
 }
 
+/* ── GET /admin/gps-events/:plate ───────────────────────────── */
+// Historial de eventos recibidos y respuestas de integraciones para una patente
+router.get('/gps-events/:plate', requireRole('admin'), async (req, res) => {
+  try {
+    const { plate }  = req.params;
+    const limit      = Math.min(parseInt(req.query.limit  || '50',  10), 200);
+    const offset     = parseInt(req.query.offset || '0', 10);
+    const dest_id    = req.query.dest_id || null;
+
+    const conditions = ['e.plate = $1'];
+    const values     = [plate.toUpperCase()];
+    let   i          = 2;
+
+    if (dest_id) {
+      conditions.push(`e.destination_id = $${i++}`);
+      values.push(dest_id);
+    }
+
+    const where = conditions.join(' AND ');
+
+    const { rows } = await query(`
+      SELECT
+        e.id,
+        e.plate,
+        e.imei,
+        e.lat,
+        e.lon,
+        e.speed,
+        e.heading,
+        e.ignition,
+        e.wialon_ts,
+        e.forward_ok,
+        e.forward_resp,
+        e.created_at,
+        d.name  AS dest_name,
+        d.id    AS dest_id
+      FROM public.gps_events e
+      LEFT JOIN public.destinations d ON d.id = e.destination_id
+      WHERE ${where}
+      ORDER BY e.created_at DESC
+      LIMIT $${i++} OFFSET $${i++}
+    `, [...values, limit, offset]);
+
+    // Total para paginación
+    const { rows: countRows } = await query(
+      `SELECT COUNT(*) FROM public.gps_events e WHERE ${where}`,
+      values
+    );
+
+    res.json({
+      plate:  plate.toUpperCase(),
+      total:  parseInt(countRows[0].count),
+      limit,
+      offset,
+      events: rows,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── GET /admin/gps-events/:plate/destinations ───────────────── */
+// Destinos únicos que han recibido eventos de una patente (para filtrar)
+router.get('/gps-events/:plate/destinations', requireRole('admin'), async (req, res) => {
+  try {
+    const { plate } = req.params;
+    const { rows } = await query(`
+      SELECT DISTINCT d.id, d.name
+      FROM public.gps_events e
+      JOIN public.destinations d ON d.id = e.destination_id
+      WHERE e.plate = $1
+      ORDER BY d.name
+    `, [plate.toUpperCase()]);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Arranque diferido: espera 5 minutos para no competir con el inicio del servidor
 // Solo activo si GPS_AUTO_PURGE !== 'false'
 if (process.env.GPS_AUTO_PURGE !== 'false') {
