@@ -233,7 +233,7 @@ router.post('/purge-gps-events', requireRole('admin'), async (req, res) => {
 /* ── Auto-purge al arrancar el servidor ──────────────────────── */
 // Se ejecuta 30 segundos después del arranque para no impactar el inicio
 // y luego cada 24 horas automáticamente
-const AUTO_PURGE_DAYS  = parseInt(process.env.GPS_RETENTION_DAYS || '15', 10);
+const AUTO_PURGE_DAYS  = parseInt(process.env.GPS_RETENTION_DAYS || '2', 10);
 const AUTO_PURGE_BATCH = 5000;
 const AUTO_PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 horas
 
