@@ -1,0 +1,157 @@
+'use strict';
+
+/**
+ * src/drivers/skyangel.js
+ * ─────────────────────────────────────────────────────────────────
+ * Driver REST/JSON para SkyAngel México
+ * Endpoint: POST http://api.skyangel.com.mx:8081/insertaMov/
+ *
+ * Variables de entorno Railway:
+ *   SKYANGEL_USER  — usuario de la cuenta SkyAngel
+ *   SKYANGEL_PASS  — password de la cuenta SkyAngel
+ *   SKYANGEL_URL   — URL del endpoint (default: el de producción)
+ *
+ * Para múltiples clientes SkyAngel, se pueden sobreescribir desde field_schema:
+ *   apiKey: skyangel_user  → usuario específico del cliente
+ *   apiKey: skyangel_pass  → password específico del cliente
+ *   apiKey: skyangel_url   → URL si difiere
+ */
+
+const DEFAULT_URL  = process.env.SKYANGEL_URL  || 'http://api.skyangel.com.mx:8081/insertaMov/';
+const DEFAULT_USER = process.env.SKYANGEL_USER || '';
+const DEFAULT_PASS = process.env.SKYANGEL_PASS || '';
+
+// ── Formatear fecha en formato SkyAngel UTC ───────────────────────
+// Formato esperado: "YYYY-MM-DD HH:MM:SS +00:00"
+function formatFechahora(wialon_ts) {
+  const d = wialon_ts ? new Date(wialon_ts) : new Date();
+  if (isNaN(d.getTime())) return '';
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ` +
+         `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} +00:00`;
+}
+
+// ── Función principal del driver ──────────────────────────────────
+async function send({ event, unit, route }) {
+  // Leer credenciales — primero field_schema, luego env vars
+  let url      = DEFAULT_URL;
+  let usuario  = DEFAULT_USER;
+  let password = DEFAULT_PASS;
+
+  try {
+    let schema = route?.field_schema || [];
+    if (typeof schema === 'string') {
+      try { schema = JSON.parse(schema); } catch (_) { schema = []; }
+    }
+    for (const f of schema) {
+      if (f.source === 'fixed' && f.fixedValue) {
+        if (f.apiKey === 'skyangel_url')  url      = f.fixedValue;
+        if (f.apiKey === 'skyangel_user') usuario  = f.fixedValue;
+        if (f.apiKey === 'skyangel_pass') password = f.fixedValue;
+      }
+    }
+  } catch (_) {}
+
+  // Credenciales del auth del destino como fallback
+  // (auth.type === 'basic-in-body' con username/password)
+  if (!usuario && route?.auth) {
+    try {
+      const auth = typeof route.auth === 'string' ? JSON.parse(route.auth) : route.auth;
+      if (auth?.username) usuario  = auth.username;
+      if (auth?.password) password = auth.password;
+    } catch (_) {}
+  }
+
+  if (!usuario || !password) {
+    console.error('[skyangel] ❌ SKYANGEL_USER/PASS no configurados');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing SKYANGEL credentials' };
+  }
+
+  const imei  = unit.imei  || event.imei  || '';
+  const plate = (unit.plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+  if (!imei) {
+    console.error('[skyangel] ❌ IMEI faltante');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing imei' };
+  }
+
+  const lat   = event.lat   ?? 0;
+  const lon   = event.lon   ?? event.lng ?? 0;
+  const speed = event.speed ?? 0;
+  const alt   = event.alt   ?? 0;
+  const course = event.heading ?? 0;
+
+  // Validar coordenadas
+  if (!lat && !lon) {
+    console.warn(`[skyangel] ⚠ coordenadas 0,0 — descartando imei=${imei}`);
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing coordinates' };
+  }
+
+  const fechahora = formatFechahora(event.wialon_ts);
+  if (!fechahora) {
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Invalid timestamp' };
+  }
+
+  // Payload exacto que espera SkyAngel
+  const body = {
+    usuario,
+    password,
+    imei:       String(imei),
+    neconomico: String(plate || imei),
+    fechahora,
+    latitud:    String(lat),
+    longitud:   String(lon),
+    altitud:    String(Math.round(alt)),
+    velocidad:  String(Math.round(speed)),
+    direccion:  String(Math.round(course)),
+    ubicacion:  '',
+    evento:     '',
+    temperatura:'',
+    gasolina:   '',
+  };
+
+  console.log(`[skyangel] enviando imei=${body.imei} lat=${body.latitud} lon=${body.longitud} speed=${body.velocidad}`);
+
+  const t0 = Date.now();
+  try {
+    const res = await fetch(url, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(body),
+      signal:  AbortSignal.timeout(12000),
+    });
+
+    const latency = Date.now() - t0;
+    const text    = await res.text().catch(() => '');
+
+    // SkyAngel responde con texto "enviado correctamente" en éxito
+    const ok = res.ok && text.toLowerCase().includes('enviado correctamente');
+
+    if (ok) {
+      console.log(`[skyangel] ✓ imei=${body.imei} (${latency}ms)`);
+    } else {
+      console.error(`[skyangel] ✗ imei=${body.imei} http=${res.status} resp=${text.slice(0,200)}`);
+    }
+
+    return {
+      ok,
+      http_status:   res.status,
+      status:        ok ? 'ok' : 'failed',
+      response_http: text.slice(0, 500),
+      latency_ms:    latency,
+    };
+
+  } catch (err) {
+    const latency = Date.now() - t0;
+    console.error(`[skyangel] Error fetch:`, err.message);
+    return {
+      ok:            false,
+      http_status:   0,
+      status:        'failed',
+      response_http: err.message?.slice(0, 500) || 'fetch_error',
+      latency_ms:    latency,
+    };
+  }
+}
+
+module.exports = { send };
