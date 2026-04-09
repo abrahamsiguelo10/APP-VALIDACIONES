@@ -305,7 +305,7 @@ router.get('/gps-events/:plate', requireRole('admin'), async (req, res) => {
       FROM public.gps_events e
       LEFT JOIN public.destinations d ON d.id = e.destination_id
       WHERE ${where}
-      ORDER BY e.created_at DESC
+      ORDER BY e.received_at DESC
       LIMIT $${i++} OFFSET $${i++}
     `, [...values, limit, offset]);
 
