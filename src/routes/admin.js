@@ -49,8 +49,8 @@ router.get('/audit', requireRole('admin'), async (req, res) => {
 
     if (action)   { conditions.push(`action ILIKE $${i++}`);   values.push(`%${action}%`); }
     if (username) { conditions.push(`username ILIKE $${i++}`); values.push(`%${username}%`); }
-    if (from)     { conditions.push(`created_at >= $${i++}`);  values.push(from); }
-    if (to)       { conditions.push(`created_at <= $${i++}`);  values.push(to); }
+    if (from)     { conditions.push(`received_at >= $${i++}`);  values.push(from); }
+    if (to)       { conditions.push(`received_at <= $${i++}`);  values.push(to); }
     if (search)   {
       conditions.push(`(action ILIKE $${i} OR target ILIKE $${i} OR username ILIKE $${i})`);
       values.push(`%${search}%`); i++;
@@ -61,10 +61,10 @@ router.get('/audit', requireRole('admin'), async (req, res) => {
     const [rows, total] = await Promise.all([
       query(
         `SELECT id, action, target, before_data, after_data,
-                user_id, username, role, ip, created_at
+                user_id, username, role, ip, received_at
          FROM public.audit_log
          ${where}
-         ORDER BY created_at DESC
+         ORDER BY received_at DESC
          LIMIT $${i++} OFFSET $${i++}`,
         [...values, parseInt(limit), parseInt(offset)]
       ),
@@ -299,7 +299,7 @@ router.get('/gps-events/:plate', requireRole('admin'), async (req, res) => {
         e.wialon_ts,
         e.forward_ok,
         e.forward_resp,
-        e.created_at,
+        e.received_at,
         d.name  AS dest_name,
         d.id    AS dest_id
       FROM public.gps_events e
