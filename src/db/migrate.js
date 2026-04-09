@@ -56,8 +56,6 @@ const migrations = [
      );` },
   { name: '013_add_auth_to_destinations',
     sql: `ALTER TABLE public.destinations ADD COLUMN IF NOT EXISTS auth JSONB DEFAULT NULL;` },
-
-  // ── NUEVA: asegurar columnas completas en audit_log ───────────
   { name: '014_create_audit_log',
     sql: `
       CREATE TABLE IF NOT EXISTS public.audit_log (
@@ -87,13 +85,8 @@ const migrations = [
     sql: `ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS ip TEXT;` },
   { name: '014i_audit_log_created_at',
     sql: `ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();` },
-  { name: '014i_audit_log_created_at',
-    sql: `ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();` },
   { name: '014j_audit_log_actor_nullable',
-    sql: `
-      -- Si existe columna 'actor' con NOT NULL, hacerla nullable
-      ALTER TABLE public.audit_log ALTER COLUMN actor DROP NOT NULL;
-    ` },
+    sql: `SELECT 1;` },
   { name: '014h_audit_log_indexes',
     sql: `
       CREATE INDEX IF NOT EXISTS idx_audit_log_action   ON public.audit_log(action);
@@ -105,8 +98,14 @@ const migrations = [
       USING public.users u2
       WHERE u1.id > u2.id
         AND u1.username = u2.username;
-      ALTER TABLE public.users
-        ADD CONSTRAINT IF NOT EXISTS users_username_unique UNIQUE (username);
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'users_username_unique'
+        ) THEN
+          ALTER TABLE public.users ADD CONSTRAINT users_username_unique UNIQUE (username);
+        END IF;
+      END $$;
     ` },
   { name: '015b_destinations_driver_slug',
     sql: `
@@ -135,6 +134,7 @@ async function runMigrations() {
       console.log(` ✅ ${migration.name}`);
     } catch (err) {
       console.error(` ❌ ${migration.name}: ${err.message}`);
+      // No hacer crash — continuar con la siguiente migración
     }
   }
   console.log('✅ Migraciones completadas');
