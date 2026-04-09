@@ -22,6 +22,36 @@ const { query } = require('./db/pool');
 
 const TCP_PORT = parseInt(process.env.TCP_PORT || '9001', 10);
 
+// ─── Caché en memoria ─────────────────────────────────────────────────────────
+// Evita queries repetidas a Supabase por datos que casi nunca cambian.
+// Con 200 unidades × 1 evento/s = 600 queries/s sin caché → ~3 queries/s con caché.
+
+const CACHE_TTL_MS       = 60_000;  // 60 segundos TTL general
+const CACHE_DEST_TTL_MS  = 120_000; // 2 minutos para destinos (cambian menos)
+
+const _unitCache = new Map();        // imei → { data, expiresAt }
+const _destCache = new Map();        // imei → { data, expiresAt }
+const _clienteCache = new Map();     // cliente_id → { data, expiresAt }
+
+function cacheGet(map, key) {
+  const entry = map.get(key);
+  if (!entry) return undefined;
+  if (Date.now() > entry.expiresAt) { map.delete(key); return undefined; }
+  return entry.data;
+}
+
+function cacheSet(map, key, data, ttl = CACHE_TTL_MS) {
+  map.set(key, { data, expiresAt: Date.now() + ttl });
+}
+
+// Limpiar caché expirado cada 5 minutos para evitar memory leaks
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of _unitCache)   { if (now > v.expiresAt) _unitCache.delete(k); }
+  for (const [k, v] of _destCache)   { if (now > v.expiresAt) _destCache.delete(k); }
+  for (const [k, v] of _clienteCache){ if (now > v.expiresAt) _clienteCache.delete(k); }
+}, 5 * 60_000);
+
 // ─── Parser Wialon IPS (texto) ────────────────────────────────────────────────
 function parseWialonIPS(raw) {
   try {
@@ -160,11 +190,16 @@ function parseRetranslatorPacket(buf) {
 
 // ─── Buscar unidad ────────────────────────────────────────────────────────────
 async function findUnit(imei) {
+  const cached = cacheGet(_unitCache, imei);
+  if (cached !== undefined) return cached;
+
   const { rows } = await query(
     'SELECT imei, plate, name, rut, enabled, cliente_id FROM public.units WHERE imei = $1',
     [imei]
   );
-  return rows[0] || null;
+  const unit = rows[0] || null;
+  cacheSet(_unitCache, imei, unit, CACHE_TTL_MS);
+  return unit;
 }
 
 // ─── Guardar evento GPS ───────────────────────────────────────────────────────
@@ -525,14 +560,23 @@ async function forwardToDestinations(unit, parsed) {
   let clienteData = {};
   try {
     if (unit.cliente_id) {
-      const { rows: cr } = await query(
-        'SELECT nombre, rut FROM public.clientes WHERE id = $1', [unit.cliente_id]
-      );
-      if (cr[0]) clienteData = cr[0];
+      const cachedCliente = cacheGet(_clienteCache, unit.cliente_id);
+      if (cachedCliente !== undefined) {
+        clienteData = cachedCliente;
+      } else {
+        const { rows: cr } = await query(
+          'SELECT nombre, rut FROM public.clientes WHERE id = $1', [unit.cliente_id]
+        );
+        clienteData = cr[0] || {};
+        cacheSet(_clienteCache, unit.cliente_id, clienteData, CACHE_TTL_MS);
+      }
     }
   } catch (_) {}
 
-  const { rows: assignments } = await query(`
+  // Caché de destinos por IMEI — se invalida cada 2 minutos
+  let assignments_rows = cacheGet(_destCache, unit.imei);
+  if (assignments_rows === undefined) {
+    const { rows: freshRows } = await query(`
     SELECT
       ud.shadow,
       d.id          AS dest_id,
@@ -546,8 +590,16 @@ async function forwardToDestinations(unit, parsed) {
     WHERE ud.imei    = $1
       AND ud.enabled = true
       AND d.enabled  = true
-      AND (d.api_url IS NOT NULL AND d.api_url <> '' OR d.driver_slug IS NOT NULL AND d.driver_slug <> '')
-  `, [unit.imei]);
+      AND (
+        (d.api_url IS NOT NULL AND d.api_url <> '')
+        OR
+        (d.driver_slug IS NOT NULL AND d.driver_slug <> '')
+      )
+    `, [unit.imei]);
+    cacheSet(_destCache, unit.imei, freshRows, CACHE_DEST_TTL_MS);
+    assignments_rows = freshRows;
+  }
+  const assignments = assignments_rows;
 
   if (!assignments.length) {
     console.log(`[TCP] ${unit.plate} — sin destinos activos`);
@@ -596,7 +648,7 @@ async function forwardToDestinations(unit, parsed) {
           name:   unit.name,
           rut:    unit.rut,
         };
-        const driverRoute = { destination_id: row.dest_id, field_schema: row.field_schema || [] };
+        const driverRoute = { destination_id: row.dest_id };
 
         console.log(`[TCP] ${unit.plate} → ${row.dest_name} [driver:${row.driver_slug}]`);
         const result = await driver.send({ event: driverEvent, unit: driverUnit, route: driverRoute });
