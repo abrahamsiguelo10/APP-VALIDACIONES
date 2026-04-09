@@ -735,7 +735,8 @@ async function forwardToDestinations(unit, parsed) {
       });
       forwardOk   = res.ok;
       const respBody = await res.text().catch(()=>'');
-      forwardResp = `${res.status} ${res.statusText}`.slice(0, 500);
+      // Guardar: "STATUS | body_json" para que el validador pueda ver la respuesta completa
+      forwardResp = `${res.status} | ${respBody}`.slice(0, 500);
       if (!forwardOk) {
         console.error(`[TCP] ${unit.plate} → ${row.dest_name} ✗ (${res.status}) body: ${respBody.slice(0,200)}`);
       } else {
