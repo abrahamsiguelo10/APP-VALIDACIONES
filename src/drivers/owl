@@ -108,7 +108,11 @@ async function send({ event, unit, route }) {
   let idDriver   = '-1';
 
   try {
-    const schema = route?.field_schema || [];
+    // Parsear field_schema defensivamente — puede llegar como string o array
+    let schema = route?.field_schema || [];
+    if (typeof schema === 'string') {
+      try { schema = JSON.parse(schema); } catch (_) { schema = []; }
+    }
     for (const f of schema) {
       if (f.source === 'fixed' && f.fixedValue) {
         if (f.apiKey === 'owl_base_url')   baseUrl    = f.fixedValue;
