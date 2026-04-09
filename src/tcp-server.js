@@ -648,7 +648,14 @@ async function forwardToDestinations(unit, parsed) {
           name:   unit.name,
           rut:    unit.rut,
         };
-        const driverRoute = { destination_id: row.dest_id };
+        // Parsear field_schema — puede llegar como string JSON o array
+        let driverFieldSchema = [];
+        try {
+          driverFieldSchema = typeof row.field_schema === 'string'
+            ? JSON.parse(row.field_schema)
+            : (row.field_schema || []);
+        } catch (_) {}
+        const driverRoute = { destination_id: row.dest_id, field_schema: driverFieldSchema };
 
         console.log(`[TCP] ${unit.plate} → ${row.dest_name} [driver:${row.driver_slug}]`);
         const result = await driver.send({ event: driverEvent, unit: driverUnit, route: driverRoute });
