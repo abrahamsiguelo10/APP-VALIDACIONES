@@ -1,0 +1,261 @@
+'use strict';
+
+/**
+ * src/drivers/owl.js
+ * ─────────────────────────────────────────────────────────────────
+ * Driver REST/JSON para OWL Chile — Faena Caserones y otras faenas.
+ *
+ * Flujo:
+ *   1. GET /v1/{id_provider}/login con header auth=API_KEY → JWT (60 min)
+ *   2. POST /v1/{id_provider}/{id_company}/{license_plate}/event con JWT
+ *
+ * Variables de entorno Railway:
+ *   OWL_API_KEY      — API Key entregada por OWL Chile (header auth)
+ *   OWL_ID_PROVIDER  — RUT del proveedor GPS sin puntos con guión (ej: 76825731-0)
+ *   OWL_BASE_URL     — URL base (default: https://caserones.owlchile.cl)
+ *
+ * Para múltiples clientes OWL, configurar en field_schema del destino:
+ *   apiKey: owl_id_company  → RUT empresa acreditada (ej: 10830212-9)
+ *   apiKey: owl_id_driver   → RUT conductor default (default: -1)
+ *   apiKey: owl_base_url    → URL base si difiere de la default
+ *   apiKey: owl_api_key     → API Key si difiere de la default
+ */
+
+const DEFAULT_BASE_URL  = process.env.OWL_BASE_URL     || 'https://caserones.owlchile.cl';
+const DEFAULT_API_KEY   = process.env.OWL_API_KEY       || '';
+const DEFAULT_PROVIDER  = process.env.OWL_ID_PROVIDER   || '';
+
+// ── Cache de JWT por proveedor+apikey ─────────────────────────────
+// Evita hacer login en cada evento — renueva solo cuando expira
+const _tokenCache = {};
+
+function _cacheKey(baseUrl, apiKey, idProvider) {
+  return `${baseUrl}|${apiKey}|${idProvider}`;
+}
+
+function _getCachedToken(key) {
+  const entry = _tokenCache[key];
+  if (!entry) return null;
+  // Margen de 2 minutos antes del vencimiento
+  if (Date.now() > entry.expiresAt - 2 * 60 * 1000) {
+    delete _tokenCache[key];
+    return null;
+  }
+  return entry.token;
+}
+
+function _setCachedToken(key, token) {
+  // Token válido 60 minutos según manual
+  _tokenCache[key] = {
+    token,
+    expiresAt: Date.now() + 60 * 60 * 1000,
+  };
+}
+
+// ── Login para obtener JWT ────────────────────────────────────────
+async function _login(baseUrl, apiKey, idProvider) {
+  const url = `${baseUrl}/v1/${encodeURIComponent(idProvider)}/login`;
+
+  console.log(`[owl] login → ${url}`);
+
+  const res = await fetch(url, {
+    method:  'GET',
+    headers: { auth: apiKey },
+    signal:  AbortSignal.timeout(10000),
+  });
+
+  const body = await res.text().catch(() => '');
+
+  if (!res.ok) {
+    throw new Error(`[owl] login falló http=${res.status} body=${body.slice(0, 200)}`);
+  }
+
+  // Respuesta puede ser JSON con token o el token directamente como string
+  let token;
+  try {
+    const json = JSON.parse(body);
+    token = json?.token || json?.jwt || json?.access_token || json?.data?.token;
+  } catch (_) {
+    token = body.trim();
+  }
+
+  if (!token) {
+    throw new Error(`[owl] login: no se encontró token en respuesta: ${body.slice(0, 200)}`);
+  }
+
+  console.log(`[owl] ✓ JWT obtenido para provider=${idProvider}`);
+  return token;
+}
+
+// ── Calcular code de evento según estado del vehículo ─────────────
+function _resolveCode(event) {
+  const ign = event.ignition === true || event.ignition === 1;
+  const spd = Number(event.speed || 0);
+
+  if (ign && spd > 0) return 0;   // posicionamiento en movimiento
+  if (ign && spd === 0) return 0; // posicionamiento detenido con motor
+  if (!ign) return 2;             // apagado de ignición
+  return 0;
+}
+
+// ── Función principal del driver ──────────────────────────────────
+async function send({ event, unit, route }) {
+  // Leer overrides desde field_schema
+  let baseUrl    = DEFAULT_BASE_URL;
+  let apiKey     = DEFAULT_API_KEY;
+  let idProvider = DEFAULT_PROVIDER;
+  let idCompany  = '';
+  let idDriver   = '-1';
+
+  try {
+    const schema = route?.field_schema || [];
+    for (const f of schema) {
+      if (f.source === 'fixed' && f.fixedValue) {
+        if (f.apiKey === 'owl_base_url')   baseUrl    = f.fixedValue;
+        if (f.apiKey === 'owl_api_key')    apiKey     = f.fixedValue;
+        if (f.apiKey === 'owl_id_provider') idProvider = f.fixedValue;
+        if (f.apiKey === 'owl_id_company') idCompany  = f.fixedValue;
+        if (f.apiKey === 'owl_id_driver')  idDriver   = f.fixedValue;
+      }
+    }
+  } catch (_) {}
+
+  // Validaciones
+  if (!apiKey) {
+    console.error('[owl] ❌ OWL_API_KEY no configurado');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing OWL_API_KEY' };
+  }
+  if (!idProvider) {
+    console.error('[owl] ❌ OWL_ID_PROVIDER no configurado');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing OWL_ID_PROVIDER' };
+  }
+  if (!idCompany) {
+    console.error('[owl] ❌ owl_id_company no configurado en field_schema');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing owl_id_company in field_schema' };
+  }
+
+  const plate = (unit.plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (!plate) {
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing plate' };
+  }
+
+  // ── Obtener JWT (desde cache o haciendo login) ────────────────
+  const cKey = _cacheKey(baseUrl, apiKey, idProvider);
+  let jwt = _getCachedToken(cKey);
+
+  if (!jwt) {
+    try {
+      jwt = await _login(baseUrl, apiKey, idProvider);
+      _setCachedToken(cKey, jwt);
+    } catch (err) {
+      console.error('[owl] ❌ Error en login:', err.message);
+      return { ok: false, http_status: 0, status: 'failed', response_http: err.message };
+    }
+  }
+
+  // ── Construir payload ─────────────────────────────────────────
+  const datetime = event.wialon_ts
+    ? new Date(event.wialon_ts).getTime()
+    : Date.now();
+
+  const payload = {
+    code:          _resolveCode(event),
+    datetime,
+    latitude:      event.lat     ?? 0,
+    longitude:     event.lon     ?? event.lng ?? 0,
+    altitude:      Math.round(Number(event.alt   || 0)),
+    head:          Math.round(Number(event.heading || 0)),
+    velocity:      Math.round(Number(event.speed  || 0)),
+    engine:        (event.ignition === true || event.ignition === 1) ? 1 : 0,
+    odometer:      Math.round(Number(event.odometro || -1)),
+    hdop:          Math.round(Number(event.hdop     || -1)),
+    satellites:    Math.round(Number(event.sats     || -1)),
+    signal:        -1,       // no disponible
+    license_plate: plate,
+    id_provider:   idProvider,
+    id_company:    idCompany,
+    id_driver:     idDriver,
+    deferred:      0,
+    roadscope:     -1,
+    bpanic:        -1,
+  };
+
+  const endpoint = `${baseUrl}/v1/${encodeURIComponent(idProvider)}/${encodeURIComponent(idCompany)}/${encodeURIComponent(plate)}/event`;
+  const t0 = Date.now();
+
+  try {
+    const res = await fetch(endpoint, {
+      method:  'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'auth':         jwt,
+      },
+      body:   JSON.stringify(payload),
+      signal: AbortSignal.timeout(10000),
+    });
+
+    const latency = Date.now() - t0;
+    const resText = await res.text().catch(() => '');
+
+    // Si el token expiró (403 con código 2010), limpiar cache y reintentar una vez
+    if (res.status === 403) {
+      let resJson = {};
+      try { resJson = JSON.parse(resText); } catch (_) {}
+      if ([2010, 2005, 2008].includes(resJson?.code)) {
+        console.warn(`[owl] JWT expirado (code ${resJson.code}), renovando...`);
+        delete _tokenCache[cKey];
+        try {
+          jwt = await _login(baseUrl, apiKey, idProvider);
+          _setCachedToken(cKey, jwt);
+          // Reintentar el envío con el nuevo token
+          const res2 = await fetch(endpoint, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json', 'auth': jwt },
+            body:    JSON.stringify(payload),
+            signal:  AbortSignal.timeout(10000),
+          });
+          const resText2 = await res2.text().catch(() => '');
+          const ok2 = res2.ok;
+          if (ok2) console.log(`[owl] ✓ plate=${plate} (reintento, ${Date.now()-t0}ms)`);
+          else console.error(`[owl] ✗ plate=${plate} http=${res2.status} resp=${resText2.slice(0,200)}`);
+          return {
+            ok: ok2, http_status: res2.status,
+            status: ok2 ? 'ok' : 'failed',
+            response_http: resText2.slice(0, 500),
+            latency_ms: Date.now() - t0,
+          };
+        } catch (retryErr) {
+          return { ok: false, http_status: 0, status: 'failed', response_http: retryErr.message };
+        }
+      }
+    }
+
+    const ok = res.ok;
+    if (ok) {
+      console.log(`[owl] ✓ plate=${plate} code=${payload.code} (${latency}ms)`);
+    } else {
+      console.error(`[owl] ✗ plate=${plate} http=${res.status} resp=${resText.slice(0, 200)}`);
+    }
+
+    return {
+      ok,
+      http_status:   res.status,
+      status:        ok ? 'ok' : 'failed',
+      response_http: resText.slice(0, 500),
+      latency_ms:    latency,
+    };
+
+  } catch (err) {
+    const latency = Date.now() - t0;
+    console.error(`[owl] Error fetch:`, err.message);
+    return {
+      ok:            false,
+      http_status:   0,
+      status:        'failed',
+      response_http: err.message?.slice(0, 500) || 'fetch_error',
+      latency_ms:    latency,
+    };
+  }
+}
+
+module.exports = { send };
