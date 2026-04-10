@@ -144,6 +144,7 @@ function readConfig(route) {
     if (auth?.password && cfg.pass === PASS) cfg.pass = auth.password;
   } catch (_) {}
 
+  console.log(`[position] config → net=${cfg.net} site=${cfg.site} user=${cfg.user} gps=${cfg.gps}`);
   return cfg;
 }
 
