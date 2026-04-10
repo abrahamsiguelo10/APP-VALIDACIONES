@@ -46,7 +46,7 @@ function formatFecha(wialon_ts) {
 // ── Construir SOAP envelopes ──────────────────────────────────────
 function buildInstalarMovil(pat, imei, cfg) {
   return `<?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:integrationPositionGPS" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:WsPosition" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <soapenv:Body>
     <urn:InstalarMovil soapenv:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
       <npg xsi:type="xsd:string">${esc(cfg.gps)}</npg>
@@ -66,7 +66,7 @@ function buildPublicarMovil(pat, imei, event, cfg) {
             : (event.ignition === false || event.ignition === 0) ? '-1'
             : '0';
   return `<?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:integrationPositionGPS" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:WsPosition" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <soapenv:Body>
     <urn:PublicarMovil soapenv:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
       <npg xsi:type="xsd:string">${esc(cfg.gps)}</npg>
@@ -101,7 +101,7 @@ async function soapCall(action, xmlBody) {
     method:  'POST',
     headers: {
       'Content-Type': 'text/xml; charset=utf-8',
-      'SOAPAction':   `"urn:integrationPositionGPS#${action}"`,
+      'SOAPAction':   `"urn:WsPosition#${action}"`,
     },
     body:   xmlBody,
     signal: AbortSignal.timeout(10000),
