@@ -162,7 +162,14 @@ async function ensureInstalado(pat, imei, cfg) {
     return true;
   }
 
-  console.error(`[position] InstalarMovil FAIL (${result.http_status}): ${result.response_http.slice(0, 200)}`);
+  // Loguear respuesta completa para diagnóstico
+  console.error(`[position] InstalarMovil FAIL (${result.http_status}): ${result.response_http.slice(0, 400)}`);
+
+  // Algunos servidores devuelven un mensaje específico de por qué falló
+  // Extraer el mensaje del XML si existe
+  const msgMatch = result.response_http.match(/<return[^>]*>([^<]+)<\/return>/i);
+  if (msgMatch) console.error(`[position] InstalarMovil mensaje: ${msgMatch[1]}`);
+
   return false;
 }
 
@@ -187,7 +194,9 @@ async function send({ event, unit, route }) {
   const xml    = buildPublicarMovil(pat, imei, event, cfg);
   const result = await soapCall('PublicarMovil', xml);
 
-  console.log(`[position] PublicarMovil pat=${pat} net=${cfg.net} http=${result.http_status} ok=${result.ok} (${result.latency_ms}ms)`);
+  // Extraer mensaje del XML para el log
+  const pubMsg = result.response_http.match(/<return[^>]*>([^<]{0,200})<\/return>/i);
+  console.log(`[position] PublicarMovil pat=${pat} net=${cfg.net} http=${result.http_status} ok=${result.ok} msg="${pubMsg?.[1] || ''}" (${result.latency_ms}ms)`);
 
   // Si retorna "Móvil no registrado" — limpiar cache y reintentar
   if (!result.ok && /no registrado/i.test(result.response_http)) {
