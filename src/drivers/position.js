@@ -1,35 +1,32 @@
 'use strict';
 
 /**
- * drivers/position_agunsa.js
- * ─────────────────────────────────────────────────────────────────
+ * drivers/position.js
  * Driver SOAP/XML para Position GPS (Agunsa / Amazon).
  *
- * WSDL: https://api.gpsposition.cl/wsPositionGPS/integrationPositionGPSAgunsa.php?wsdl
- *
- * Métodos:
- *   InstalarMovil  — registra el vehículo (se llama una vez por IMEI)
- *   PublicarMovil  — envía posición GPS
- *
  * Variables de entorno Railway:
- *   POSITION_GPS   — nombre del proveedor GPS  (default: SIGUELOGPS)
+ *   POSITION_GPS   — nombre del proveedor GPS (default: SIGUELOGPS)
  *   POSITION_NET   — nombre cuenta/transportista (default: SIGUELOGPS)
- *   POSITION_USER  — usuario API               (default: SIGUELOGPS)
- *   POSITION_PASS  — contraseña API (base64 ok) (default: U0lHVUVMT0dQUzE3MDI=)
- *   POSITION_SITE  — sitio cliente             (default: POS)
- *   POSITION_URL   — URL del WS                (default: url producción)
+ *   POSITION_USER  — usuario API (default: SIGUELOGPS)
+ *   POSITION_PASS  — contraseña API (default: U01HVUVMT0dQuzE3MDI=)
+ *   POSITION_SITE  — sitio cliente (default: POS)
+ *   POSITION_URL   — URL del WS
+ *
+ * Para múltiples clientes, configurar en field_schema del destino:
+ *   apiKey: position_net  → nombre transportista/cuenta del cliente
+ *   apiKey: position_site → sitio del cliente
+ *   apiKey: position_pass → password si difiere del global
+ *   apiKey: position_user → usuario si difiere del global
  */
 
-const WSDL_URL = process.env.POSITION_URL ||
-  'https://api.gpsposition.cl/wsPositionGPS/integrationPositionGPSAgunsa.php';
+const WSDL_URL  = process.env.POSITION_URL  || 'https://api.gpsposition.cl/wsPositionGPS/integrationPositionGPSAgunsa.php';
+const GPS_NAME  = process.env.POSITION_GPS  || 'SIGUELOGPS';
+const NET_NAME  = process.env.POSITION_NET  || 'SIGUELOGPS';
+const USER      = process.env.POSITION_USER || 'SIGUELOGPS';
+const PASS      = process.env.POSITION_PASS || 'U01HVUVMT0dQuzE3MDI=';  // corregido
+const SITE      = process.env.POSITION_SITE || 'POS';
 
-const GPS_NAME = process.env.POSITION_GPS  || 'SIGUELOGPS';
-const NET_NAME = process.env.POSITION_NET  || 'SIGUELOGPS';
-const USER     = process.env.POSITION_USER || 'SIGUELOGPS';
-const PASS     = process.env.POSITION_PASS || 'U0lHVUVMT0dQUzE3MDI=';
-const SITE     = process.env.POSITION_SITE || 'POS';
-
-// Cache de IMEIs ya instalados en Position (en memoria, se reinicia con el proceso)
+// Cache de IMEIs ya instalados en Position (en memoria)
 const _instalados = new Set();
 
 // ── Helpers XML ───────────────────────────────────────────────────
@@ -40,62 +37,52 @@ function esc(v) {
 function pad2(n) { return String(n).padStart(2, '0'); }
 
 function formatFecha(wialon_ts) {
-  // Formato requerido: AAAA-MM-DD HH:II:SS
   const d = wialon_ts ? new Date(wialon_ts) : new Date();
   if (isNaN(d)) return new Date().toISOString().replace('T', ' ').slice(0, 19);
   return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth()+1)}-${pad2(d.getUTCDate())} ` +
          `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`;
 }
 
-// ── Construir SOAP envelope ───────────────────────────────────────
-function buildInstalarMovil(pat, imei) {
+// ── Construir SOAP envelopes ──────────────────────────────────────
+function buildInstalarMovil(pat, imei, cfg) {
   return `<?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope
-  xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
-  xmlns:urn="urn:integrationPositionGPS"
-  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-  xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:integrationPositionGPS" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <soapenv:Body>
     <urn:InstalarMovil soapenv:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-      <npg  xsi:type="xsd:string">${esc(GPS_NAME)}</npg>
-      <net  xsi:type="xsd:string">${esc(NET_NAME)}</net>
-      <pat  xsi:type="xsd:string">${esc(pat)}</pat>
+      <npg xsi:type="xsd:string">${esc(cfg.gps)}</npg>
+      <net xsi:type="xsd:string">${esc(cfg.net)}</net>
+      <pat xsi:type="xsd:string">${esc(pat)}</pat>
       <imei xsi:type="xsd:string">${esc(imei)}</imei>
-      <user xsi:type="xsd:string">${esc(USER)}</user>
-      <pass xsi:type="xsd:string">${esc(PASS)}</pass>
-      <site xsi:type="xsd:string">${esc(SITE)}</site>
+      <user xsi:type="xsd:string">${esc(cfg.user)}</user>
+      <pass xsi:type="xsd:string">${esc(cfg.pass)}</pass>
+      <site xsi:type="xsd:string">${esc(cfg.site)}</site>
     </urn:InstalarMovil>
   </soapenv:Body>
 </soapenv:Envelope>`;
 }
 
-function buildPublicarMovil(pat, imei, event) {
+function buildPublicarMovil(pat, imei, event, cfg) {
   const ign = (event.ignition === true || event.ignition === 1) ? '1'
             : (event.ignition === false || event.ignition === 0) ? '-1'
             : '0';
-
   return `<?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope
-  xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
-  xmlns:urn="urn:integrationPositionGPS"
-  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-  xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:integrationPositionGPS" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <soapenv:Body>
     <urn:PublicarMovil soapenv:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-      <npg  xsi:type="xsd:string">${esc(GPS_NAME)}</npg>
-      <net  xsi:type="xsd:string">${esc(NET_NAME)}</net>
-      <pat  xsi:type="xsd:string">${esc(pat)}</pat>
+      <npg xsi:type="xsd:string">${esc(cfg.gps)}</npg>
+      <net xsi:type="xsd:string">${esc(cfg.net)}</net>
+      <pat xsi:type="xsd:string">${esc(pat)}</pat>
       <imei xsi:type="xsd:string">${esc(imei)}</imei>
-      <user xsi:type="xsd:string">${esc(USER)}</user>
-      <pass xsi:type="xsd:string">${esc(PASS)}</pass>
-      <site xsi:type="xsd:string">${esc(SITE)}</site>
-      <fec  xsi:type="xsd:string">${esc(formatFecha(event.wialon_ts))}</fec>
-      <lat  xsi:type="xsd:string">${esc(event.lat ?? 0)}</lat>
-      <lng  xsi:type="xsd:string">${esc(event.lon ?? event.lng ?? 0)}</lng>
+      <user xsi:type="xsd:string">${esc(cfg.user)}</user>
+      <pass xsi:type="xsd:string">${esc(cfg.pass)}</pass>
+      <site xsi:type="xsd:string">${esc(cfg.site)}</site>
+      <fec xsi:type="xsd:string">${esc(formatFecha(event.wialon_ts))}</fec>
+      <lat xsi:type="xsd:string">${esc(event.lat ?? 0)}</lat>
+      <lng xsi:type="xsd:string">${esc(event.lon ?? event.lng ?? 0)}</lng>
       <head xsi:type="xsd:string">${esc(Math.round(event.heading ?? 0))}</head>
-      <vel  xsi:type="xsd:string">${esc(Math.round(event.speed ?? 0))}</vel>
-      <ign  xsi:type="xsd:string">${ign}</ign>
-      <pta  xsi:type="xsd:string">0</pta>
+      <vel xsi:type="xsd:string">${esc(Math.round(event.speed ?? 0))}</vel>
+      <ign xsi:type="xsd:string">${ign}</ign>
+      <pta xsi:type="xsd:string">0</pta>
       <temp1 xsi:type="xsd:string">999</temp1>
       <temp2 xsi:type="xsd:string">999</temp2>
       <chof xsi:type="xsd:string"></chof>
@@ -109,7 +96,7 @@ function buildPublicarMovil(pat, imei, event) {
 
 // ── Llamada SOAP ──────────────────────────────────────────────────
 async function soapCall(action, xmlBody) {
-  const t0  = Date.now();
+  const t0 = Date.now();
   const res = await fetch(WSDL_URL, {
     method:  'POST',
     headers: {
@@ -119,51 +106,68 @@ async function soapCall(action, xmlBody) {
     body:   xmlBody,
     signal: AbortSignal.timeout(10000),
   });
-
   const text    = await res.text().catch(() => '');
   const latency = Date.now() - t0;
-
-  // Verificar resultado: buscar <return ...>OK</return> en la respuesta
-  const ok = res.ok && />\s*OK\s*<\/return>/i.test(text);
-
+  const ok      = res.ok && />\s*OK\s*<\/return>/i.test(text);
   return { ok, http_status: res.status, response_http: text.slice(0, 500), latency_ms: latency };
 }
 
+// ── Leer config del field_schema o auth del destino ───────────────
+function readConfig(route) {
+  const cfg = {
+    gps:  GPS_NAME,
+    net:  NET_NAME,
+    user: USER,
+    pass: PASS,
+    site: SITE,
+  };
+
+  // 1. Leer del field_schema (campos fijos por destino en la UI)
+  try {
+    let schema = route?.field_schema || [];
+    if (typeof schema === 'string') schema = JSON.parse(schema);
+    for (const f of schema) {
+      if (f.source === 'fixed' && f.fixedValue) {
+        if (f.apiKey === 'position_net')  cfg.net  = f.fixedValue;
+        if (f.apiKey === 'position_site') cfg.site = f.fixedValue;
+        if (f.apiKey === 'position_user') cfg.user = f.fixedValue;
+        if (f.apiKey === 'position_pass') cfg.pass = f.fixedValue;
+        if (f.apiKey === 'position_gps')  cfg.gps  = f.fixedValue;
+      }
+    }
+  } catch (_) {}
+
+  // 2. Leer del auth del destino como fallback
+  try {
+    const auth = typeof route?.auth === 'string' ? JSON.parse(route.auth) : route?.auth;
+    if (auth?.username && cfg.user === USER) cfg.user = auth.username;
+    if (auth?.password && cfg.pass === PASS) cfg.pass = auth.password;
+  } catch (_) {}
+
+  return cfg;
+}
+
 // ── Instalar móvil si no está en cache ────────────────────────────
-async function ensureInstalado(pat, imei) {
-  const key = `${imei}`;
+async function ensureInstalado(pat, imei, cfg) {
+  const key = `${imei}:${cfg.net}:${cfg.site}`;
   if (_instalados.has(key)) return true;
 
-  console.log(`[position_agunsa] InstalarMovil pat=${pat} imei=${imei}`);
-  const xml    = buildInstalarMovil(pat, imei);
+  console.log(`[position] InstalarMovil pat=${pat} imei=${imei} net=${cfg.net} site=${cfg.site}`);
+  const xml    = buildInstalarMovil(pat, imei, cfg);
   const result = await soapCall('InstalarMovil', xml);
 
-  if (result.ok) {
+  if (result.ok || /ya existe/i.test(result.response_http)) {
     _instalados.add(key);
-    console.log(`[position_agunsa] InstalarMovil OK (${result.latency_ms}ms)`);
+    console.log(`[position] InstalarMovil OK (${result.latency_ms}ms)`);
     return true;
   }
 
-  // "Patente/IMEI ya existe" también es válido — ya está registrado
-  if (/ya existe/i.test(result.response_http)) {
-    _instalados.add(key);
-    console.log(`[position_agunsa] InstalarMovil — ya existe, continuando`);
-    return true;
-  }
-
-  console.error(`[position_agunsa] InstalarMovil FAIL (${result.http_status}): ${result.response_http.slice(0, 200)}`);
+  console.error(`[position] InstalarMovil FAIL (${result.http_status}): ${result.response_http.slice(0, 200)}`);
   return false;
 }
 
 // ── Función principal del driver ──────────────────────────────────
-/**
- * @param {object} options
- * @param {object} options.event   — datos GPS del evento
- * @param {object} options.unit    — datos de la unidad (imei, plate, ...)
- * @param {object} options.route   — datos del destino
- * @returns {{ ok, http_status, status, response_http }}
- */
-async function send({ event, unit }) {
+async function send({ event, unit, route }) {
   const imei = unit.imei || event.imei;
   const pat  = (unit.plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 
@@ -171,21 +175,26 @@ async function send({ event, unit }) {
     return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing imei or plate' };
   }
 
+  const cfg = readConfig(route);
+
   // 1. Asegurar que el móvil está instalado
-  const instalado = await ensureInstalado(pat, imei);
+  const instalado = await ensureInstalado(pat, imei, cfg);
   if (!instalado) {
     return { ok: false, http_status: 0, status: 'failed', response_http: 'InstalarMovil falló' };
   }
 
   // 2. Publicar posición
-  const xml    = buildPublicarMovil(pat, imei, event);
+  const xml    = buildPublicarMovil(pat, imei, event, cfg);
   const result = await soapCall('PublicarMovil', xml);
 
-  // Si retorna "Móvil no registrado" limpiar cache y reintentar una vez
+  console.log(`[position] PublicarMovil pat=${pat} net=${cfg.net} http=${result.http_status} ok=${result.ok} (${result.latency_ms}ms)`);
+
+  // Si retorna "Móvil no registrado" — limpiar cache y reintentar
   if (!result.ok && /no registrado/i.test(result.response_http)) {
-    console.warn(`[position_agunsa] Móvil no registrado, reintentando InstalarMovil...`);
-    _instalados.delete(imei);
-    const reinstalado = await ensureInstalado(pat, imei);
+    console.warn(`[position] Móvil no registrado, reintentando InstalarMovil...`);
+    const key = `${imei}:${cfg.net}:${cfg.site}`;
+    _instalados.delete(key);
+    const reinstalado = await ensureInstalado(pat, imei, cfg);
     if (reinstalado) {
       const retry = await soapCall('PublicarMovil', xml);
       return { ...retry, status: retry.ok ? 'ok' : 'failed' };
