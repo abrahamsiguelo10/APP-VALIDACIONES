@@ -153,9 +153,12 @@ async function ensureInstalado(pat, imei, cfg) {
   const key = `${imei}:${cfg.net}:${cfg.site}`;
   if (_instalados.has(key)) return true;
 
-  console.log(`[position] InstalarMovil pat=${pat} imei=${imei} net=${cfg.net} site=${cfg.site}`);
+  console.log(`[position] InstalarMovil pat=${pat} imei=${imei} net=${cfg.net} site=${cfg.site} user=${cfg.user}`);
   const xml    = buildInstalarMovil(pat, imei, cfg);
   const result = await soapCall('InstalarMovil', xml);
+  // Log respuesta completa del InstalarMovil
+  const instMsg = result.response_http.match(/<return[^>]*>([^<]{0,300})<\/return>/i);
+  console.log(`[position] InstalarMovil resp http=${result.http_status} ok=${result.ok} msg="${instMsg?.[1] || result.response_http.slice(0,200)}"`);
 
   if (result.ok || /ya existe/i.test(result.response_http)) {
     _instalados.add(key);
