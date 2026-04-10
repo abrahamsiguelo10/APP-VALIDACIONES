@@ -4,7 +4,7 @@
  * Método: Post_XML con XML como CDATA
  *
  * Variables de entorno Railway:
- *   dduarte_URL      — URL WebService (default: http://wspos.samtech.cl/WSP.asmx)
+ *   dduarte_URL      — URL WebService (default: https://wspos.samtech.cl/WSP.asmx)
  *   dduarte_USER     — Login WS
  *   dduarte_PASS     — Clave WS
  *   dduarte_PGPS     — Nombre proveedor GPS (default: SigueloGPS)
@@ -13,8 +13,8 @@
 
 'use strict';
 
-const DEFAULT_URL    = 'http://wspos.samtech.cl/WSP.asmx';
-const SOAP_ACTION    = 'samtechGPS/Post_XML';
+const DEFAULT_URL    = 'https://wspos.samtech.cl/WSP.asmx';
+const SOAP_ACTION    = 'samtechpos/Post_XML';
 
 function xmlEscape(s) {
   return String(s ?? '')
@@ -82,7 +82,7 @@ function buildSoapEnvelope(innerXml) {
       'xmlns:xsd="http://www.w3.org/2001/XMLSchema" ' +
       'xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">' +
       '<soap12:Body>' +
-        '<Post_XML xmlns="samtechGPS">' +
+        '<Post_XML xmlns="samtechpos">' +
           '<xmldoc><![CDATA[' + innerXml + ']]></xmldoc>' +
         '</Post_XML>' +
       '</soap12:Body>' +
@@ -163,7 +163,7 @@ async function send({ event, unit, route } = {}) {
   const innerXml = buildInnerXml(fields);
   const envelope = buildSoapEnvelope(innerXml);
 
-  console.log(`[dduarte] enviando imei=${imei} plate=${plate} fn=${fields.fn}`);
+  console.log(`[dduarte] enviando imei=${imei} plate=${plate} empresa=${empresa} fn=${fields.fn}`);
 
   const t0 = Date.now();
   let res, body;
@@ -171,8 +171,7 @@ async function send({ event, unit, route } = {}) {
     res  = await fetch(url, {
       method:  'POST',
       headers: {
-        'Content-Type': 'application/soap+xml; charset=utf-8',
-        'SOAPAction':   SOAP_ACTION,
+        'Content-Type': `application/soap+xml; charset=utf-8; action="${SOAP_ACTION}"`,
       },
       body:   envelope,
       signal: AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined,
@@ -188,9 +187,9 @@ async function send({ event, unit, route } = {}) {
   const ok = res.ok && /\bOK\b/i.test(body) && !/error/i.test(body);
 
   if (ok) {
-    console.log(`[dduarte] ✓ (${res.status})`);
+    console.log(`[dduarte] ✓ ${plate} empresa=${empresa} (${res.status}) ${latency_ms}ms`);
   } else {
-    console.warn(`[dduarte] ✗ (${res.status}) ${body.slice(0,200)}`);
+    console.warn(`[dduarte] ✗ ${plate} empresa=${empresa} (${res.status}) ${body.slice(0,200)}`);
   }
 
   return {
