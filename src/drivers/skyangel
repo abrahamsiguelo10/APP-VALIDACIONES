@@ -22,11 +22,12 @@ const DEFAULT_USER = process.env.SKYANGEL_USER || '';
 const DEFAULT_PASS = process.env.SKYANGEL_PASS || '';
 
 // ── Formatear fecha en formato SkyAngel UTC ───────────────────────
-// Formato esperado: "YYYY-MM-DD HH:MM:SS +00:00"
+// Formato exacto documentado: "YYYY-MM-DD HH:MM:SS +00:00"
 function formatFechahora(wialon_ts) {
   const d = wialon_ts ? new Date(wialon_ts) : new Date();
   if (isNaN(d.getTime())) return '';
   const p = n => String(n).padStart(2, '0');
+  // UTC+0 explícito con offset "+00:00" como pide SkyAngel
   return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ` +
          `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} +00:00`;
 }
@@ -62,8 +63,17 @@ async function send({ event, unit, route }) {
     } catch (_) {}
   }
 
+  // Fallback: leer del auth del destino si no vienen del field_schema ni env vars
+  if ((!usuario || !password) && route?.auth) {
+    try {
+      const auth = typeof route.auth === 'string' ? JSON.parse(route.auth) : route.auth;
+      if (!usuario && auth?.username) usuario  = auth.username;
+      if (!password && auth?.password) password = auth.password;
+    } catch (_) {}
+  }
+
   if (!usuario || !password) {
-    console.error('[skyangel] ❌ SKYANGEL_USER/PASS no configurados');
+    console.error('[skyangel] ❌ Credenciales no encontradas (env vars, field_schema ni auth del destino)');
     return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing SKYANGEL credentials' };
   }
 
