@@ -96,6 +96,8 @@ function buildPublicarMovil(pat, imei, event, cfg) {
 
 // ── Llamada SOAP ──────────────────────────────────────────────────
 async function soapCall(action, xmlBody) {
+  // Log del XML enviado para diagnóstico (solo las primeras 500 chars)
+  console.log(`[position] soapCall action=${action} xml=${xmlBody.replace(/\s+/g,' ').slice(0,500)}`);
   const t0 = Date.now();
   const res = await fetch(WSDL_URL, {
     method:  'POST',
