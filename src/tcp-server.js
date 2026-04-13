@@ -67,7 +67,21 @@ function parseWialonIPS(raw) {
 
     if (type === 'D' || type === 'SD') {
       const body = (parts[1] || '').split(';');
-      const [date, time, latRaw, latHem, lonRaw, lonHem, speed, course, alt, sats,, inputs] = body;
+      const [date, time, latRaw, latHem, lonRaw, lonHem, speed, course, alt, sats,, inputs, outputs, adc, ibutton, params] = body;
+  
+      const parsedParams = {};
+      if (params && params !== 'NA' && params !== '') {
+        for (const p of params.split(',')) {
+          const [name, type, value] = p.split(':');
+          if (name && value !== undefined) {
+            parsedParams[name.toLowerCase()] = type === '2' ? parseInt(value, 10)
+              : type === '1' ? parseFloat(value)
+              : value;
+          }
+        }
+      }
+      const odometro = parsedParams['odometer'] ?? parsedParams['odo'] ?? parsedParams['mileage'] ?? null;
+      const hdopVal = parsedParams['hdop'] ?? null;
 
       function nmea2dec(raw, hem) {
         const v = parseFloat(raw);
@@ -98,7 +112,7 @@ function parseWialonIPS(raw) {
         }
       } catch (_) {}
 
-      return {
+     return {
         type:      'data',
         lat:       parseFloat(lat.toFixed(6)),
         lon:       parseFloat(lon.toFixed(6)),
@@ -107,6 +121,8 @@ function parseWialonIPS(raw) {
         alt:       parseFloat(alt    || '0'),
         sats:      parseInt(sats     || '0', 10),
         ignition,
+        odometro,        // ← NUEVO
+        hdop: hdopVal,   // ← NUEVO
         wialon_ts,
         raw:       str,
       };
@@ -637,6 +653,9 @@ async function forwardToDestinations(unit, parsed) {
           alt:        parsed.alt   || 0,
           ignition:   parsed.ignition,
           engineOn:   parsed.ignition,
+          odometro:   parsed.odometro ?? 0,   // ← NUEVO
+          hdop:       parsed.hdop     ?? 0,   // ← NUEVO
+          sats:       parsed.sats     ?? 0,   // ← NUEVO
           wialon_ts:  parsed.wialon_ts,
           time_epoch: parsed.wialon_ts
             ? Math.floor(new Date(parsed.wialon_ts).getTime() / 1000)
