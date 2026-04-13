@@ -73,10 +73,7 @@ async function send({ event, unit }) {
   };
 
   const bodyStr = JSON.stringify(payload);
-  console.log(`[drivetech] ENDPOINT=${ENDPOINT}`);
-  console.log(`[drivetech] TOKEN_LEN=${token.length} TOKEN_END=${token.slice(-10)}`);
-  console.log(`[drivetech] BODY=${bodyStr.slice(0, 500)}`);
-
+  
   const t0 = Date.now();
 
   try {
