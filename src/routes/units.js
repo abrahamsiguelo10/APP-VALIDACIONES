@@ -358,22 +358,30 @@ router.patch('/:imei/change-imei', requireRole('admin'), async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // 1. Actualizar unit_destinations (FK por imei)
+    // 1. Crear la nueva unidad como copia de la vieja
+    await client.query(
+      `INSERT INTO public.units (imei, plate, name, rut, enabled, cliente_id, created_at, updated_at)
+       SELECT $1, plate, name, rut, enabled, cliente_id, created_at, now()
+       FROM public.units WHERE imei = $2`,
+      [newImei, oldImei]
+    );
+
+    // 2. Mover unit_destinations al nuevo IMEI
     await client.query(
       'UPDATE public.unit_destinations SET imei = $1 WHERE imei = $2',
       [newImei, oldImei]
     );
 
-    // 2. Actualizar gps_events (histórico)
+    // 3. Actualizar gps_events
     await client.query(
       'UPDATE public.gps_events SET imei = $1 WHERE imei = $2',
       [newImei, oldImei]
     );
 
-    // 3. Actualizar la unidad en sí
+    // 4. Eliminar la unidad vieja (ya no tiene referencias)
     await client.query(
-      'UPDATE public.units SET imei = $1, updated_at = now() WHERE imei = $2',
-      [newImei, oldImei]
+      'DELETE FROM public.units WHERE imei = $1',
+      [oldImei]
     );
 
     await client.query('COMMIT');
