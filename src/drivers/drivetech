@@ -71,6 +71,7 @@ async function send({ event, unit }) {
     gps_status: true,
     odometer:  safeNum(event.odometro ?? event.odometer, 0),
   };
+  console.log(`[drivetech] payload=${JSON.stringify(payload)}`);
 
   const t0 = Date.now();
 
