@@ -1,1 +1,135 @@
 
+'use strict';
+
+/**
+ * src/drivers/cala.js
+ * ─────────────────────────────────────────────────────────────────
+ * Driver REST/JSON para CALA — WebService GPS
+ *
+ * Endpoint: POST {CALA_URL}
+ * Auth:     Basic Auth (header Authorization)
+ * Payload:  Array con un objeto por evento
+ *
+ * Variables de entorno Railway:
+ *   CALA_URL   — URL del WebService (requerido)
+ *   CALA_USER  — Usuario Basic Auth (default: Cala)
+ *   CALA_PASS  — Contraseña Basic Auth (default: Gps)
+ *
+ * Para múltiples clientes CALA, configurar en field_schema del destino:
+ *   apiKey: cala_url   → URL si difiere de la global
+ *   apiKey: cala_user  → usuario si difiere
+ *   apiKey: cala_pass  → contraseña si difiere
+ */
+
+const DEFAULT_URL  = process.env.CALA_URL  || '';
+const DEFAULT_USER = process.env.CALA_USER || 'Cala';
+const DEFAULT_PASS = process.env.CALA_PASS || 'Gps';
+
+// ── Helpers ───────────────────────────────────────────────────────
+
+function pad2(n) { return String(n).padStart(2, '0'); }
+
+/**
+ * Formato CALA: "DD/MM/YYYY HH:mm:ss" (UTC)
+ */
+function formatFecha(wialon_ts) {
+  const d = wialon_ts ? new Date(wialon_ts) : new Date();
+  if (isNaN(d)) return new Date().toISOString();
+  return `${pad2(d.getUTCDate())}/${pad2(d.getUTCMonth() + 1)}/${d.getUTCFullYear()} ` +
+         `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`;
+}
+
+function basicAuthHeader(user, pass) {
+  return 'Basic ' + Buffer.from(`${user}:${pass}`, 'utf8').toString('base64');
+}
+
+// ── Función principal del driver ──────────────────────────────────
+async function send({ event, unit, route }) {
+  let url  = DEFAULT_URL;
+  let user = DEFAULT_USER;
+  let pass = DEFAULT_PASS;
+
+  // Leer overrides desde field_schema
+  try {
+    let schema = route?.field_schema || [];
+    if (typeof schema === 'string') {
+      try { schema = JSON.parse(schema); } catch (_) { schema = []; }
+    }
+    for (const f of schema) {
+      if (f.source === 'fixed' && f.fixedValue) {
+        if (f.apiKey === 'cala_url')  url  = f.fixedValue;
+        if (f.apiKey === 'cala_user') user = f.fixedValue;
+        if (f.apiKey === 'cala_pass') pass = f.fixedValue;
+      }
+    }
+  } catch (_) {}
+
+  if (!url) {
+    console.warn('[cala] CALA_URL no configurado');
+    return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_url' };
+  }
+
+  const plate = (unit.plate || '').toUpperCase().trim();
+  if (!plate) {
+    console.warn('[cala] patente faltante — skip');
+    return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_plate' };
+  }
+
+  const lat = event.lat ?? null;
+  const lon = event.lon ?? null;
+  if (lat === null || lon === null) {
+    console.warn(`[cala] coordenadas faltantes — skip`);
+    return { ok: true, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'no_coords' };
+  }
+
+  const payload = [{
+    Patente:   plate,
+    Latitud:   lat,
+    Longitud:  lon,
+    Fecha:     formatFecha(event.wialon_ts),
+    Calle:     '',
+    Velocidad: Number.isFinite(Number(event.speed)) ? Math.round(Number(event.speed)) : 0,
+  }];
+
+  console.log(`[cala] enviando plate=${plate} fecha=${payload[0].Fecha}`);
+
+  const t0 = Date.now();
+  let res, body;
+
+  try {
+    res = await fetch(url, {
+      method:  'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'Accept':        'application/json',
+        'Authorization': basicAuthHeader(user, pass),
+      },
+      body:   JSON.stringify(payload),
+      signal: AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined,
+    });
+    body = await res.text().catch(() => '');
+  } catch (err) {
+    console.error(`[cala] error de red:`, err.message);
+    return { ok: false, status: 'failed', http_status: 0, latency_ms: Date.now() - t0, response_http: err.message };
+  }
+
+  const latency_ms = Date.now() - t0;
+  const ok = res.ok && /recibido/i.test(body) && !/error/i.test(body);
+
+  if (ok) {
+    console.log(`[cala] ✓ ${plate} (${res.status}) ${latency_ms}ms`);
+  } else {
+    console.warn(`[cala] ✗ ${plate} (${res.status}) ${body.slice(0, 200)}`);
+  }
+
+  return {
+    ok,
+    status:        ok ? 'sent' : 'failed',
+    http_status:   res.status,
+    latency_ms,
+    response_http: body.slice(0, 2000),
+    error:         ok ? null : `http_${res.status}`,
+  };
+}
+
+module.exports = { send, name: 'cala' };
