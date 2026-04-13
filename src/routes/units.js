@@ -319,4 +319,83 @@ router.delete('/:imei/destinations/:did', requireRole('admin'), async (req, res)
   res.json({ ok: true });
 });
 
+/* ── PATCH /units/:imei/change-imei ────────────────────────────
+   Cambia el IMEI de una unidad y actualiza TODAS las tablas relacionadas.
+   Body: { new_imei: "nuevo_imei" }
+   ────────────────────────────────────────────────────────────── */
+router.patch('/:imei/change-imei', requireRole('admin'), async (req, res) => {
+  const oldImei = req.params.imei;
+  const { new_imei } = req.body;
+
+  if (!new_imei || !new_imei.trim()) {
+    return res.status(400).json({ error: 'new_imei es requerido.' });
+  }
+
+  const newImei = new_imei.trim();
+
+  if (oldImei === newImei) {
+    return res.status(400).json({ error: 'El IMEI nuevo es igual al actual.' });
+  }
+
+  // Verificar que la unidad original existe
+  const { rows: original } = await query(
+    'SELECT * FROM public.units WHERE imei = $1', [oldImei]
+  );
+  if (!original.length) {
+    return res.status(404).json({ error: 'Unidad no encontrada.' });
+  }
+
+  // Verificar que el nuevo IMEI no esté en uso
+  const { rows: existing } = await query(
+    'SELECT imei FROM public.units WHERE imei = $1', [newImei]
+  );
+  if (existing.length) {
+    return res.status(409).json({ error: `El IMEI "${newImei}" ya está en uso por otra unidad.` });
+  }
+
+  // Ejecutar el cambio en una transacción
+  const client = await require('../db/pool').pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Actualizar unit_destinations (FK por imei)
+    await client.query(
+      'UPDATE public.unit_destinations SET imei = $1 WHERE imei = $2',
+      [newImei, oldImei]
+    );
+
+    // 2. Actualizar gps_events (histórico)
+    await client.query(
+      'UPDATE public.gps_events SET imei = $1 WHERE imei = $2',
+      [newImei, oldImei]
+    );
+
+    // 3. Actualizar la unidad en sí
+    await client.query(
+      'UPDATE public.units SET imei = $1, updated_at = now() WHERE imei = $2',
+      [newImei, oldImei]
+    );
+
+    await client.query('COMMIT');
+
+    // Audit log
+    await audit.log({
+      req,
+      action: 'UNIT_CHANGE_IMEI',
+      target: `${oldImei} → ${newImei}`,
+      before: { imei: oldImei },
+      after:  { imei: newImei },
+    });
+
+    res.json({ ok: true, old_imei: oldImei, new_imei: newImei });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[units] change-imei error:', err.message);
+    res.status(500).json({ error: 'Error al cambiar IMEI: ' + err.message });
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;
