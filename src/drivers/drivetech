@@ -57,28 +57,28 @@ async function send({ event, unit }) {
 
   const payload = {
     plate,
-    buff:      false,
-    datetime:  toDatetime(event.wialon_ts),
-    latitude:  safeNum(event.lat, 0),
-    longitude: safeNum(event.lon ?? event.lng, 0),
+    buff:       false,
+    datetime:   toDatetime(event.wialon_ts),
+    latitude:   safeNum(event.lat, 0),
+    longitude:  safeNum(event.lon ?? event.lng, 0),
     speed,
-    azimuth:   safeNum(event.heading, 0),
-    altitude:  safeNum(event.alt, 0),
+    azimuth:    safeNum(event.heading, 0),
+    altitude:   safeNum(event.alt, 0),
     state,
-    event:     { type: 'GPS' },
-    ign_input: ignition,
-    doors:     false,
+    event:      { type: 'GPS' },
+    ign_input:  ignition,
+    doors:      false,
     gps_status: true,
-    odometer:  safeNum(event.odometro ?? event.odometer, 1),
+    odometer:   safeNum(event.odometro ?? event.odometer, 0) || 1,
   };
-  console.log(`[drivetech] payload=${JSON.stringify(payload)}`);
 
   const bodyStr = JSON.stringify(payload);
   console.log(`[drivetech] ENDPOINT=${ENDPOINT}`);
   console.log(`[drivetech] TOKEN_LEN=${token.length} TOKEN_END=${token.slice(-10)}`);
   console.log(`[drivetech] BODY=${bodyStr.slice(0, 500)}`);
-  
+
   const t0 = Date.now();
+
   try {
     const res = await fetch(ENDPOINT, {
       method:  'POST',
@@ -87,9 +87,10 @@ async function send({ event, unit }) {
         'Authorization': `Bearer ${token}`,
       },
       body: bodyStr,
+    });
 
-    const latency  = Date.now() - t0;
-    const resText  = await res.text().catch(() => '');
+    const latency = Date.now() - t0;
+    const resText = await res.text().catch(() => '');
 
     let ok = res.ok;
     try {
@@ -98,7 +99,7 @@ async function send({ event, unit }) {
     } catch (_) {}
 
     if (ok) {
-      console.log(`[drivetech] ✓ plate=${plate} state=${state} (${latency}ms)`);
+      console.log(`[drivetech] ✓ plate=${plate} state=${state} odo=${payload.odometer} (${latency}ms)`);
     } else {
       console.error(`[drivetech] ✗ plate=${plate} http=${res.status} resp=${resText.slice(0, 200)}`);
     }
