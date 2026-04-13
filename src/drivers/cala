@@ -1,4 +1,3 @@
-
 'use strict';
 
 /**
@@ -69,7 +68,11 @@ async function send({ event, unit, route }) {
     return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_url' };
   }
 
-  const plate = (unit.plate || '').toUpperCase().trim();
+  // CALA requiere formato XXXX-XX (ej: FJTS-40)
+  const rawPlate = (unit.plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const plate = rawPlate.length === 6
+    ? `${rawPlate.slice(0, 4)}-${rawPlate.slice(4)}`
+    : rawPlate;
   if (!plate) {
     console.warn('[cala] patente faltante — skip');
     return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_plate' };
