@@ -6,19 +6,18 @@
  * Driver REST/JSON para ARM-Siga — RegistrarPaqueteGps
  *
  * Flujo:
- *   1. POST /FPLogin con {NOMBRE, CLAVE} → TOKEN (120s)
- *   2. POST /RegistrarPaqueteGps con header TOKEN
+ *   1. POST {url}/FPLogin con {NOMBRE, CLAVE} → TOKEN (120s)
+ *   2. POST {url}/RegistrarPaqueteGps con header TOKEN
  *
- * Variables de entorno Railway:
+ * Prioridad de configuración:
+ *   1. Identidad del destino (URL + Auth de la app)
+ *   2. Variables de entorno Railway (ARM_URL, ARM_USER, ARM_PASS)
+ *   3. field_schema fijos como último override (arm_evento)
+ *
+ * Variables de entorno Railway (fallback):
  *   ARM_URL   — URL base con puerto (ej: http://integraciones.arm-services.com:12345)
  *   ARM_USER  — usuario login
  *   ARM_PASS  — contraseña login
- *
- * Para múltiples clientes ARM, configurar en field_schema del destino:
- *   apiKey: arm_url   → URL base si difiere
- *   apiKey: arm_user  → usuario si difiere
- *   apiKey: arm_pass  → contraseña si difiere
- *   apiKey: arm_evento → código evento fijo (default: 1)
  */
 
 const DEFAULT_URL  = (process.env.ARM_URL  || '').replace(/\/+$/, '');
@@ -28,21 +27,18 @@ const DEFAULT_PASS = process.env.ARM_PASS || '';
 // ── Cache de token por URL ──────────────────────────────────────
 const _tokenCache = {};
 
-function _cacheKey(url) { return url; }
-
-function _getCachedToken(key) {
-  const e = _tokenCache[key];
+function _getCachedToken(url) {
+  const e = _tokenCache[url];
   if (!e) return null;
-  // Margen de 10s antes del vencimiento
   if (Date.now() > e.expiresAt - 10000) {
-    delete _tokenCache[key];
+    delete _tokenCache[url];
     return null;
   }
   return e.token;
 }
 
-function _setCachedToken(key, token, expiresSec) {
-  _tokenCache[key] = {
+function _setCachedToken(url, token, expiresSec) {
+  _tokenCache[url] = {
     token,
     expiresAt: Date.now() + (expiresSec || 120) * 1000,
   };
@@ -73,7 +69,7 @@ async function _login(baseUrl, user, pass) {
   const json = await res.json().catch(() => null);
   const data = json?.FPLoginResult?.Data;
   if (!data?.TOKEN) {
-    console.error('[arm] login sin TOKEN en respuesta:', JSON.stringify(json).slice(0, 300));
+    console.error('[arm] login sin TOKEN:', JSON.stringify(json).slice(0, 300));
     return null;
   }
 
@@ -83,14 +79,10 @@ async function _login(baseUrl, user, pass) {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
-
 function stripPlate(plate) {
   return String(plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 }
 
-/**
- * Fecha UTC → "YYYYMMDD"
- */
 function formatFecha(wialon_ts) {
   const d = wialon_ts ? new Date(wialon_ts) : new Date();
   if (isNaN(d)) return '';
@@ -98,9 +90,6 @@ function formatFecha(wialon_ts) {
   return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}`;
 }
 
-/**
- * Hora UTC → "HHMMSS"
- */
 function formatHora(wialon_ts) {
   const d = wialon_ts ? new Date(wialon_ts) : new Date();
   if (isNaN(d)) return '';
@@ -113,14 +102,31 @@ function safeInt(v, fb) {
   return Number.isFinite(n) ? n : (fb ?? 0);
 }
 
-// ── Función principal del driver ─────────────────────────────────
-async function send({ event, unit, route } = {}) {
+/**
+ * Lee configuración con prioridad:
+ *   1. Identidad del destino (route.url + route.auth)
+ *   2. Env vars Railway (ARM_*)
+ *   3. field_schema fijos (arm_evento, overrides)
+ */
+function readConfig(route) {
   let baseUrl = DEFAULT_URL;
   let user    = DEFAULT_USER;
   let pass    = DEFAULT_PASS;
   let evento  = 1;
 
-  // Leer overrides desde field_schema
+  // 1. URL del destino (identidad de la organización)
+  if (route?.url) {
+    baseUrl = String(route.url).replace(/\/+$/, '');
+  }
+
+  // 2. Auth del destino (username/password de la app)
+  try {
+    const auth = typeof route?.auth === 'string' ? JSON.parse(route.auth) : route?.auth;
+    if (auth?.username) user = auth.username;
+    if (auth?.password) pass = auth.password;
+  } catch (_) {}
+
+  // 3. field_schema overrides (para evento u otros campos extra)
   try {
     let schema = route?.field_schema || [];
     if (typeof schema === 'string') {
@@ -136,12 +142,19 @@ async function send({ event, unit, route } = {}) {
     }
   } catch (_) {}
 
-  if (!baseUrl) {
-    console.warn('[arm] ARM_URL no configurado');
+  return { baseUrl, user, pass, evento };
+}
+
+// ── Función principal del driver ─────────────────────────────────
+async function send({ event, unit, route } = {}) {
+  const cfg = readConfig(route);
+
+  if (!cfg.baseUrl) {
+    console.warn('[arm] URL no configurada (ni en destino, ni en ARM_URL)');
     return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_url' };
   }
-  if (!user || !pass) {
-    console.warn('[arm] credenciales ARM faltantes');
+  if (!cfg.user || !cfg.pass) {
+    console.warn('[arm] credenciales faltantes (ni en auth destino, ni en ARM_USER/ARM_PASS)');
     return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_credentials' };
   }
 
@@ -154,26 +167,25 @@ async function send({ event, unit, route } = {}) {
   const lat = event?.lat ?? null;
   const lon = event?.lon ?? null;
   if (lat === null || lon === null) {
-    console.warn(`[arm] coordenadas faltantes — skip`);
+    console.warn('[arm] coordenadas faltantes — skip');
     return { ok: true, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'no_coords' };
   }
 
   // ── Obtener token (cache o login) ──
-  const ck = _cacheKey(baseUrl);
-  let token = _getCachedToken(ck);
+  let token = _getCachedToken(cfg.baseUrl);
   if (!token) {
-    const loginResult = await _login(baseUrl, user, pass);
+    const loginResult = await _login(cfg.baseUrl, cfg.user, cfg.pass);
     if (!loginResult) {
       return { ok: false, status: 'failed', http_status: 401, latency_ms: 0, response_http: 'login_failed' };
     }
     token = loginResult.token;
-    _setCachedToken(ck, token, loginResult.expiresSec);
+    _setCachedToken(cfg.baseUrl, token, loginResult.expiresSec);
   }
 
   // ── Construir paquete ──
   const paquete = {
     Dominio:   plate,
-    Evento:    evento,
+    Evento:    cfg.evento,
     Fecha:     formatFecha(event?.wialon_ts),
     Hora:      formatHora(event?.wialon_ts),
     Latitud:   Number(lat),
@@ -190,14 +202,11 @@ async function send({ event, unit, route } = {}) {
   let res, resText;
 
   try {
-    res = await fetch(`${baseUrl}/RegistrarPaqueteGps`, {
+    res = await fetch(`${cfg.baseUrl}/RegistrarPaqueteGps`, {
       method:  'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'TOKEN':        token,
-      },
-      body:   JSON.stringify(body),
-      signal: AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined,
+      headers: { 'Content-Type': 'application/json', 'TOKEN': token },
+      body:    JSON.stringify(body),
+      signal:  AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined,
     });
     resText = await res.text().catch(() => '');
   } catch (err) {
@@ -207,27 +216,23 @@ async function send({ event, unit, route } = {}) {
 
   const latency_ms = Date.now() - t0;
 
-  // Si token expiró (401), reintentar con login fresco
+  // Si token expiró (401), relogin + reintento
   if (res.status === 401) {
     console.warn('[arm] token expirado — reintentando login');
-    delete _tokenCache[ck];
-    const loginResult = await _login(baseUrl, user, pass);
+    delete _tokenCache[cfg.baseUrl];
+    const loginResult = await _login(cfg.baseUrl, cfg.user, cfg.pass);
     if (!loginResult) {
       return { ok: false, status: 'failed', http_status: 401, latency_ms, response_http: 'relogin_failed' };
     }
     token = loginResult.token;
-    _setCachedToken(ck, token, loginResult.expiresSec);
+    _setCachedToken(cfg.baseUrl, token, loginResult.expiresSec);
 
-    // Reintentar envío
     try {
-      res = await fetch(`${baseUrl}/RegistrarPaqueteGps`, {
+      res = await fetch(`${cfg.baseUrl}/RegistrarPaqueteGps`, {
         method:  'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'TOKEN':        token,
-        },
-        body:   JSON.stringify(body),
-        signal: AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined,
+        headers: { 'Content-Type': 'application/json', 'TOKEN': token },
+        body:    JSON.stringify(body),
+        signal:  AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined,
       });
       resText = await res.text().catch(() => '');
     } catch (err) {
