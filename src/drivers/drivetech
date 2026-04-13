@@ -18,38 +18,27 @@ const TOKEN    = process.env.DRIVETECH_TOKEN || '';
 
 // ── Helpers ───────────────────────────────────────────────────────
 
-/**
- * Formatea fecha en ISO 8601 UTC compatible con Drivetech:
- * "YYYY-MM-DDTHH:MM:SS.000Z"
- */
 function toDatetime(wialon_ts) {
   const d = wialon_ts ? new Date(wialon_ts) : new Date();
   if (isNaN(d)) return new Date().toISOString();
-  return d.toISOString(); // "2024-02-14T11:58:44.063Z"
+  return d.toISOString();
 }
 
-/**
- * Determina el estado del vehículo según ignición y velocidad.
- * Opciones: IgnitionOnMoving | IgnitionOnRest | IgnitionOffRest | Idling
- */
 function resolveState(ignition, speed) {
   const ign    = ignition === true || ignition === 1;
   const moving = Number(speed || 0) > 0;
 
   if (!ign)   return 'IgnitionOffRest';
   if (moving) return 'IgnitionOnMoving';
-  return 'IgnitionOnRest'; // encendido pero detenido → puede ser Idling
-  // Nota: Idling requiere 2+ min detenido con motor encendido.
-  // Sin estado previo no podemos determinarlo, usamos IgnitionOnRest como fallback.
+  return 'IgnitionOnRest';
+}
+
+function safeNum(v, fallback) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 // ── Función principal del driver ──────────────────────────────────
-/**
- * @param {object} options
- * @param {object} options.event  — datos GPS del evento
- * @param {object} options.unit   — datos de la unidad (imei, plate, ...)
- * @param {object} options.route  — datos del destino
- */
 async function send({ event, unit }) {
   const token = TOKEN;
   if (!token) {
@@ -63,24 +52,24 @@ async function send({ event, unit }) {
   }
 
   const ignition = event.ignition === true || event.ignition === 1;
-  const speed    = Number(event.speed ?? 0);
+  const speed    = safeNum(event.speed, 0);
   const state    = resolveState(event.ignition, speed);
 
   const payload = {
     plate,
     buff:      false,
     datetime:  toDatetime(event.wialon_ts),
-    latitude:  event.lat       ?? 0,
-    longitude: event.lon       ?? event.lng ?? 0,
+    latitude:  safeNum(event.lat, 0),
+    longitude: safeNum(event.lon ?? event.lng, 0),
     speed,
-    azimuth:   event.heading   ?? 0,
-    altitude:  event.alt       ?? 0,
+    azimuth:   safeNum(event.heading, 0),
+    altitude:  safeNum(event.alt, 0),
     state,
     event:     { type: 'GPS' },
     ign_input: ignition,
     doors:     false,
     gps_status: true,
-    odometer:  event.odometro  ?? 0,
+    odometer:  safeNum(event.odometro ?? event.odometer, 0),
   };
 
   const t0 = Date.now();
@@ -99,7 +88,6 @@ async function send({ event, unit }) {
     const latency  = Date.now() - t0;
     const resText  = await res.text().catch(() => '');
 
-    // Drivetech retorna {"status": true, "description": "..."} en éxito
     let ok = res.ok;
     try {
       const json = JSON.parse(resText);
