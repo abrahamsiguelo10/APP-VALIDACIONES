@@ -73,8 +73,12 @@ async function send({ event, unit }) {
   };
   console.log(`[drivetech] payload=${JSON.stringify(payload)}`);
 
+  const bodyStr = JSON.stringify(payload);
+  console.log(`[drivetech] ENDPOINT=${ENDPOINT}`);
+  console.log(`[drivetech] TOKEN_LEN=${token.length} TOKEN_END=${token.slice(-10)}`);
+  console.log(`[drivetech] BODY=${bodyStr.slice(0, 500)}`);
+  
   const t0 = Date.now();
-
   try {
     const res = await fetch(ENDPOINT, {
       method:  'POST',
@@ -82,9 +86,7 @@ async function send({ event, unit }) {
         'Content-Type':  'application/json',
         'Authorization': `Bearer ${token}`,
       },
-      body:   JSON.stringify(payload),
-      signal: AbortSignal.timeout(10000),
-    });
+      body: bodyStr,
 
     const latency  = Date.now() - t0;
     const resText  = await res.text().catch(() => '');
