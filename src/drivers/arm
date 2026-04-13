@@ -1,0 +1,264 @@
+'use strict';
+
+/**
+ * src/drivers/arm.js
+ * ─────────────────────────────────────────────────────────────────
+ * Driver REST/JSON para ARM-Siga — RegistrarPaqueteGps
+ *
+ * Flujo:
+ *   1. POST /FPLogin con {NOMBRE, CLAVE} → TOKEN (120s)
+ *   2. POST /RegistrarPaqueteGps con header TOKEN
+ *
+ * Variables de entorno Railway:
+ *   ARM_URL   — URL base con puerto (ej: http://integraciones.arm-services.com:12345)
+ *   ARM_USER  — usuario login
+ *   ARM_PASS  — contraseña login
+ *
+ * Para múltiples clientes ARM, configurar en field_schema del destino:
+ *   apiKey: arm_url   → URL base si difiere
+ *   apiKey: arm_user  → usuario si difiere
+ *   apiKey: arm_pass  → contraseña si difiere
+ *   apiKey: arm_evento → código evento fijo (default: 1)
+ */
+
+const DEFAULT_URL  = (process.env.ARM_URL  || '').replace(/\/+$/, '');
+const DEFAULT_USER = process.env.ARM_USER || '';
+const DEFAULT_PASS = process.env.ARM_PASS || '';
+
+// ── Cache de token por URL ──────────────────────────────────────
+const _tokenCache = {};
+
+function _cacheKey(url) { return url; }
+
+function _getCachedToken(key) {
+  const e = _tokenCache[key];
+  if (!e) return null;
+  // Margen de 10s antes del vencimiento
+  if (Date.now() > e.expiresAt - 10000) {
+    delete _tokenCache[key];
+    return null;
+  }
+  return e.token;
+}
+
+function _setCachedToken(key, token, expiresSec) {
+  _tokenCache[key] = {
+    token,
+    expiresAt: Date.now() + (expiresSec || 120) * 1000,
+  };
+}
+
+// ── Login ────────────────────────────────────────────────────────
+async function _login(baseUrl, user, pass) {
+  const url = `${baseUrl}/FPLogin`;
+  const body = { oSession: { NOMBRE: user, CLAVE: pass } };
+
+  const res = await fetch(url, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify(body),
+    signal:  AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined,
+  });
+
+  if (res.status === 401) {
+    console.error('[arm] login 401 — credenciales inválidas');
+    return null;
+  }
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    console.error(`[arm] login HTTP ${res.status}: ${txt.slice(0, 200)}`);
+    return null;
+  }
+
+  const json = await res.json().catch(() => null);
+  const data = json?.FPLoginResult?.Data;
+  if (!data?.TOKEN) {
+    console.error('[arm] login sin TOKEN en respuesta:', JSON.stringify(json).slice(0, 300));
+    return null;
+  }
+
+  const expSec = parseInt(data.expires_in, 10) || 120;
+  console.log(`[arm] login OK — token válido ${expSec}s`);
+  return { token: data.TOKEN, expiresSec: expSec };
+}
+
+// ── Helpers ──────────────────────────────────────────────────────
+
+function stripPlate(plate) {
+  return String(plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+/**
+ * Fecha UTC → "YYYYMMDD"
+ */
+function formatFecha(wialon_ts) {
+  const d = wialon_ts ? new Date(wialon_ts) : new Date();
+  if (isNaN(d)) return '';
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}`;
+}
+
+/**
+ * Hora UTC → "HHMMSS"
+ */
+function formatHora(wialon_ts) {
+  const d = wialon_ts ? new Date(wialon_ts) : new Date();
+  if (isNaN(d)) return '';
+  const p = n => String(n).padStart(2, '0');
+  return `${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}`;
+}
+
+function safeInt(v, fb) {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : (fb ?? 0);
+}
+
+// ── Función principal del driver ─────────────────────────────────
+async function send({ event, unit, route } = {}) {
+  let baseUrl = DEFAULT_URL;
+  let user    = DEFAULT_USER;
+  let pass    = DEFAULT_PASS;
+  let evento  = 1;
+
+  // Leer overrides desde field_schema
+  try {
+    let schema = route?.field_schema || [];
+    if (typeof schema === 'string') {
+      try { schema = JSON.parse(schema); } catch (_) { schema = []; }
+    }
+    for (const f of schema) {
+      if (f.source === 'fixed' && f.fixedValue) {
+        if (f.apiKey === 'arm_url')    baseUrl = String(f.fixedValue).replace(/\/+$/, '');
+        if (f.apiKey === 'arm_user')   user    = f.fixedValue;
+        if (f.apiKey === 'arm_pass')   pass    = f.fixedValue;
+        if (f.apiKey === 'arm_evento') evento  = parseInt(f.fixedValue, 10) || 1;
+      }
+    }
+  } catch (_) {}
+
+  if (!baseUrl) {
+    console.warn('[arm] ARM_URL no configurado');
+    return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_url' };
+  }
+  if (!user || !pass) {
+    console.warn('[arm] credenciales ARM faltantes');
+    return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_credentials' };
+  }
+
+  const plate = stripPlate(unit?.plate);
+  if (!plate) {
+    console.warn('[arm] patente faltante — skip');
+    return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_plate' };
+  }
+
+  const lat = event?.lat ?? null;
+  const lon = event?.lon ?? null;
+  if (lat === null || lon === null) {
+    console.warn(`[arm] coordenadas faltantes — skip`);
+    return { ok: true, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'no_coords' };
+  }
+
+  // ── Obtener token (cache o login) ──
+  const ck = _cacheKey(baseUrl);
+  let token = _getCachedToken(ck);
+  if (!token) {
+    const loginResult = await _login(baseUrl, user, pass);
+    if (!loginResult) {
+      return { ok: false, status: 'failed', http_status: 401, latency_ms: 0, response_http: 'login_failed' };
+    }
+    token = loginResult.token;
+    _setCachedToken(ck, token, loginResult.expiresSec);
+  }
+
+  // ── Construir paquete ──
+  const paquete = {
+    Dominio:   plate,
+    Evento:    evento,
+    Fecha:     formatFecha(event?.wialon_ts),
+    Hora:      formatHora(event?.wialon_ts),
+    Latitud:   Number(lat),
+    Longitud:  Number(lon),
+    Velocidad: safeInt(event?.speed, 0),
+    Direccion: safeInt(event?.heading, 0),
+  };
+
+  const body = { paquetes: { paquetes: [paquete] } };
+
+  console.log(`[arm] enviando plate=${plate} fecha=${paquete.Fecha} hora=${paquete.Hora}`);
+
+  const t0 = Date.now();
+  let res, resText;
+
+  try {
+    res = await fetch(`${baseUrl}/RegistrarPaqueteGps`, {
+      method:  'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'TOKEN':        token,
+      },
+      body:   JSON.stringify(body),
+      signal: AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined,
+    });
+    resText = await res.text().catch(() => '');
+  } catch (err) {
+    console.error(`[arm] error de red:`, err.message);
+    return { ok: false, status: 'failed', http_status: 0, latency_ms: Date.now() - t0, response_http: err.message };
+  }
+
+  const latency_ms = Date.now() - t0;
+
+  // Si token expiró (401), reintentar con login fresco
+  if (res.status === 401) {
+    console.warn('[arm] token expirado — reintentando login');
+    delete _tokenCache[ck];
+    const loginResult = await _login(baseUrl, user, pass);
+    if (!loginResult) {
+      return { ok: false, status: 'failed', http_status: 401, latency_ms, response_http: 'relogin_failed' };
+    }
+    token = loginResult.token;
+    _setCachedToken(ck, token, loginResult.expiresSec);
+
+    // Reintentar envío
+    try {
+      res = await fetch(`${baseUrl}/RegistrarPaqueteGps`, {
+        method:  'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'TOKEN':        token,
+        },
+        body:   JSON.stringify(body),
+        signal: AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined,
+      });
+      resText = await res.text().catch(() => '');
+    } catch (err) {
+      return { ok: false, status: 'failed', http_status: 0, latency_ms: Date.now() - t0, response_http: err.message };
+    }
+  }
+
+  // Evaluar respuesta
+  let ok = false;
+  try {
+    const json = JSON.parse(resText);
+    const result = json?.RegistrarPaqueteGpsResult;
+    ok = result?.codigo === 0 && (result?.aceptados ?? 0) > 0;
+  } catch (_) {
+    ok = res.ok && !/error/i.test(resText);
+  }
+
+  if (ok) {
+    console.log(`[arm] ✓ ${plate} (${res.status}) ${latency_ms}ms`);
+  } else {
+    console.warn(`[arm] ✗ ${plate} (${res.status}) ${resText.slice(0, 200)}`);
+  }
+
+  return {
+    ok,
+    status:        ok ? 'sent' : 'failed',
+    http_status:   res.status,
+    latency_ms,
+    response_http: resText.slice(0, 2000),
+    error:         ok ? null : `http_${res.status}`,
+  };
+}
+
+module.exports = { send, name: 'arm' };
