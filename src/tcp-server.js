@@ -479,6 +479,12 @@ function resolveSource(source, unit, parsed, clienteData) {
       return ign ? 163 : 164;
     }
 
+      case 'unix_timestamp_ms': {
+      // Epoch milisegundos UTC (para REDD Hub y similares)
+      const iso = parsed.wialon_ts || new Date().toISOString();
+      return new Date(iso).getTime();
+    }
+
     // ── Datos de la unidad (de la DB) ────────────────────────────────────────
     case 'unit_plate':     return unit.plate || '';
     case 'unit_plate_guion': {
