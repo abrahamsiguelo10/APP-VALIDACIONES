@@ -1,0 +1,236 @@
+'use strict';
+
+/**
+ * src/drivers/wisetrack.js
+ * ─────────────────────────────────────────────────────────────────
+ * Driver REST/JSON para Wisetrack — InsertarPosicion
+ *
+ * Endpoint: POST http://ei.wisetrack.cl/API/{empresa}/InsertarPosicion
+ * Auth:     Authorization: Bearer TOKEN
+ *
+ * Particularidades Wisetrack:
+ *   - Todos los campos son STRING
+ *   - Decimales con COMA (no punto): "-33,435654"
+ *   - Odómetro con 2 decimales y coma: "1859,55"
+ *   - Payload: { "posicion": [ {...} ] }
+ *   - Máximo 300 posiciones por llamado
+ *   - Máximo 3 llamados por minuto
+ *
+ * Prioridad de configuración:
+ *   1. Identidad del destino (route.url + route.auth)
+ *   2. Variables de entorno Railway (WISETRACK_URL, WISETRACK_TOKEN)
+ *   3. field_schema fijos (wisetrack_empresa, wisetrack_transportista)
+ *
+ * Variables de entorno Railway (fallback):
+ *   WISETRACK_URL           — URL base (ej: http://ei.wisetrack.cl/API/EMSA/InsertarPosicion)
+ *   WISETRACK_TOKEN         — Bearer token
+ *   WISETRACK_TRANSPORTISTA — nombre transportista (opcional)
+ */
+
+const DEFAULT_URL   = (process.env.WISETRACK_URL   || '').replace(/\/+$/, '');
+const DEFAULT_TOKEN = process.env.WISETRACK_TOKEN || '';
+const DEFAULT_TRANSPORTISTA = process.env.WISETRACK_TRANSPORTISTA || '';
+
+// ── Helpers ──────────────────────────────────────────────────────
+
+function stripPlate(plate) {
+  return String(plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+/**
+ * Número a string con coma decimal (formato Wisetrack)
+ * toComma(33.435654) → "33,435654"
+ * toComma(-70.605527) → "-70,605527"
+ */
+function toComma(v, decimals) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return '0';
+  const s = decimals !== undefined ? n.toFixed(decimals) : String(n);
+  return s.replace('.', ',');
+}
+
+/**
+ * Fecha UTC → "YYYY-MM-DD HH:MM:SS"
+ */
+function formatFechaUTC(wialon_ts) {
+  const d = wialon_ts ? new Date(wialon_ts) : new Date();
+  if (isNaN(d)) return new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ` +
+         `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+
+/**
+ * Determina el numero_evento Wisetrack según estado
+ *   45 = Posición online con ignición
+ *   46 = Posición con motor apagado
+ *   29 = Encendido de motor
+ *   28 = Apagado de motor
+ */
+function resolveEvento(ignition, speed) {
+  const ign = ignition === true || ignition === 1;
+  return ign ? '45' : '46';
+}
+
+function safeStr(v, fb) {
+  if (v === null || v === undefined) return fb ?? '0';
+  return String(v);
+}
+
+/**
+ * Lee configuración con prioridad:
+ *   1. Identidad del destino (route.url + route.auth)
+ *   2. Env vars Railway
+ *   3. field_schema fijos
+ */
+function readConfig(route) {
+  let url           = DEFAULT_URL;
+  let token         = DEFAULT_TOKEN;
+  let transportista = DEFAULT_TRANSPORTISTA;
+
+  // 1. URL del destino
+  if (route?.url) {
+    url = String(route.url).replace(/\/+$/, '');
+  }
+
+  // 2. Auth del destino (Bearer token)
+  try {
+    const auth = typeof route?.auth === 'string' ? JSON.parse(route.auth) : route?.auth;
+    // Soportar auth.token, auth.api_key, o auth.password
+    if (auth?.token)    token = auth.token;
+    if (auth?.api_key)  token = auth.api_key;
+    if (auth?.password) token = auth.password;
+  } catch (_) {}
+
+  // 3. field_schema overrides
+  try {
+    let schema = route?.field_schema || [];
+    if (typeof schema === 'string') {
+      try { schema = JSON.parse(schema); } catch (_) { schema = []; }
+    }
+    for (const f of schema) {
+      if (f.source === 'fixed' && f.fixedValue) {
+        if (f.apiKey === 'wisetrack_url')           url           = String(f.fixedValue).replace(/\/+$/, '');
+        if (f.apiKey === 'wisetrack_token')         token         = f.fixedValue;
+        if (f.apiKey === 'wisetrack_transportista') transportista = f.fixedValue;
+      }
+    }
+  } catch (_) {}
+
+  return { url, token, transportista };
+}
+
+// ── Función principal del driver ─────────────────────────────────
+async function send({ event, unit, route } = {}) {
+  const cfg = readConfig(route);
+
+  if (!cfg.url) {
+    console.warn('[wisetrack] URL no configurada');
+    return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_url' };
+  }
+  if (!cfg.token) {
+    console.warn('[wisetrack] TOKEN no configurado');
+    return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_token' };
+  }
+
+  const plate = stripPlate(unit?.plate);
+  if (!plate) {
+    console.warn('[wisetrack] patente faltante — skip');
+    return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_plate' };
+  }
+
+  const lat = event?.lat ?? null;
+  const lon = event?.lon ?? null;
+  if (lat === null || lon === null) {
+    console.warn('[wisetrack] coordenadas faltantes — skip');
+    return { ok: true, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'no_coords' };
+  }
+
+  const ign = event?.ignition === true || event?.ignition === 1;
+
+  // Todos los campos son STRING con coma decimal
+  const posicion = {
+    patente:           plate,
+    fecha_hora:        formatFechaUTC(event?.wialon_ts),
+    latitud:           toComma(lat),
+    longitud:          toComma(lon),
+    direccion:         safeStr(Math.round(Number(event?.heading) || 0)),
+    velocidad:         safeStr(Math.round(Number(event?.speed) || 0)),
+    estado_registro:   '1',
+    estado_ignicion:   ign ? '1' : '0',
+    numero_evento:     resolveEvento(event?.ignition, event?.speed),
+    odometro:          toComma(Number(event?.odometro) || 0, 2),
+    numero_satelites:  safeStr(Number(event?.sats) || 0),
+    hdop:              safeStr(Number(event?.hdop) || 0),
+    edad_dato:         '0',
+  };
+
+  // Campos opcionales
+  if (cfg.transportista) {
+    posicion.transportista = cfg.transportista;
+  }
+
+  const body = { posicion: [posicion] };
+
+  console.log(`[wisetrack] enviando plate=${plate} fecha=${posicion.fecha_hora} evento=${posicion.numero_evento}`);
+
+  const t0 = Date.now();
+  let res, resText;
+
+  try {
+    res = await fetch(cfg.url, {
+      method:  'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${cfg.token}`,
+      },
+      body:   JSON.stringify(body),
+      signal: AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined,
+    });
+    resText = await res.text().catch(() => '');
+  } catch (err) {
+    console.error(`[wisetrack] error de red:`, err.message);
+    return { ok: false, status: 'failed', http_status: 0, latency_ms: Date.now() - t0, response_http: err.message };
+  }
+
+  const latency_ms = Date.now() - t0;
+
+  // Evaluar respuesta
+  // OK: Estado === 1 (Llamada exitosa) o Estado === 5 (Duplicado — no es error real)
+  let ok = false;
+  try {
+    let json = JSON.parse(resText);
+    if (typeof json === 'string') json = JSON.parse(json);
+    const resultado = json?.RespuestaServicioWeb?.RespuestaOperacion;
+
+    if (Array.isArray(resultado)) {
+      // Múltiples posiciones: OK si al menos una fue Estado 1 o 5
+      ok = resultado.some(r => {
+        const e = r?.ResultadoTransaccion?.Estado;
+        return e === 1 || e === 5;
+      });
+    } else {
+      const estado = resultado?.ResultadoTransaccion?.Estado;
+      ok = estado === 1 || estado === 5;
+    }
+  } catch (_) {
+    ok = res.ok && !/error/i.test(resText);
+  }
+
+  if (ok) {
+    console.log(`[wisetrack] ✓ ${plate} (${res.status}) ${latency_ms}ms`);
+  } else {
+    console.warn(`[wisetrack] ✗ ${plate} (${res.status}) ${resText.slice(0, 200)}`);
+  }
+
+  return {
+    ok,
+    status:        ok ? 'sent' : 'failed',
+    http_status:   res.status,
+    latency_ms,
+    response_http: resText.slice(0, 2000),
+    error:         ok ? null : `http_${res.status}`,
+  };
+}
+
+module.exports = { send, name: 'wisetrack' };
