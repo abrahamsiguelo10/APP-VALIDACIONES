@@ -1,0 +1,146 @@
+'use strict';
+
+/**
+ * src/drivers/idux.js
+ * ─────────────────────────────────────────────────────────────────
+ * Driver REST/JSON para i-dux / CTAC — webservice.ctac.cl/location
+ *
+ * Endpoint: POST http://webservice.ctac.cl/location
+ * Auth:     Sin autenticación
+ * Payload:  Array con un objeto por evento
+ *
+ * Prioridad de configuración:
+ *   1. Identidad del destino (route.url)
+ *   2. Variables de entorno Railway (CTAC_URL, CTAC_EMPRESA_GPS)
+ *   3. field_schema fijos (idux_empresa_gps)
+ *
+ * Variables de entorno Railway:
+ *   CTAC_URL         — URL del endpoint (default: http://webservice.ctac.cl/location)
+ *   CTAC_EMPRESA_GPS — código empresa proveedora GPS (default: 51)
+ */
+
+const DEFAULT_URL     = (process.env.CTAC_URL || 'http://webservice.ctac.cl/location').replace(/\/+$/, '');
+const DEFAULT_EMPRESA = parseInt(process.env.CTAC_EMPRESA_GPS || '51', 10);
+
+// ── Helpers ──────────────────────────────────────────────────────
+
+function stripPlate(plate) {
+  const s = String(plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  return s.length > 6 ? s.slice(0, 6) : s;
+}
+
+/**
+ * Fecha UTC → "YYYY-MM-DD HH:MM:SS"
+ */
+function formatUTC(wialon_ts) {
+  const d = wialon_ts ? new Date(wialon_ts) : new Date();
+  if (isNaN(d)) return new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ` +
+         `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+
+function readConfig(route) {
+  let url     = DEFAULT_URL;
+  let empresa = DEFAULT_EMPRESA;
+
+  if (route?.url) {
+    url = String(route.url).replace(/\/+$/, '');
+  }
+
+  try {
+    let schema = route?.field_schema || [];
+    if (typeof schema === 'string') {
+      try { schema = JSON.parse(schema); } catch (_) { schema = []; }
+    }
+    for (const f of schema) {
+      if (f.source === 'fixed' && f.fixedValue) {
+        if (f.apiKey === 'idux_url')         url     = String(f.fixedValue).replace(/\/+$/, '');
+        if (f.apiKey === 'idux_empresa_gps') empresa = parseInt(f.fixedValue, 10) || DEFAULT_EMPRESA;
+      }
+    }
+  } catch (_) {}
+
+  return { url, empresa };
+}
+
+// ── Función principal del driver ─────────────────────────────────
+async function send({ event, unit, route } = {}) {
+  const cfg = readConfig(route);
+
+  if (!cfg.url) {
+    console.warn('[idux] URL no configurada');
+    return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_url' };
+  }
+
+  const patente = stripPlate(unit?.plate);
+  if (!patente) {
+    console.warn('[idux] patente faltante — skip');
+    return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_patente' };
+  }
+
+  const lat = event?.lat ?? null;
+  const lon = event?.lon ?? null;
+  if (lat === null || lon === null) {
+    console.warn('[idux] coordenadas faltantes — skip');
+    return { ok: true, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'no_coords' };
+  }
+
+  const ign = event?.ignition === true || event?.ignition === 1;
+
+  const payload = [{
+    patente:                patente,
+    latitude:               Number(lat),
+    longitude:              Number(lon),
+    datetime:               formatUTC(event?.wialon_ts),
+    speed:                  Math.max(0, Math.round(Number(event?.speed) || 0)),
+    acc:                    ign,
+    empresa_proveedora_gps: cfg.empresa,
+  }];
+
+  console.log(`[idux] enviando patente=${patente} datetime=${payload[0].datetime} empresa=${cfg.empresa}`);
+
+  const t0 = Date.now();
+  let res, resText;
+
+  try {
+    res = await fetch(cfg.url, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(payload),
+      signal:  AbortSignal.timeout ? AbortSignal.timeout(12000) : undefined,
+    });
+    resText = await res.text().catch(() => '');
+  } catch (err) {
+    console.error(`[idux] error de red:`, err.message);
+    return { ok: false, status: 'failed', http_status: 0, latency_ms: Date.now() - t0, response_http: err.message };
+  }
+
+  const latency_ms = Date.now() - t0;
+
+  let ok = false;
+  try {
+    let json = JSON.parse(resText);
+    if (typeof json === 'string') json = JSON.parse(json);
+    ok = res.ok && String(json?.status || '').toUpperCase() === 'OK';
+  } catch (_) {
+    ok = res.ok && /ok/i.test(resText);
+  }
+
+  if (ok) {
+    console.log(`[idux] ✓ ${patente} (${res.status}) ${latency_ms}ms`);
+  } else {
+    console.warn(`[idux] ✗ ${patente} (${res.status}) ${resText.slice(0, 200)}`);
+  }
+
+  return {
+    ok,
+    status:        ok ? 'sent' : 'failed',
+    http_status:   res.status,
+    latency_ms,
+    response_http: resText.slice(0, 2000),
+    error:         ok ? null : `http_${res.status}`,
+  };
+}
+
+module.exports = { send, name: 'idux' };
