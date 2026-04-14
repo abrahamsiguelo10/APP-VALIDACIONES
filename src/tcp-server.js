@@ -685,7 +685,7 @@ async function forwardToDestinations(unit, parsed) {
         try {
           driverAuth = typeof row.auth === 'string' ? JSON.parse(row.auth) : row.auth;
         } catch (_) {}
-        const driverRoute = { destination_id: row.dest_id, url: row.url, field_schema: driverFieldSchema, auth: driverAuth };
+        const driverRoute = { destination_id: row.dest_id, url: row.api_url, field_schema: driverFieldSchema, auth: driverAuth };
 
         console.log(`[TCP] ${unit.plate} → ${row.dest_name} [driver:${row.driver_slug}]`);
         const result = await driver.send({ event: driverEvent, unit: driverUnit, route: driverRoute });
