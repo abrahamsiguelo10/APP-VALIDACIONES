@@ -1,0 +1,155 @@
+'use strict';
+
+/**
+ * src/drivers/tranciti.js
+ * ─────────────────────────────────────────────────────────────────
+ * Driver REST/JSON para Tranciti / Waypoint — inboundLD
+ *
+ * Endpoint: POST https://api.waypoint.cl/inbound/inboundLD
+ * Auth:     Sin autenticación
+ * Payload:  Array con un objeto por evento
+ *
+ * Variables de entorno Railway (opcionales):
+ *   TRANCITI_URL — URL del endpoint (default: producción)
+ *
+ * Respuesta esperada:
+ *   OK:    { "message": "Successful", "code": 0 }
+ *   Error: { "message": "Error: ...", "code": -1 }
+ */
+
+const DEFAULT_URL = process.env.TRANCITI_URL || 'https://api.waypoint.cl/inbound/inboundLD';
+
+// ── Helpers ──────────────────────────────────────────────────────
+
+function num(v, fb) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : (fb ?? 0);
+}
+
+function int01(v) {
+  return (v === true || v === 1) ? 1 : 0;
+}
+
+function stripPlate(plate) {
+  return String(plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+/**
+ * Convierte wialon_ts (ISO string) a epoch milisegundos
+ */
+function toEpochMs(wialon_ts) {
+  if (!wialon_ts) return Date.now();
+  const d = new Date(wialon_ts);
+  return isNaN(d.getTime()) ? Date.now() : d.getTime();
+}
+
+// ── Función principal del driver ─────────────────────────────────
+async function send({ event, unit, route } = {}) {
+  let url = DEFAULT_URL;
+
+  // Override URL desde field_schema o route.url
+  if (route?.url) {
+    url = String(route.url).replace(/\/+$/, '');
+  }
+  try {
+    let schema = route?.field_schema || [];
+    if (typeof schema === 'string') {
+      try { schema = JSON.parse(schema); } catch (_) { schema = []; }
+    }
+    for (const f of schema) {
+      if (f.source === 'fixed' && f.fixedValue && f.apiKey === 'tranciti_url') {
+        url = f.fixedValue;
+      }
+    }
+  } catch (_) {}
+
+  const plate = stripPlate(unit?.plate);
+  if (!plate) {
+    console.warn('[tranciti] patente faltante — skip');
+    return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_plate' };
+  }
+
+  const lat = event?.lat ?? null;
+  const lon = event?.lon ?? null;
+  if (lat === null || lon === null) {
+    console.warn('[tranciti] coordenadas faltantes — skip');
+    return { ok: true, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'no_coords' };
+  }
+
+  const ign = event?.ignition === true || event?.ignition === 1;
+
+  const payload = [{
+    fecha:       toEpochMs(event?.wialon_ts),
+    latitud:     num(lat, 0),
+    longitud:    num(lon, 0),
+    altitud:     num(event?.alt, 0),
+    velocidad:   num(event?.speed, 0),
+    cog:         num(event?.heading, 0),
+    nsat:        num(event?.sats, 0),
+    realtime:    true,
+    input:       [int01(ign), 0, 0, 0],
+    hdop:        num(event?.hdop, 0),
+    ignicion:    int01(ign),
+    adc:         [-200, -200, -200, -200],
+    power:       1,
+    horometro:   0,
+    odometro:    num(event?.odometro, 0),
+    panico:      0,
+    bateria:     0,
+    bateriaInt:  0,
+    patente:     plate,
+    tercerojo:   0,
+    aceleracion: 0,
+    frenada:     0,
+    giro:        0,
+  }];
+
+  console.log(`[tranciti] enviando plate=${plate} fecha=${payload[0].fecha}`);
+
+  const t0 = Date.now();
+  let res, resText;
+
+  try {
+    res = await fetch(url, {
+      method:  'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept':       'application/json',
+      },
+      body:   JSON.stringify(payload),
+      signal: AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined,
+    });
+    resText = await res.text().catch(() => '');
+  } catch (err) {
+    console.error(`[tranciti] error de red:`, err.message);
+    return { ok: false, status: 'failed', http_status: 0, latency_ms: Date.now() - t0, response_http: err.message };
+  }
+
+  const latency_ms = Date.now() - t0;
+
+  // Evaluar respuesta: OK = { "message": "Successful", "code": 0 }
+  let ok = false;
+  try {
+    const json = JSON.parse(resText);
+    ok = json?.code === 0 || /successful/i.test(json?.message || '');
+  } catch (_) {
+    ok = res.ok && /successful/i.test(resText);
+  }
+
+  if (ok) {
+    console.log(`[tranciti] ✓ ${plate} (${res.status}) ${latency_ms}ms`);
+  } else {
+    console.warn(`[tranciti] ✗ ${plate} (${res.status}) ${resText.slice(0, 200)}`);
+  }
+
+  return {
+    ok,
+    status:        ok ? 'sent' : 'failed',
+    http_status:   res.status,
+    latency_ms,
+    response_http: resText.slice(0, 2000),
+    error:         ok ? null : `http_${res.status}`,
+  };
+}
+
+module.exports = { send, name: 'tranciti' };
