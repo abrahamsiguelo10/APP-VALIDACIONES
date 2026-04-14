@@ -128,11 +128,15 @@ async function send({ event, unit, route } = {}) {
   const latency_ms = Date.now() - t0;
 
   // Evaluar respuesta: OK = { "message": "Successful", "code": 0 }
+  // Nota: Tranciti a veces devuelve el JSON double-encoded (string con comillas)
   let ok = false;
   try {
-    const json = JSON.parse(resText);
+    let json = JSON.parse(resText);
+    // Si vino double-encoded ("\"{ ... }\""), parsear de nuevo
+    if (typeof json === 'string') json = JSON.parse(json);
     ok = json?.code === 0 || /successful/i.test(json?.message || '');
   } catch (_) {
+    // Fallback: buscar "Successful" en el texto crudo
     ok = res.ok && /successful/i.test(resText);
   }
 
