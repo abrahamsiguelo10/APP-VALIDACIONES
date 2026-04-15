@@ -645,6 +645,10 @@ async function forwardToDestinations(unit, parsed) {
     // ── Driver externo: si el destino tiene driver_slug, delegar ─────────────
     if (row.driver_slug) {
       // Filtrar coordenadas 0,0 también para drivers
+      // Agregar ANTES del filtro de coordenadas 0,0
+if (parsed.lat === 0 && parsed.lon === 0) {
+  console.warn(`[TCP] ${unit.plate} COORDS_DEBUG | lat=${parsed.lat} lon=${parsed.lon} speed=${parsed.speed} heading=${parsed.heading} alt=${parsed.alt} sats=${parsed.sats} wialon_ts=${parsed.wialon_ts} raw=${parsed.raw?.slice(0,150)}`);
+}
       if (parsed.lat === 0 && parsed.lon === 0) {
         console.warn(`[TCP] ${unit.plate} → ${row.dest_name} ⚠ coordenadas 0,0 — paquete descartado`);
         await saveEvent(unit, parsed, row.dest_id, false, 'invalid_coords_0_0');
