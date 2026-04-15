@@ -484,6 +484,11 @@ function resolveSource(source, unit, parsed, clienteData) {
       const iso = parsed.wialon_ts || new Date().toISOString();
       return new Date(iso).getTime();
     }
+      case 'unix_timestamp': {
+  // Epoch segundos UTC (para Mitgra y similares)
+  const iso = parsed.wialon_ts || new Date().toISOString();
+  return Math.floor(new Date(iso).getTime() / 1000);
+    }
 
     // ── Datos de la unidad (de la DB) ────────────────────────────────────────
     case 'unit_plate':     return unit.plate || '';
