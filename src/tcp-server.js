@@ -164,44 +164,33 @@ function parseRetranslatorPacket(buf) {
       offset += blockSize;
       if (blockSize < 1) continue;
 
-      // Iterar todos los sub-bloques dentro del bloque 0x0BBB
+      // Leer sub-bloque: [1B stealth] [1B dataType] [name\0] [value]
       let bOff = 0;
-      while (bOff + 3 < blockData.length) {
-        const valLen = blockData[bOff]; bOff += 1;
-        const dataType = blockData[bOff]; bOff += 1;
-        const nameNull = blockData.indexOf(0x00, bOff);
-        if (nameNull === -1) break;
-        const blockName = blockData.slice(bOff, nameNull).toString('ascii');
-        bOff = nameNull + 1;
+      bOff += 1; // stealth attribute
+      const dataType = blockData[bOff]; bOff += 1;
+      const nameNull = blockData.indexOf(0x00, bOff);
+      if (nameNull === -1) continue;
+      const blockName = blockData.slice(bOff, nameNull).toString('ascii');
+      bOff = nameNull + 1;
 
-        if (blockName === 'posinfo' && dataType === 0x02) {
-          if (bOff + 27 <= blockData.length) {
-            lon      = blockData.readDoubleBE(bOff); bOff += 8;
-            lat      = blockData.readDoubleBE(bOff); bOff += 8;
-            altitude = blockData.readDoubleBE(bOff); bOff += 8;
-            speed    = blockData.readInt16BE(bOff);  bOff += 2;
-            heading  = blockData.readInt16BE(bOff);  bOff += 2;
-            sats     = blockData[bOff]; bOff += 1;
-          } else {
-            bOff += valLen;
-          }
-        } else if (blockName === 'io' || blockName === 'di') {
-          // Leer inputs — bit 0 = ignición
-          if (bOff + 4 <= blockData.length) {
-            const inputs = blockData.readUInt32BE(bOff);
-            ignition = (inputs & 0x01) === 1;
-          }
-          bOff += valLen;
-        } else if (blockName === 'engine operation' && dataType === 0x04) {
-          // Ignición como Double BE (1.0 = encendida, 0.0 = apagada)
-          if (bOff + 8 <= blockData.length) {
-            const val = blockData.readDoubleBE(bOff);
-            ignition = val >= 1.0;
-          }
-          bOff += valLen;
-        } else {
-          // Sub-bloque desconocido — saltar
-          bOff += valLen;
+      if (blockName === 'posinfo' && dataType === 0x02) {
+        if (bOff + 27 <= blockData.length) {
+          lon      = blockData.readDoubleBE(bOff); bOff += 8;
+          lat      = blockData.readDoubleBE(bOff); bOff += 8;
+          altitude = blockData.readDoubleBE(bOff); bOff += 8;
+          speed    = blockData.readInt16BE(bOff);  bOff += 2;
+          heading  = blockData.readInt16BE(bOff);  bOff += 2;
+          sats     = blockData[bOff];
+        }
+      } else if (blockName === 'avl_inputs' && dataType === 0x03) {
+        if (bOff + 4 <= blockData.length) {
+          const inputs = blockData.readUInt32BE(bOff);
+          ignition = (inputs & 0x01) === 1;
+        }
+      } else if ((blockName === 'ign' || blockName === 'engine operation') && dataType === 0x04) {
+        if (bOff + 8 <= blockData.length) {
+          const val = blockData.readDoubleLE(bOff);
+          ignition = val >= 1.0;
         }
       }
     }
