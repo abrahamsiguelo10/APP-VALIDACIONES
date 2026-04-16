@@ -192,6 +192,13 @@ function parseRetranslatorPacket(buf) {
             ignition = (inputs & 0x01) === 1;
           }
           bOff += valLen;
+        } else if (blockName === 'engine operation' && dataType === 0x04) {
+          // Ignición como Double BE (1.0 = encendida, 0.0 = apagada)
+          if (bOff + 8 <= blockData.length) {
+            const val = blockData.readDoubleBE(bOff);
+            ignition = val >= 1.0;
+          }
+          bOff += valLen;
         } else {
           // Sub-bloque desconocido — saltar
           bOff += valLen;
