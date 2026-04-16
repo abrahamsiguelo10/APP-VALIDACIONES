@@ -173,18 +173,16 @@ function parseRetranslatorPacket(buf) {
       const blockName = blockData.slice(bOff, nameNull).toString('ascii');
       bOff = nameNull + 1;
 
-      if (blockName === 'posinfo' && dataType === 0x02) {
-        if (bOff + 27 <= blockData.length) {
-          lon      = blockData.readDoubleBE(bOff); bOff += 8;
-          lat      = blockData.readDoubleBE(bOff); bOff += 8;
-          altitude = blockData.readDoubleBE(bOff); bOff += 8;
-          speed    = blockData.readInt16BE(bOff);  bOff += 2;
-          heading  = blockData.readInt16BE(bOff);  bOff += 2;
-          sats     = blockData[bOff];
-          console.log(`[RT-POSINFO] lonBE=${lon} lonLE=${lonLE} latBE=${lat} latLE=${latLE} speed=${speed} hdg=${heading} sats=${sats}`);
-
-        }
-      } else if (blockName === 'avl_inputs' && dataType === 0x03) {
+     if (blockName === 'posinfo' && dataType === 0x02) {
+  if (bOff + 27 <= blockData.length) {
+    lon      = blockData.readDoubleLE(bOff); bOff += 8;
+    lat      = blockData.readDoubleLE(bOff); bOff += 8;
+    altitude = blockData.readDoubleLE(bOff); bOff += 8;
+    speed    = blockData.readInt16BE(bOff);  bOff += 2;
+    heading  = blockData.readInt16BE(bOff);  bOff += 2;
+    sats     = blockData[bOff]; bOff += 1;
+  } else { break; }
+} else if (blockName === 'avl_inputs' && dataType === 0x03) {
         if (bOff + 4 <= blockData.length) {
           const inputs = blockData.readUInt32BE(bOff);
           ignition = (inputs & 0x01) === 1;
