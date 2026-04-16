@@ -142,19 +142,17 @@ function parseRetranslatorPacket(buf) {
     if (buf.length < 8) return null;
     const packetSize = buf.readUInt32LE(0);
     if (buf.length < packetSize + 4) return null;
-
     let offset = 4;
     const nullIdx = buf.indexOf(0x00, offset);
     if (nullIdx === -1) return null;
     const uid = buf.slice(offset, nullIdx).toString('ascii');
     offset = nullIdx + 1;
-
     if (offset + 8 > buf.length) return null;
     const timestamp = buf.readUInt32BE(offset); offset += 4;
     offset += 4; // bitmask
-
     const wialon_ts = timestamp ? new Date(timestamp * 1000).toISOString() : null;
     let lat = null, lon = null, speed = null, heading = null, altitude = null, sats = null;
+    let ignition = null;
 
     while (offset + 6 <= packetSize + 4) {
       if (offset + 6 > buf.length) break;
@@ -165,21 +163,38 @@ function parseRetranslatorPacket(buf) {
       const blockData = buf.slice(offset, offset + blockSize);
       offset += blockSize;
       if (blockSize < 1) continue;
+
+      // Iterar todos los sub-bloques dentro del bloque 0x0BBB
       let bOff = 0;
-      bOff += 1;
-      const dataType = blockData[bOff]; bOff += 1;
-      const nameNull = blockData.indexOf(0x00, bOff);
-      if (nameNull === -1) continue;
-      const blockName = blockData.slice(bOff, nameNull).toString('ascii');
-      bOff = nameNull + 1;
-      if (blockName === 'posinfo' && dataType === 0x02) {
-        if (bOff + 27 <= blockData.length) {
-          lon      = blockData.readDoubleBE(bOff); bOff += 8;
-          lat      = blockData.readDoubleBE(bOff); bOff += 8;
-          altitude = blockData.readDoubleBE(bOff); bOff += 8;
-          speed    = blockData.readInt16BE(bOff);  bOff += 2;
-          heading  = blockData.readInt16BE(bOff);  bOff += 2;
-          sats     = blockData[bOff];
+      while (bOff + 3 < blockData.length) {
+        const valLen = blockData[bOff]; bOff += 1;
+        const dataType = blockData[bOff]; bOff += 1;
+        const nameNull = blockData.indexOf(0x00, bOff);
+        if (nameNull === -1) break;
+        const blockName = blockData.slice(bOff, nameNull).toString('ascii');
+        bOff = nameNull + 1;
+
+        if (blockName === 'posinfo' && dataType === 0x02) {
+          if (bOff + 27 <= blockData.length) {
+            lon      = blockData.readDoubleBE(bOff); bOff += 8;
+            lat      = blockData.readDoubleBE(bOff); bOff += 8;
+            altitude = blockData.readDoubleBE(bOff); bOff += 8;
+            speed    = blockData.readInt16BE(bOff);  bOff += 2;
+            heading  = blockData.readInt16BE(bOff);  bOff += 2;
+            sats     = blockData[bOff]; bOff += 1;
+          } else {
+            bOff += valLen;
+          }
+        } else if (blockName === 'io' || blockName === 'di') {
+          // Leer inputs — bit 0 = ignición
+          if (bOff + 4 <= blockData.length) {
+            const inputs = blockData.readUInt32BE(bOff);
+            ignition = (inputs & 0x01) === 1;
+          }
+          bOff += valLen;
+        } else {
+          // Sub-bloque desconocido — saltar
+          bOff += valLen;
         }
       }
     }
@@ -194,7 +209,7 @@ function parseRetranslatorPacket(buf) {
       heading:    heading  ?? 0,
       alt:        altitude ?? 0,
       sats:       sats     ?? 0,
-      ignition:   false,
+      ignition:   ignition !== null ? ignition : (speed !== null && speed > 0),
       raw:        buf.slice(0, packetSize + 4).toString('hex'),
       packetSize: packetSize + 4,
     };
