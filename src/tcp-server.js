@@ -181,6 +181,8 @@ function parseRetranslatorPacket(buf) {
           speed    = blockData.readInt16BE(bOff);  bOff += 2;
           heading  = blockData.readInt16BE(bOff);  bOff += 2;
           sats     = blockData[bOff];
+          console.log(`[RT-POSINFO] lonBE=${lon} lonLE=${lonLE} latBE=${lat} latLE=${latLE} speed=${speed} hdg=${heading} sats=${sats}`);
+
         }
       } else if (blockName === 'avl_inputs' && dataType === 0x03) {
         if (bOff + 4 <= blockData.length) {
