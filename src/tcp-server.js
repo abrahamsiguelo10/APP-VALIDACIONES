@@ -195,7 +195,7 @@ function parseRetranslatorPacket(buf) {
       alt:        altitude ?? 0,
       sats:       sats     ?? 0,
       ignition:   false,
-      raw:        buf.slice(0, packetSize + 4).toString('hex').slice(0, 80),
+      raw:        raw: buf.slice(0, packetSize + 4).toString('hex'),
       packetSize: packetSize + 4,
     };
   } catch (err) {
