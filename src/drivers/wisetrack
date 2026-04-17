@@ -124,6 +124,8 @@ function readConfig(route) {
 async function send({ event, unit, route } = {}) {
   const cfg = readConfig(route);
 
+  console.log(`[wisetrack] DEBUG url=${cfg.url} route.url=${route?.url} DEFAULT_URL=${DEFAULT_URL}`);
+
   if (!cfg.url) {
     console.warn('[wisetrack] URL no configurada');
     return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_url' };
