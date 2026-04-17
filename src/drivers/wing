@@ -43,6 +43,15 @@ async function send({ event, unit, route }) {
     }
   } catch (_) {}
 
+ try {
+    const auth = typeof route?.auth === 'string' ? JSON.parse(route.auth) : route?.auth;
+    if (auth?.token && !token) token = auth.token;
+    if (auth?.password && !token) token = auth.password;
+  } catch (_) {}
+
+  // Leer URL desde route.url (GUI → URL de la API)
+  if (route?.url && endpoint === ENDPOINT) endpoint = route.url;
+
   if (!token) {
     console.error('[tms] ❌ Token no configurado (ni TMS_TOKEN env ni campo fijo tms_token)');
     return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing token' };
