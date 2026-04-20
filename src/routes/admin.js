@@ -345,6 +345,93 @@ router.get('/gps-events/:plate/destinations', requireRole('admin'), async (req, 
   }
 });
 
+
+/* ── GET /admin/samtech-sample/:plate ────────────────────────── */
+router.get('/samtech-sample/:plate', requireRole('admin'), async (req, res) => {
+  const { plate } = req.params;
+  const dest_id = req.query.dest_id || null;
+
+  try {
+    // Buscar último evento con coords válidas
+    const { rows } = await query(`
+      SELECT e.imei, e.lat, e.lon, e.speed, e.heading, e.ignition,
+             e.wialon_ts, u.name, u.rut
+      FROM public.gps_events e
+      JOIN public.units u ON u.imei = e.imei
+      WHERE UPPER(e.plate) = UPPER($1)
+        AND e.lat != 0 AND e.lon != 0
+      ORDER BY e.received_at DESC LIMIT 1
+    `, [plate]);
+
+    if (!rows.length) return res.status(404).json({ error: 'Sin eventos GPS para esa patente.' });
+
+    const r = rows[0];
+    const ign = r.ignition === true || r.ignition === 1 ? 1 : 0;
+
+    // Leer config del destino si se pasa dest_id
+    let empresa = process.env.dduarte_EMPRESA || 'dduarte';
+    let pgps    = process.env.dduarte_PGPS    || 'SigueloGPS';
+    let login   = process.env.dduarte_USER    || '';
+    let clave   = process.env.dduarte_PASS    || '';
+
+    if (dest_id) {
+      const { rows: dRows } = await query(
+        'SELECT field_schema FROM public.destinations WHERE id = $1', [dest_id]
+      );
+      if (dRows.length) {
+        let schema = dRows[0].field_schema;
+        if (typeof schema === 'string') schema = JSON.parse(schema);
+        for (const f of (schema || [])) {
+          if (f.source === 'fixed' && f.fixedValue) {
+            if (f.apiKey === 'samtech_empresa') empresa = f.fixedValue;
+            if (f.apiKey === 'samtech_pgps')    pgps    = f.fixedValue;
+            if (f.apiKey === 'samtech_login')   login   = f.fixedValue;
+            if (f.apiKey === 'samtech_clave')   clave   = f.fixedValue;
+          }
+        }
+      }
+    }
+
+    const p = n => String(n).padStart(2, '0');
+    const d = r.wialon_ts ? new Date(r.wialon_ts) : new Date();
+    const fn = `${p(d.getUTCDate())}/${p(d.getUTCMonth()+1)}/${d.getUTCFullYear()} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+    const pat = plate.toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+    const innerXml = `<?xml version="1.0" encoding="ISO-8859-1"?><datos><movil>` +
+      `<pgps>${pgps}</pgps><empresa>${empresa}</empresa><tercero>${r.name || 'No Asignado'}</tercero>` +
+      `<pat>${pat}</pat><fn>${fn}</fn>` +
+      `<lat>${parseFloat(r.lat).toFixed(6)}</lat><lon>${parseFloat(r.lon).toFixed(6)}</lon>` +
+      `<ori>${Math.round(Number(r.heading) || 0)}</ori><vel>${Math.round(Number(r.speed) || 0)}</vel>` +
+      `<mot>${ign}</mot><hdop>000</hdop><odo>0</odo><eve>${ign ? 46 : 47}</eve>` +
+      `<conductor>No Asignado</conductor><numSAT>0</numSAT><sens1>0</sens1><sens2>0</sens2>` +
+      `</movil><usuario xmlns="user"><login>${login}</login><clave>********</clave></usuario></datos>`;
+
+    const envelope = `<?xml version="1.0" encoding="utf-8"?>` +
+      `<soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" ` +
+      `xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">` +
+      `<soap12:Body><Post_XML xmlns="samtechpos"><xmldoc><![CDATA[${innerXml}]]></xmldoc></Post_XML>` +
+      `</soap12:Body></soap12:Envelope>`;
+
+    res.json({
+      plate: pat,
+      imei: r.imei,
+      url: process.env.dduarte_URL || 'https://wspos.samtech.cl/WSP.asmx',
+      soapAction: 'samtechpos/Post_XML',
+      contentType: 'application/soap+xml; charset=utf-8; action="samtechpos/Post_XML"',
+      empresa,
+      pgps,
+      fecha_utc: fn,
+      lat: parseFloat(r.lat),
+      lon: parseFloat(r.lon),
+      innerXml,
+      envelope,
+      nota: 'La clave se muestra como ********. El XML real incluye la clave configurada.',
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Arranque diferido: espera 5 minutos para no competir con el inicio del servidor
 // Solo activo si GPS_AUTO_PURGE !== 'false'
 if (process.env.GPS_AUTO_PURGE !== 'false') {
