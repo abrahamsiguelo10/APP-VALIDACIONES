@@ -148,6 +148,7 @@ async function send({ event, unit }) {
   }
   const vel    = Math.round(Number(event.speed   || 0));
   const ori    = Math.round(Number(event.heading || 0));
+  const mot    = (event.ignition === true || event.ignition === 1) ? 1 : 0;
   const hdop   = Math.round(Number(event.hdop    || 0));
   const odo    = Number(event.odometro || 0).toFixed(2);
   const numSAT = Math.round(Number(event.sats    || 0));
