@@ -12,23 +12,29 @@
  * El XML de datos viaja como CDATA dentro del campo <wsp:xmldoc>.
  * Las credenciales van dentro del XML en <usuario><login><clave>.
  *
+ * Prioridad de configuración:
+ *   1. Auth del destino (route.auth) → username/password
+ *   2. URL del destino (route.url)
+ *   3. field_schema fijos → tracktec_login, tracktec_clave, tracktec_url, etc.
+ *   4. Variables de entorno Railway (fallback global)
+ *
  * Variables de entorno Railway:
  *   TRACKTEC_URL      — endpoint SOAP (default: producción)
  *   TRACKTEC_USER     — login de acceso al WS
  *   TRACKTEC_PASS     — clave de acceso al WS
  *   TRACKTEC_PGPS     — nombre del proveedor GPS (ej: SIGUELOGPS)
  *   TRACKTEC_TERCERO  — nombre transportista/cliente (ej: TRANSPORTES XYZ)
- *   TRACKTEC_EMPRESA  — siempre "controlsellos" (default fijo)
+ *   TRACKTEC_EMPRESA  — nombre empresa (default: controlsellos)
  *   TRACKTEC_EVENTO   — código de evento por defecto (default: 46)
  */
 
-const ENDPOINT = process.env.TRACKTEC_URL     || 'https://wshub.tracktec.cl/ws/wspos';
-const USER     = process.env.TRACKTEC_USER    || '';
-const PASS     = process.env.TRACKTEC_PASS    || '';
-const PGPS     = process.env.TRACKTEC_PGPS    || 'SIGUELOGPS';
-const TERCERO  = process.env.TRACKTEC_TERCERO || '';
-const EMPRESA  = process.env.TRACKTEC_EMPRESA || 'controlsellos';
-const EVE_DEF  = process.env.TRACKTEC_EVENTO  || '46';
+const ENV_URL     = process.env.TRACKTEC_URL     || 'https://wshub.tracktec.cl/ws/wspos';
+const ENV_USER    = process.env.TRACKTEC_USER    || '';
+const ENV_PASS    = process.env.TRACKTEC_PASS    || '';
+const ENV_PGPS    = process.env.TRACKTEC_PGPS    || 'SIGUELOGPS';
+const ENV_TERCERO = process.env.TRACKTEC_TERCERO || '';
+const ENV_EMPRESA = process.env.TRACKTEC_EMPRESA || 'controlsellos';
+const ENV_EVE     = process.env.TRACKTEC_EVENTO  || '46';
 
 const SOAP_ACTION = 'http://wspos.tracktec.cl/wspos/Post_XMLRequest';
 
@@ -46,28 +52,70 @@ function pad2(n) { return String(n).padStart(2, '0'); }
 
 /**
  * Formato Local Chile: "DD/MM/YYYY HH:MM:SS"
- * TrackTec acepta fecha local Chile (UTC-3/UTC-4) por defecto.
  */
 function toFechaChile(wialon_ts) {
   const iso = wialon_ts || new Date().toISOString();
   try {
-    const d   = new Date(new Date(iso).toLocaleString('en-US', { timeZone: 'America/Santiago' }));
-    const p   = n => String(n).padStart(2, '0');
+    const d = new Date(new Date(iso).toLocaleString('en-US', { timeZone: 'America/Santiago' }));
+    const p = n => String(n).padStart(2, '0');
     return `${p(d.getDate())}/${p(d.getMonth()+1)}/${d.getFullYear()} ` +
            `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
   } catch (_) {
-    // Fallback UTC-4
     const d = new Date(new Date(iso).getTime() - 4 * 3600 * 1000);
     return `${pad2(d.getUTCDate())}/${pad2(d.getUTCMonth()+1)}/${d.getUTCFullYear()} ` +
            `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`;
   }
 }
 
+// ── Leer configuración con prioridad: auth → URL → field_schema → env ──
+function readConfig(route) {
+  let url     = ENV_URL;
+  let login   = ENV_USER;
+  let clave   = ENV_PASS;
+  let pgps    = ENV_PGPS;
+  let tercero = ENV_TERCERO;
+  let empresa = ENV_EMPRESA;
+  let eve     = ENV_EVE;
+
+  // 1. URL del destino (GUI)
+  if (route?.url) {
+    url = String(route.url).replace(/\/+$/, '');
+  }
+
+  // 2. Auth del destino (GUI → Autenticación)
+  try {
+    const auth = typeof route?.auth === 'string' ? JSON.parse(route.auth) : route?.auth;
+    if (auth?.username) login = auth.username;
+    if (auth?.password) clave = auth.password;
+  } catch (_) {}
+
+  // 3. field_schema overrides (GUI → campos fijos)
+  try {
+    let schema = route?.field_schema || [];
+    if (typeof schema === 'string') {
+      try { schema = JSON.parse(schema); } catch (_) { schema = []; }
+    }
+    for (const f of schema) {
+      if (f.source === 'fixed' && f.fixedValue) {
+        if (f.apiKey === 'tracktec_url'     || f.apiKey === 'url')     url     = String(f.fixedValue).replace(/\/+$/, '');
+        if (f.apiKey === 'tracktec_login'   || f.apiKey === 'login')   login   = f.fixedValue;
+        if (f.apiKey === 'tracktec_clave'   || f.apiKey === 'clave')   clave   = f.fixedValue;
+        if (f.apiKey === 'tracktec_pgps'    || f.apiKey === 'pgps')    pgps    = f.fixedValue;
+        if (f.apiKey === 'tracktec_tercero' || f.apiKey === 'tercero') tercero = f.fixedValue;
+        if (f.apiKey === 'tracktec_empresa' || f.apiKey === 'empresa') empresa = f.fixedValue;
+        if (f.apiKey === 'tracktec_evento'  || f.apiKey === 'eve')     eve     = f.fixedValue;
+      }
+    }
+  } catch (_) {}
+
+  return { url, login, clave, pgps, tercero, empresa, eve };
+}
+
 // ── Construir XML interno (va en CDATA) ───────────────────────────
 function buildDatosXml({ pgps, tercero, empresa, pat, fn, lat, lon,
                           ori, vel, mot, hdop, odo, eve,
                           conductor, numSAT, sens1, sens2,
-                          user, pass }) {
+                          login, clave }) {
   return `<?xml version="1.0" encoding="ISO-8859-1"?><datos>` +
     `<movil>` +
       `<pgps>${esc(pgps)}</pgps>` +
@@ -89,8 +137,8 @@ function buildDatosXml({ pgps, tercero, empresa, pat, fn, lat, lon,
       `<sens2>${sens2}</sens2>` +
     `</movil>` +
     `<usuario xmlns="user">` +
-      `<login>${esc(user)}</login>` +
-      `<clave>${esc(pass)}</clave>` +
+      `<login>${esc(login)}</login>` +
+      `<clave>${esc(clave)}</clave>` +
     `</usuario>` +
   `</datos>`;
 }
@@ -111,14 +159,16 @@ function buildEnvelope(datosXml) {
 }
 
 // ── Función principal del driver ──────────────────────────────────
-async function send({ event, unit }) {
-  if (!USER || !PASS) {
-    console.error('[tracktec] ❌ TRACKTEC_USER / TRACKTEC_PASS no configurados');
+async function send({ event, unit, route }) {
+  const cfg = readConfig(route);
+
+  if (!cfg.login || !cfg.clave) {
+    console.error('[tracktec] ❌ Credenciales no configuradas (ni en auth, field_schema, ni env vars)');
     return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing credentials' };
   }
-  if (!TERCERO) {
-    console.error('[tracktec] ❌ TRACKTEC_TERCERO no configurado');
-    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing TRACKTEC_TERCERO' };
+  if (!cfg.tercero) {
+    console.error('[tracktec] ❌ tercero no configurado');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing tercero' };
   }
 
   const pat = (unit.plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -126,39 +176,19 @@ async function send({ event, unit }) {
     return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing plate' };
   }
 
-  // Leer overrides desde field_schema si están configurados como fixed
-  // Permite tener múltiples destinos TrackTec con distintos tercero/pgps/eve
-  let pgps    = PGPS;
-  let tercero = TERCERO;
-  let eve     = EVE_DEF;
-  try {
-    const schema = (route?.field_schema) || [];
-    for (const f of schema) {
-      if (f.source === 'fixed' && f.fixedValue) {
-        if (f.apiKey === 'pgps')    pgps    = f.fixedValue;
-        if (f.apiKey === 'tercero') tercero = f.fixedValue;
-        if (f.apiKey === 'eve')     eve     = f.fixedValue;
-      }
-    }
-  } catch (_) {}
-
-  if (!tercero) {
-    console.error('[tracktec] ❌ TRACKTEC_TERCERO no configurado (ni en env ni en field_schema)');
-    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing tercero' };
-  }
   const vel    = Math.round(Number(event.speed   || 0));
   const ori    = Math.round(Number(event.heading || 0));
   const mot    = (event.ignition === true || event.ignition === 1) ? 1 : 0;
   const hdop   = Math.round(Number(event.hdop    || 0));
   const odo    = Number(event.odometro || 0).toFixed(2);
   const numSAT = Math.round(Number(event.sats    || 0));
-  const sens1  = 0;  // horómetro en minutos — no disponible
+  const sens1  = 0;
   const sens2  = 0;
 
   const datosXml = buildDatosXml({
-    pgps,
-    tercero,
-    empresa:   EMPRESA,
+    pgps:      cfg.pgps,
+    tercero:   cfg.tercero,
+    empresa:   cfg.empresa,
     pat,
     fn:        toFechaChile(event.wialon_ts),
     lat:       event.lat ?? 0,
@@ -168,20 +198,23 @@ async function send({ event, unit }) {
     mot,
     hdop,
     odo,
-    eve,
+    eve:       cfg.eve,
     conductor: 'No Asignado',
     numSAT,
     sens1,
     sens2,
-    user:      USER,
-    pass:      PASS,
+    login:     cfg.login,
+    clave:     cfg.clave,
   });
 
   const envelope = buildEnvelope(datosXml);
-  const t0       = Date.now();
+
+  console.log(`[tracktec] enviando pat=${pat} tercero=${cfg.tercero} empresa=${cfg.empresa} url=${cfg.url}`);
+
+  const t0 = Date.now();
 
   try {
-    const res = await fetch(ENDPOINT, {
+    const res = await fetch(cfg.url, {
       method:  'POST',
       headers: {
         'Content-Type': 'text/xml; charset=utf-8',
@@ -194,13 +227,11 @@ async function send({ event, unit }) {
     const latency = Date.now() - t0;
     const resText = await res.text().catch(() => '');
 
-    // Respuesta exitosa contiene: <Post_XMLResult>OK</Post_XMLResult>
     const ok = res.ok && /Post_XMLResult[^>]*>OK</i.test(resText);
 
     if (ok) {
       console.log(`[tracktec] ✓ pat=${pat} (${latency}ms)`);
     } else {
-      // Extraer mensaje de error del XML de respuesta si existe
       const errMatch = resText.match(/Post_XMLResult[^>]*>([^<]+)</i);
       const errMsg   = errMatch ? errMatch[1] : resText.slice(0, 200);
       console.error(`[tracktec] ✗ pat=${pat} http=${res.status} err=${errMsg}`);
