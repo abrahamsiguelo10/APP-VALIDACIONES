@@ -1,0 +1,148 @@
+'use strict';
+
+/**
+ * src/drivers/project44.js
+ * ─────────────────────────────────────────────────────────────────
+ * Driver para project44 Unified Integrations API
+ *
+ * Endpoint: POST /services/unified-integrations/v1/connections/{id}/ingestions
+ *
+ * Payload esperado por p44:
+ * [{
+ *   owner_id:     "CLETFCRJ",          // fijo, desde field_schema
+ *   device_id:    "869671077365722",   // IMEI
+ *   license_plate:"BRDS55",            // patente
+ *   position: {                         // ← objeto anidado (no soportado por field_schema)
+ *     latitude:  -23.57342,
+ *     longitude: -70.394682
+ *   },
+ *   timestamp:    1714123456,          // epoch segundos UTC
+ *   speed:        60,
+ *   direction:    180,
+ *   altitude:     850,
+ *   odometer:     12345.5,
+ *   moving:       true,                // booleano: speed > 0 (omitir si null)
+ *   ignition:     true                 // booleano (omitir si null)
+ * }]
+ *
+ * Autenticación: Basic Auth desde route.auth
+ *   { type: "basic", username: "...", password: "..." }
+ *
+ * Configuración fija desde field_schema:
+ *   owner_id → fixedValue (ej: "CLETFCRJ")
+ */
+
+async function send({ event, unit, route }) {
+  // ── Leer owner_id desde field_schema ─────────────────────────
+  let owner_id = '';
+  try {
+    const schema = typeof route?.field_schema === 'string'
+      ? JSON.parse(route.field_schema)
+      : (route?.field_schema || []);
+    const ownerField = schema.find(f => f.apiKey === 'owner_id' && f.source === 'fixed');
+    if (ownerField?.fixedValue) owner_id = ownerField.fixedValue;
+  } catch (_) {}
+
+  if (!owner_id) {
+    console.error('[p44] ❌ owner_id no configurado en field_schema');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing owner_id' };
+  }
+
+  // ── Construir payload ─────────────────────────────────────────
+  const payload = {
+    owner_id,
+    device_id:    unit.imei  || '',
+    license_plate:(unit.plate || '').toUpperCase(),
+
+    // Objeto anidado — esto es lo que el field_schema no puede hacer
+    position: {
+      latitude:  event.lat ?? 0,
+      longitude: event.lon ?? event.lng ?? 0,
+    },
+
+    timestamp: event.wialon_ts
+      ? Math.floor(new Date(event.wialon_ts).getTime() / 1000)
+      : Math.floor(Date.now() / 1000),
+
+    speed:     Number(event.speed   ?? 0),
+    direction: Number(event.heading ?? 0),
+    altitude:  Number(event.alt     ?? 0),
+  };
+
+  // Odómetro — solo incluir si tiene valor
+  if (event.odometro != null && event.odometro !== 0) {
+    payload.odometer = Number(event.odometro);
+  }
+
+  // moving — booleano derivado de speed, omitir si no hay datos
+  if (event.speed != null) {
+    payload.moving = Number(event.speed) > 0;
+  }
+
+  // ignition — booleano, omitir si null/undefined
+  if (event.ignition != null) {
+    payload.ignition = event.ignition === true || event.ignition === 1;
+  }
+
+  // ── Auth: Basic desde route.auth ──────────────────────────────
+  const headers = { 'Content-Type': 'application/json' };
+  try {
+    const auth = typeof route?.auth === 'string' ? JSON.parse(route.auth) : route?.auth;
+    if (auth?.type === 'basic' && auth.username && auth.password) {
+      const b64 = Buffer.from(`${auth.username}:${auth.password}`).toString('base64');
+      headers['Authorization'] = `Basic ${b64}`;
+    } else if (auth?.type === 'bearer' && auth.token) {
+      headers['Authorization'] = `Bearer ${auth.token}`;
+    }
+  } catch (_) {}
+
+  const url = route?.url;
+  if (!url) {
+    console.error('[p44] ❌ URL no configurada en el destino');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing URL' };
+  }
+
+  console.log(`[p44] enviando plate=${payload.license_plate} imei=${payload.device_id} moving=${payload.moving} pos=${payload.position.latitude},${payload.position.longitude}`);
+
+  const t0 = Date.now();
+
+  try {
+    const res = await fetch(url, {
+      method:  'POST',
+      headers,
+      body:    JSON.stringify([payload]), // p44 espera un array
+      signal:  AbortSignal.timeout(10000),
+    });
+
+    const latency = Date.now() - t0;
+    const resText = await res.text().catch(() => '');
+    const ok      = res.ok;
+
+    if (ok) {
+      console.log(`[p44] ✓ plate=${payload.license_plate} (${res.status}) ${latency}ms`);
+    } else {
+      console.error(`[p44] ✗ plate=${payload.license_plate} http=${res.status} resp=${resText.slice(0, 200)}`);
+    }
+
+    return {
+      ok,
+      http_status:   res.status,
+      status:        ok ? 'ok' : 'failed',
+      response_http: resText.slice(0, 500),
+      latency_ms:    latency,
+    };
+
+  } catch (err) {
+    const latency = Date.now() - t0;
+    console.error(`[p44] Error fetch: ${err.message}`);
+    return {
+      ok:            false,
+      http_status:   0,
+      status:        'failed',
+      response_http: err.message?.slice(0, 500) || 'fetch_error',
+      latency_ms:    latency,
+    };
+  }
+}
+
+module.exports = { send };
