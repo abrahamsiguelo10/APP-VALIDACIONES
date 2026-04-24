@@ -511,7 +511,9 @@ async function buildPayload(fieldSchema, unit, parsed, clienteData) {
 
   for (const f of fields) {
     let val;
-    if (f.source === 'fixed') {
+    // Tratar como fixed si: source === 'fixed' O source está vacío pero hay fixedValue
+    const isFixed = f.source === 'fixed' || ((!f.source || f.source === '') && f.fixedValue !== undefined && f.fixedValue !== null && f.fixedValue !== '');
+    if (isFixed) {
       val = (f.fixedValue !== undefined && f.fixedValue !== null && f.fixedValue !== '')
         ? f.fixedValue : null;
     } else {
