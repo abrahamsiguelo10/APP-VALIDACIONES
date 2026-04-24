@@ -28,7 +28,7 @@
  *   TRACKTEC_EVENTO   — código de evento (default: 46)
  */
 
-const ENV_URL     = process.env.TRACKTEC_URL     || 'https://track3ws.gpschile.com/api/inyeccion';
+const ENV_URL     = process.env.TRACKTEC_URL     || 'https://wshub.tracktec.cl/ws/wspos';
 const ENV_USER    = process.env.TRACKTEC_USER    || '';
 const ENV_PASS    = process.env.TRACKTEC_PASS    || '';
 const ENV_PGPS    = process.env.TRACKTEC_PGPS    || 'SIGUELOGPS';
@@ -234,12 +234,27 @@ async function send({ event, unit, route }) {
     'SOAPAction':   `"${SOAP_ACTION}"`,
   };
 
-  // Agregar Bearer Token si está disponible
+  // Resolver Authorization header
+  // GPSChile envía el token como Base64(usuario:password) seleccionado como "Bearer Token"
+  // en la GUI — en realidad es Basic Auth. Detectar automáticamente por presencia de ':'
+  // al decodificar el Base64.
   if (cfg.bearerToken) {
-    headers['Authorization'] = `Bearer ${cfg.bearerToken}`;
-    console.log(`[tracktec] usando Bearer Token (${cfg.bearerToken.substring(0,12)}...)`);
+    let authType = 'bearer';
+    try {
+      const decoded = Buffer.from(cfg.bearerToken, 'base64').toString('utf8');
+      if (decoded.includes(':')) authType = 'basic';
+    } catch (_) {}
+
+    if (authType === 'basic') {
+      // El token ya es Base64(usuario:password) — enviarlo como Basic directamente
+      headers['Authorization'] = `Basic ${cfg.bearerToken}`;
+      console.log(`[tracktec] token Base64 detectado como Basic Auth → Authorization: Basic ***${cfg.bearerToken.slice(-6)}`);
+    } else {
+      headers['Authorization'] = `Bearer ${cfg.bearerToken}`;
+      console.log(`[tracktec] usando Bearer Token (***${cfg.bearerToken.slice(-6)})`);
+    }
   } else {
-    console.log(`[tracktec] usando Basic Auth (login=${cfg.login})`);
+    console.log(`[tracktec] sin token HTTP — credenciales solo en XML (login=${cfg.login})`);
   }
 
   console.log(`[tracktec] enviando pat=${pat} tercero=${cfg.tercero} empresa=${cfg.empresa} url=${cfg.url}`);
