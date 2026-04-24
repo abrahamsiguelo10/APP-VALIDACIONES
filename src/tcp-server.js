@@ -488,7 +488,11 @@ function resolveSource(source, unit, parsed, clienteData) {
 // ─── buildPayload — ahora async para poder await campos como 'address' ────────
 async function buildPayload(fieldSchema, unit, parsed, clienteData) {
   const fields = (fieldSchema || [])
-    .filter(f => f.apiKey && (f.source || f.source === 'fixed'))
+    .filter(f => f.apiKey && (
+      f.source === 'fixed' ||           // fuente explícita fixed
+      (f.source && f.source !== '') ||  // cualquier fuente no vacía
+      (f.fixedValue !== undefined && f.fixedValue !== null && f.fixedValue !== '') // source vacío pero con valor fijo
+    ))
     .sort((a, b) => (a.order || 0) - (b.order || 0));
 
   if (!fields.length) {
