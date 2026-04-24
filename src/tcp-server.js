@@ -1,3 +1,5 @@
+'use strict';
+
 /**
  * src/tcp-server.js
  * Recibe paquetes Wialon IPS (texto) Y Wialon Retranslator v1.0 (binario) por TCP.
@@ -6,7 +8,6 @@
  * Wialon IPS:          primer byte = '#' (0x23)
  * Wialon Retranslator: primer 4 bytes = tamaño del paquete en Little Endian (binario)
  */
-'use strict';
 
 // ── Handlers globales de error — evitan que el proceso muera por errores no capturados ──
 process.on('uncaughtException', (err) => {
@@ -26,12 +27,14 @@ const TCP_PORT = parseInt(process.env.TCP_PORT || '9001', 10);
 // Evita queries repetidas a Supabase por datos que casi nunca cambian.
 // Con 200 unidades × 1 evento/s = 600 queries/s sin caché → ~3 queries/s con caché.
 
-const CACHE_TTL_MS       = 60_000;  // 60 segundos TTL general
-const CACHE_DEST_TTL_MS  = 120_000; // 2 minutos para destinos (cambian menos)
+const CACHE_TTL_MS       = 60_000;   // 60 segundos TTL general
+const CACHE_DEST_TTL_MS  = 120_000;  // 2 minutos para destinos (cambian menos)
+const CACHE_GEO_TTL_MS   = 30 * 60_000; // ← NUEVO: 30 min para direcciones
 
-const _unitCache = new Map();        // imei → { data, expiresAt }
-const _destCache = new Map();        // imei → { data, expiresAt }
-const _clienteCache = new Map();     // cliente_id → { data, expiresAt }
+const _unitCache    = new Map(); // imei       → { data, expiresAt }
+const _destCache    = new Map(); // imei       → { data, expiresAt }
+const _clienteCache = new Map(); // cliente_id → { data, expiresAt }
+const _geocodeCache = new Map(); // "lat,lon"  → { data, expiresAt } ← NUEVO
 
 function cacheGet(map, key) {
   const entry = map.get(key);
@@ -47,10 +50,65 @@ function cacheSet(map, key, data, ttl = CACHE_TTL_MS) {
 // Limpiar caché expirado cada 5 minutos para evitar memory leaks
 setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of _unitCache)   { if (now > v.expiresAt) _unitCache.delete(k); }
-  for (const [k, v] of _destCache)   { if (now > v.expiresAt) _destCache.delete(k); }
-  for (const [k, v] of _clienteCache){ if (now > v.expiresAt) _clienteCache.delete(k); }
+  for (const [k, v] of _unitCache)    { if (now > v.expiresAt) _unitCache.delete(k); }
+  for (const [k, v] of _destCache)    { if (now > v.expiresAt) _destCache.delete(k); }
+  for (const [k, v] of _clienteCache) { if (now > v.expiresAt) _clienteCache.delete(k); }
+  for (const [k, v] of _geocodeCache) { if (now > v.expiresAt) _geocodeCache.delete(k); } // ← NUEVO
 }, 5 * 60_000);
+
+// ─── NUEVO: Reverse Geocoding — Nominatim (OpenStreetMap) ────────────────────
+// Gratuito, sin API key. Política: max 1 req/s con User-Agent identificado.
+// Con caché de 30 min y ~200 unidades el uso es < 1 req/min. Completamente seguro.
+// Devuelve string con la dirección formateada o null si falla.
+async function getReverseGeocode(lat, lon) {
+  if (!lat || !lon || (lat === 0 && lon === 0)) return null;
+
+  // Redondear a 4 decimales (~11m) para maximizar hits de caché entre eventos cercanos
+  const key = `${Number(lat).toFixed(4)},${Number(lon).toFixed(4)}`;
+
+  const cached = cacheGet(_geocodeCache, key);
+  if (cached !== undefined) return cached; // null también se cachea (evita re-intentos)
+
+  try {
+    const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&addressdetails=1`;
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'SigueloGPS/1.0 (siguelo.cl)' },
+      signal:  AbortSignal.timeout(5000),
+    });
+
+    if (!res.ok) {
+      cacheSet(_geocodeCache, key, null, CACHE_GEO_TTL_MS);
+      return null;
+    }
+
+    const data = await res.json();
+    let address = null;
+
+    if (data?.address) {
+      const a = data.address;
+      // Construir: "Calle Número, Ciudad, Región, País"
+      const parts = [
+        a.road || a.pedestrian || a.path || a.footway || a.highway || '',
+        a.house_number || '',
+        a.city || a.town || a.village || a.municipality || a.county || '',
+        a.state || a.region || '',
+        a.country || '',
+      ].filter(Boolean);
+      address = parts.join(', ') || data.display_name?.slice(0, 250) || null;
+    } else if (data?.display_name) {
+      address = data.display_name.slice(0, 250);
+    }
+
+    cacheSet(_geocodeCache, key, address, CACHE_GEO_TTL_MS);
+    if (address) console.log(`[GEO] ${lat},${lon} → ${address.slice(0, 80)}`);
+    return address;
+
+  } catch (err) {
+    console.warn(`[GEO] reverse geocode failed lat=${lat} lon=${lon}: ${err.message}`);
+    cacheSet(_geocodeCache, key, null, CACHE_GEO_TTL_MS);
+    return null;
+  }
+}
 
 // ─── Parser Wialon IPS (texto) ────────────────────────────────────────────────
 function parseWialonIPS(raw) {
@@ -81,7 +139,7 @@ function parseWialonIPS(raw) {
         }
       }
       const odometro = parsedParams['odometer'] ?? parsedParams['odo'] ?? parsedParams['mileage'] ?? null;
-      const hdopVal = parsedParams['hdop'] ?? null;
+      const hdopVal  = parsedParams['hdop'] ?? null;
 
       function nmea2dec(raw, hem) {
         const v = parseFloat(raw);
@@ -97,11 +155,11 @@ function parseWialonIPS(raw) {
       const lon = nmea2dec(lonRaw, lonHem);
       if (isNaN(lat) || isNaN(lon)) return null;
 
-      const inputsVal = inputs && inputs !== 'NA' ? parseInt(inputs, 10) : 0;
+      const inputsVal          = inputs && inputs !== 'NA' ? parseInt(inputs, 10) : 0;
       const ignitionFromInputs = !!(inputsVal & 1);
-       // Fallback: si inputs no reporta ignición pero hay velocidad > 0, inferir encendido
-      const speedVal = parseFloat(speed) || 0;
-      const ignition = ignitionFromInputs || speedVal > 0;
+      // Fallback: si inputs no reporta ignición pero hay velocidad > 0, inferir encendido
+      const speedVal  = parseFloat(speed) || 0;
+      const ignition  = ignitionFromInputs || speedVal > 0;
 
       let wialon_ts = null;
       try {
@@ -112,7 +170,7 @@ function parseWialonIPS(raw) {
         }
       } catch (_) {}
 
-     return {
+      return {
         type:      'data',
         lat:       parseFloat(lat.toFixed(6)),
         lon:       parseFloat(lon.toFixed(6)),
@@ -121,10 +179,10 @@ function parseWialonIPS(raw) {
         alt:       parseFloat(alt    || '0'),
         sats:      parseInt(sats     || '0', 10),
         ignition,
-        odometro,        // ← NUEVO
-        hdop: hdopVal,   // ← NUEVO
+        odometro,
+        hdop: hdopVal,
         wialon_ts,
-        raw:       str,
+        raw: str,
       };
     }
 
@@ -164,7 +222,6 @@ function parseRetranslatorPacket(buf) {
       offset += blockSize;
       if (blockSize < 1) continue;
 
-      // Leer sub-bloque: [1B stealth] [1B dataType] [name\0] [value]
       let bOff = 0;
       bOff += 1; // stealth attribute
       const dataType = blockData[bOff]; bOff += 1;
@@ -173,16 +230,16 @@ function parseRetranslatorPacket(buf) {
       const blockName = blockData.slice(bOff, nameNull).toString('ascii');
       bOff = nameNull + 1;
 
-     if (blockName === 'posinfo' && dataType === 0x02) {
-  if (bOff + 27 <= blockData.length) {
-    lon      = blockData.readDoubleLE(bOff); bOff += 8;
-    lat      = blockData.readDoubleLE(bOff); bOff += 8;
-    altitude = blockData.readDoubleLE(bOff); bOff += 8;
-    speed    = blockData.readInt16BE(bOff);  bOff += 2;
-    heading  = blockData.readInt16BE(bOff);  bOff += 2;
-    sats     = blockData[bOff]; bOff += 1;
-  } else { break; }
-} else if (blockName === 'avl_inputs' && dataType === 0x03) {
+      if (blockName === 'posinfo' && dataType === 0x02) {
+        if (bOff + 27 <= blockData.length) {
+          lon      = blockData.readDoubleLE(bOff); bOff += 8;
+          lat      = blockData.readDoubleLE(bOff); bOff += 8;
+          altitude = blockData.readDoubleLE(bOff); bOff += 8;
+          speed    = blockData.readInt16BE(bOff);  bOff += 2;
+          heading  = blockData.readInt16BE(bOff);  bOff += 2;
+          sats     = blockData[bOff]; bOff += 1;
+        } else { break; }
+      } else if (blockName === 'avl_inputs' && dataType === 0x03) {
         if (bOff + 4 <= blockData.length) {
           const inputs = blockData.readUInt32BE(bOff);
           ignition = (inputs & 0x01) === 1;
@@ -219,7 +276,6 @@ function parseRetranslatorPacket(buf) {
 async function findUnit(imei) {
   const cached = cacheGet(_unitCache, imei);
   if (cached !== undefined) return cached;
-
   const { rows } = await query(
     'SELECT imei, plate, name, rut, enabled, cliente_id FROM public.units WHERE imei = $1',
     [imei]
@@ -254,52 +310,30 @@ async function saveEvent(unit, parsed, destinationId, forwardOk, forwardResp) {
 // ─── Headers de autenticación ─────────────────────────────────────────────────
 function buildAuthHeaders(auth) {
   if (!auth || !auth.type || auth.type === 'none') return {};
-
-  // ── Tipos clásicos (retrocompatibilidad) ──────────────────────────────────
-  if (auth.type === 'bearer') {
-    return { Authorization: `Bearer ${auth.token}` };
-  }
+  if (auth.type === 'bearer') return { Authorization: `Bearer ${auth.token}` };
   if (auth.type === 'basic') {
     const b64 = Buffer.from(`${auth.username}:${auth.password}`).toString('base64');
     return { Authorization: `Basic ${b64}` };
   }
-  if (auth.type === 'bearer+basic') {
-    return { Authorization: `Bearer ${auth.token}` };
-  }
-  if (auth.type === 'apikey') {
-    return { [auth.header || 'X-Api-Key']: auth.value };
-  }
-
-  // ── custom-headers legacy (objeto con username_header/password_header) ────
+  if (auth.type === 'bearer+basic') return { Authorization: `Bearer ${auth.token}` };
+  if (auth.type === 'apikey') return { [auth.header || 'X-Api-Key']: auth.value };
   if (auth.type === 'custom-headers' && !Array.isArray(auth.headers)) {
     const headers = {};
     if (auth.username_header && auth.username) headers[auth.username_header] = auth.username;
     if (auth.password_header && auth.password) headers[auth.password_header] = auth.password;
-    if (auth.token_header  && auth.token)    headers[auth.token_header]    = auth.token;
+    if (auth.token_header    && auth.token)    headers[auth.token_header]    = auth.token;
     return headers;
   }
-
-  // ── custom-headers NUEVO: array de {key, value} ───────────────────────────
-  // Cualquier combinación de headers arbitrarios configurable desde la UI
-  // Ejemplo: [{ key: "Username", value: "siguelo" }, { key: "Password", value: "xxx" }]
   if (auth.type === 'custom-headers' && Array.isArray(auth.headers)) {
     const headers = {};
     for (const h of auth.headers) {
-      if (h.key && h.value !== undefined && h.value !== '') {
-        headers[h.key] = h.value;
-      }
+      if (h.key && h.value !== undefined && h.value !== '') headers[h.key] = h.value;
     }
     return headers;
   }
-
   return {};
 }
 
-/**
- * Agrega credenciales al body del payload según el tipo de auth.
- * - basic-in-body: username/password van dentro del JSON (no en header)
- * - bearer+basic:  Bearer en header + username/password en body
- */
 function injectAuthInBody(auth, payloadArray) {
   if (!auth) return payloadArray;
   const inject = {};
@@ -315,33 +349,23 @@ function injectAuthInBody(auth, payloadArray) {
   return payloadArray.map(item => ({ ...inject, ...item }));
 }
 
-
 // ── Cargador de drivers externos ─────────────────────────────────────────────
 const _driverCache = {};
-
 function loadDriver(slug) {
   if (_driverCache[slug]) return _driverCache[slug];
   const candidates = [
     require.resolve ? (() => { try { return require('./drivers/' + slug); } catch(_) { return null; } })() : null,
   ];
   const driver = candidates.find(Boolean);
-  if (!driver) {
-    console.warn(`[TCP] Driver "${slug}" no encontrado en ./drivers/`);
-    return null;
-  }
+  if (!driver) { console.warn(`[TCP] Driver "${slug}" no encontrado en ./drivers/`); return null; }
   _driverCache[slug] = driver;
   console.log(`[TCP] Driver "${slug}" cargado`);
   return driver;
 }
 
-// ─── Construir payload dinámico desde field_schema ────────────────────────────
-/**
- * Resuelve el valor de cada campo GPS según su "source" configurado en la modal.
- *
- * Las fuentes disponibles coinciden con las opciones en orgs.js GPS_SOURCES:
- *   plate, imei, lat, lon, speed, heading, ignition, ignition01,
- *   wialon_ts, fecha_hora, fecha_slash, alt, sats, hdop, odometro
- */
+// ─── resolveSource ────────────────────────────────────────────────────────────
+// NOTA: puede devolver una Promise para el case 'address'.
+// buildPayload() lo awaita automáticamente.
 function resolveSource(source, unit, parsed, clienteData) {
   const pad = n => String(n).padStart(2, '0');
   function toFecha(iso, sep) {
@@ -353,46 +377,38 @@ function resolveSource(source, unit, parsed, clienteData) {
   }
 
   switch (source) {
-    // ── Datos GPS (del dispositivo) ──────────────────────────────────────────
-    case 'lat':            return parsed.lat       ?? 0;
-    case 'lon':            return parsed.lon       ?? 0;
-    case 'speed':          return parsed.speed     ?? 0;
-    case 'heading':        return parsed.heading   ?? 0;
-    case 'ignition':       return parsed.ignition  ?? false;
-    case 'ignition01':     return parsed.ignition  ? 1 : 0;
+    case 'lat':        return parsed.lat      ?? 0;
+    case 'lon':        return parsed.lon      ?? 0;
+    case 'speed':      return parsed.speed    ?? 0;
+    case 'heading':    return parsed.heading  ?? 0;
+    case 'ignition':   return parsed.ignition ?? false;
+    case 'ignition01': return parsed.ignition ? 1 : 0;
     case 'skynav_evento': {
-      // 41 = Ignición ON + Movimiento
-      // 42 = Ignición OFF + Detenido
-      // 51 = Ignición ON + Detenido
-      // 52 = Ignición OFF + Movimiento
       const ign    = parsed.ignition === true || parsed.ignition === 1;
       const moving = Number(parsed.speed || 0) > 0;
-      if (moving)  return ign ? 41 : 52;
+      if (moving) return ign ? 41 : 52;
       return ign ? 51 : 42;
     }
-    case 'wialon_ts':      return parsed.wialon_ts || new Date().toISOString();
-    case 'fecha_hora':     return toFecha(parsed.wialon_ts, '-');
-    case 'fecha_slash':    return toFecha(parsed.wialon_ts, '/');
+    case 'wialon_ts':   return parsed.wialon_ts || new Date().toISOString();
+    case 'fecha_hora':  return toFecha(parsed.wialon_ts, '-');
+    case 'fecha_slash': return toFecha(parsed.wialon_ts, '/');
     case 'fecha_chile': {
-      // Fecha/hora local Chile (America/Santiago): "DD-MM-YYYY HH:MM:SS"
       const iso = parsed.wialon_ts || new Date().toISOString();
       try {
-        const d   = new Date(new Date(iso).toLocaleString('en-US', { timeZone: 'America/Santiago' }));
-        const p   = n => String(n).padStart(2, '0');
+        const d = new Date(new Date(iso).toLocaleString('en-US', { timeZone: 'America/Santiago' }));
+        const p = n => String(n).padStart(2, '0');
         return `${p(d.getDate())}-${p(d.getMonth()+1)}-${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
       } catch (_) { return iso; }
     }
     case 'fecha_chile_iso': {
-      // Fecha/hora local Chile ISO: "YYYY-MM-DD HH:MM:SS"
       const iso = parsed.wialon_ts || new Date().toISOString();
       try {
-        const d   = new Date(new Date(iso).toLocaleString('en-US', { timeZone: 'America/Santiago' }));
-        const p   = n => String(n).padStart(2, '0');
+        const d = new Date(new Date(iso).toLocaleString('en-US', { timeZone: 'America/Santiago' }));
+        const p = n => String(n).padStart(2, '0');
         return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
       } catch (_) { return iso; }
     }
     case 'fecha_utc_off': {
-      // Formato: "YYYY-MM-DD HH:MM:SS +00:00" (UTC con offset explícito)
       const iso = parsed.wialon_ts || new Date().toISOString();
       const d   = new Date(iso);
       if (isNaN(d)) return iso;
@@ -400,30 +416,7 @@ function resolveSource(source, unit, parsed, clienteData) {
       return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ` +
              `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} +00:00`;
     }
-    case 'fecha_chile': {
-      // Hora local de Chile (America/Santiago) — corrige UTC a zona horaria chilena
-      const iso = parsed.wialon_ts || new Date().toISOString();
-      const d   = new Date(iso);
-      if (isNaN(d)) return iso;
-      try {
-        const loc = new Date(d.toLocaleString('en-US', { timeZone: 'America/Santiago' }));
-        const p   = n => String(n).padStart(2, '0');
-        return `${loc.getFullYear()}-${p(loc.getMonth()+1)}-${p(loc.getDate())} ` +
-               `${p(loc.getHours())}:${p(loc.getMinutes())}:${p(loc.getSeconds())}`;
-      } catch (_) {
-        // Fallback manual: UTC-3
-        const loc = new Date(d.getTime() - 3 * 3600 * 1000);
-        const p   = n => String(n).padStart(2, '0');
-        return `${loc.getUTCFullYear()}-${p(loc.getUTCMonth()+1)}-${p(loc.getUTCDate())} ` +
-               `${p(loc.getUTCHours())}:${p(loc.getUTCMinutes())}:${p(loc.getUTCSeconds())}`;
-      }
-    }
-    case 'alt':            return parsed.alt       ?? 0;
-    case 'sats':           return parsed.sats      ?? 0;
-    case 'hdop':           return parsed.hdop      ?? 0;
-    case 'odometro':       return parsed.odometro  ?? 0;
     case 'fecha_gmt': {
-      // Formato OWL/Codelco: "YYYY-MM-DD HH:MM:SS GMT"
       const iso = parsed.wialon_ts || new Date().toISOString();
       const d   = new Date(iso);
       if (isNaN(d)) return iso;
@@ -431,115 +424,73 @@ function resolveSource(source, unit, parsed, clienteData) {
       return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ` +
              `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} GMT`;
     }
-    case 'numero_actividad': {
-      // ID único por evento: timestamp_ms + últimos 6 dígitos del IMEI
-      const ts         = parsed.wialon_ts ? new Date(parsed.wialon_ts).getTime() : Date.now();
-      const imeiSuffix = String(unit.imei || '000000').slice(-6);
-      return Number(`${ts}${imeiSuffix}`) || ts;
-    }
-    case 'sitrack_evento': {
-      // Codificación Sitrack Blue Express:
-      // 163 = Ignition ON, 164 = Ignition OFF, 2 = Reporte por tiempo
-      const ign = parsed.ignition === true || parsed.ignition === 1;
-      return ign ? 163 : 164;
-    }
-    case 'timezone_chile':
-      // Timezone fijo para APIs que lo requieren como campo
-      return 'America/Santiago';
     case 'wialon_ts_offset': {
-      // Formato MovUP/ALTO: "YYYY-MM-DDTHH:MM:SS-0400" (Chile UTC-4 con offset explícito)
       const iso = parsed.wialon_ts || new Date().toISOString();
       try {
         const d   = new Date(new Date(iso).toLocaleString('en-US', { timeZone: 'America/Santiago' }));
         const utc = new Date(iso);
-        const off = Math.round((d - utc) / 3600000); // offset en horas
-        const sign = off >= 0 ? '+' : '-';
+        const off = Math.round((d - utc) / 3600000);
+        const sign   = off >= 0 ? '+' : '-';
         const absOff = String(Math.abs(off)).padStart(2, '0');
         const p = n => String(n).padStart(2, '0');
         return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}` +
                `T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}${sign}${absOff}00`;
       } catch (_) {
-        // Fallback UTC-4
         const d = new Date(new Date(iso).getTime() - 4 * 3600 * 1000);
         const p = n => String(n).padStart(2, '0');
         return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())}` +
                `T${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}-0400`;
       }
     }
-    case 'fecha_gmt': {
-      // Formato OWL/Codelco: "YYYY-MM-DD HH:MM:SS GMT"
-      const iso = parsed.wialon_ts || new Date().toISOString();
-      const d   = new Date(iso);
-      if (isNaN(d)) return iso;
-      const p = n => String(n).padStart(2, '0');
-      return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ` +
-             `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} GMT`;
-    }
+    case 'alt':        return parsed.alt      ?? 0;
+    case 'sats':       return parsed.sats     ?? 0;
+    case 'hdop':       return parsed.hdop     ?? 0;
+    case 'odometro':   return parsed.odometro ?? 0;
     case 'numero_actividad': {
-      // ID único por evento: timestamp_ms + últimos 6 dígitos del IMEI
-      const ts    = parsed.wialon_ts ? new Date(parsed.wialon_ts).getTime() : Date.now();
+      const ts         = parsed.wialon_ts ? new Date(parsed.wialon_ts).getTime() : Date.now();
       const imeiSuffix = String(unit.imei || '000000').slice(-6);
       return Number(`${ts}${imeiSuffix}`) || ts;
     }
     case 'sitrack_evento': {
-      // Codificación Sitrack Blue Express:
-      // 163 = Ignition ON
-      // 164 = Ignition OFF
-      //   2 = Reporte por tiempo (normal)
       const ign = parsed.ignition === true || parsed.ignition === 1;
       return ign ? 163 : 164;
     }
-
-      case 'unix_timestamp_ms': {
-      // Epoch milisegundos UTC (para REDD Hub y similares)
-      const iso = parsed.wialon_ts || new Date().toISOString();
-      return new Date(iso).getTime();
+    case 'timezone_chile': return 'America/Santiago';
+    case 'unix_timestamp_ms': {
+      return new Date(parsed.wialon_ts || new Date().toISOString()).getTime();
     }
-      case 'unix_timestamp': {
-  // Epoch segundos UTC (para Mitgra y similares)
-  const iso = parsed.wialon_ts || new Date().toISOString();
-  return Math.floor(new Date(iso).getTime() / 1000);
+    case 'unix_timestamp': {
+      return Math.floor(new Date(parsed.wialon_ts || new Date().toISOString()).getTime() / 1000);
     }
 
-    // ── Datos de la unidad (de la DB) ────────────────────────────────────────
-    case 'unit_plate':     return unit.plate || '';
+    // ── NUEVO: dirección física (reverse geocoding) ────────────────────────
+    case 'address':
+      return getReverseGeocode(parsed.lat, parsed.lon); // devuelve Promise<string|null>
+
+    case 'unit_plate': return unit.plate || '';
     case 'unit_plate_guion': {
-      // Formatea la patente con guiones: ABCD12 → AB-CD-12
       const p = (unit.plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
       if (p.length === 6) return `${p.slice(0,2)}-${p.slice(2,4)}-${p.slice(4,6)}`;
       if (p.length === 5) return `${p.slice(0,2)}-${p.slice(2,4)}-${p.slice(4,5)}`;
-      return p; // si no tiene 6 chars, devolver sin formato
+      return p;
     }
     case 'unit_imei':      return unit.imei        || '';
     case 'unit_name':      return unit.name        || '';
     case 'unit_rut':       return unit.rut         || '';
-    case 'cliente_nombre': return clienteData?.nombre || unit.name  || null;
-    case 'cliente_rut':    return clienteData?.rut    || unit.rut   || null;
-
-    // ── Retrocompatibilidad con fuentes antiguas ─────────────────────────────
+    case 'cliente_nombre': return clienteData?.nombre || unit.name || null;
+    case 'cliente_rut':    return clienteData?.rut    || unit.rut  || null;
     case 'plate':          return unit.plate || '';
     case 'imei':           return unit.imei  || '';
-
     default:               return null;
   }
 }
 
-/**
- * Construye el payload para un destino a partir de su field_schema.
- *
- * Si el destino tiene campos con "source" configurado → payload mapeado.
- * Si todos los campos tienen source vacío o no hay campos → payload genérico.
- *
- * El resultado siempre es un ARRAY (como requieren la mayoría de APIs GPS).
- * Si el destino necesita un objeto en vez de array, se puede configurar
- * agregando un campo especial con apiKey="__format__" y source="object".
- */
-function buildPayload(fieldSchema, unit, parsed, clienteData) {
+// ─── buildPayload — ahora async para poder await campos como 'address' ────────
+async function buildPayload(fieldSchema, unit, parsed, clienteData) {
   const fields = (fieldSchema || [])
     .filter(f => f.apiKey && (f.source || f.source === 'fixed'))
     .sort((a, b) => (a.order || 0) - (b.order || 0));
 
-  // Sin campos mapeados → payload genérico (retrocompatibilidad)
   if (!fields.length) {
     return {
       payload: [{
@@ -552,35 +503,29 @@ function buildPayload(fieldSchema, unit, parsed, clienteData) {
         ignition: parsed.ignition,
         ts:       parsed.wialon_ts,
       }],
-      missing: [],    // sin campos requeridos faltantes
-      warnings: [],
+      missing: [], warnings: [],
     };
   }
 
-  const obj      = {};
-  const missing  = [];   // campos required sin valor
-  const warnings = [];   // campos opcionales sin valor
+  const obj = {}, missing = [], warnings = [];
 
   for (const f of fields) {
     let val;
-
     if (f.source === 'fixed') {
       val = (f.fixedValue !== undefined && f.fixedValue !== null && f.fixedValue !== '')
-        ? f.fixedValue
-        : null;
+        ? f.fixedValue : null;
     } else {
-      val = resolveSource(f.source, unit, parsed, clienteData);
+      const resolved = resolveSource(f.source, unit, parsed, clienteData);
+      // Await si es Promise (ej: 'address' llama a getReverseGeocode)
+      val = (resolved instanceof Promise) ? await resolved : resolved;
     }
 
-    // Valor nulo o string vacío → campo sin datos
     const isEmpty = val === null || val === undefined || val === '';
-
     if (isEmpty) {
       if (f.required) {
         missing.push({ apiKey: f.apiKey, source: f.source, label: f.label });
       } else {
         warnings.push({ apiKey: f.apiKey, source: f.source });
-        // Incluir igual con null para que el destino decida qué hacer
         obj[f.apiKey] = null;
       }
     } else {
@@ -593,8 +538,6 @@ function buildPayload(fieldSchema, unit, parsed, clienteData) {
 
 // ─── Reenviar a destinos ──────────────────────────────────────────────────────
 async function forwardToDestinations(unit, parsed) {
-  // Leer destinos asignados CON su field_schema y auth
-  // Cargar datos del cliente de la unidad (para fuentes cliente_nombre, cliente_rut)
   let clienteData = {};
   try {
     if (unit.cliente_id) {
@@ -611,7 +554,6 @@ async function forwardToDestinations(unit, parsed) {
     }
   } catch (_) {}
 
-  // Caché de destinos por IMEI — se invalida cada 2 minutos
   let assignments_rows = cacheGet(_destCache, unit.imei);
   if (assignments_rows === undefined) {
     const { rows: freshRows } = await query(`
@@ -646,20 +588,16 @@ async function forwardToDestinations(unit, parsed) {
   }
 
   for (const row of assignments) {
-    // ── Shadow: registrar sin enviar ─────────────────────────────────────────
     if (row.shadow) {
       console.log(`[TCP] ${unit.plate} → ${row.dest_name} [SHADOW]`);
       await saveEvent(unit, parsed, row.dest_id, null, 'shadow');
       continue;
     }
 
-    // ── Driver externo: si el destino tiene driver_slug, delegar ─────────────
     if (row.driver_slug) {
-      // Filtrar coordenadas 0,0 también para drivers
-      // Agregar ANTES del filtro de coordenadas 0,0
-if (parsed.lat === 0 && parsed.lon === 0) {
-  console.warn(`[TCP] ${unit.plate} COORDS_DEBUG | lat=${parsed.lat} lon=${parsed.lon} speed=${parsed.speed} heading=${parsed.heading} alt=${parsed.alt} sats=${parsed.sats} wialon_ts=${parsed.wialon_ts} raw=${parsed.raw || 'none'}`);
-}
+      if (parsed.lat === 0 && parsed.lon === 0) {
+        console.warn(`[TCP] ${unit.plate} COORDS_DEBUG | lat=${parsed.lat} lon=${parsed.lon} speed=${parsed.speed} heading=${parsed.heading} alt=${parsed.alt} sats=${parsed.sats} wialon_ts=${parsed.wialon_ts} raw=${parsed.raw || 'none'}`);
+      }
       if (parsed.lat === 0 && parsed.lon === 0) {
         console.warn(`[TCP] ${unit.plate} → ${row.dest_name} ⚠ coordenadas 0,0 — paquete descartado`);
         await saveEvent(unit, parsed, row.dest_id, false, 'invalid_coords_0_0');
@@ -679,32 +617,21 @@ if (parsed.lat === 0 && parsed.lon === 0) {
           alt:        parsed.alt   || 0,
           ignition:   parsed.ignition,
           engineOn:   parsed.ignition,
-          odometro:   parsed.odometro ?? 0,   // ← NUEVO
-          hdop:       parsed.hdop     ?? 0,   // ← NUEVO
-          sats:       parsed.sats     ?? 0,   // ← NUEVO
+          odometro:   parsed.odometro ?? 0,
+          hdop:       parsed.hdop     ?? 0,
+          sats:       parsed.sats     ?? 0,
           wialon_ts:  parsed.wialon_ts,
           time_epoch: parsed.wialon_ts
             ? Math.floor(new Date(parsed.wialon_ts).getTime() / 1000)
             : Math.floor(Date.now() / 1000),
         };
-        const driverUnit = {
-          imei:   unit.imei,
-          plate:  unit.plate,
-          name:   unit.name,
-          rut:    unit.rut,
-        };
-        // Parsear field_schema — puede llegar como string JSON o array
+        const driverUnit = { imei: unit.imei, plate: unit.plate, name: unit.name, rut: unit.rut };
+
         let driverFieldSchema = [];
-        try {
-          driverFieldSchema = typeof row.field_schema === 'string'
-            ? JSON.parse(row.field_schema)
-            : (row.field_schema || []);
-        } catch (_) {}
-        // Parsear auth del destino para pasarlo al driver
+        try { driverFieldSchema = typeof row.field_schema === 'string' ? JSON.parse(row.field_schema) : (row.field_schema || []); } catch (_) {}
         let driverAuth = null;
-        try {
-          driverAuth = typeof row.auth === 'string' ? JSON.parse(row.auth) : row.auth;
-        } catch (_) {}
+        try { driverAuth = typeof row.auth === 'string' ? JSON.parse(row.auth) : row.auth; } catch (_) {}
+
         const driverRoute = { destination_id: row.dest_id, url: row.api_url, field_schema: driverFieldSchema, auth: driverAuth };
 
         console.log(`[TCP] ${unit.plate} → ${row.dest_name} [driver:${row.driver_slug}]`);
@@ -713,30 +640,23 @@ if (parsed.lat === 0 && parsed.lon === 0) {
         forwardOk   = result.ok === true;
         forwardResp = `${result.http_status || 0} ${result.status || ''} ${result.response_http || ''}`.trim().slice(0, 500);
 
-        if (forwardOk) {
-          console.log(`[TCP] ${unit.plate} → ${row.dest_name} ✓ (${result.http_status})`);
-        } else {
-          console.error(`[TCP] ${unit.plate} → ${row.dest_name} ✗ (${result.http_status}) ${result.response_http?.slice(0,150) || ''}`);
-        }
+        if (forwardOk) console.log(`[TCP] ${unit.plate} → ${row.dest_name} ✓ (${result.http_status})`);
+        else console.error(`[TCP] ${unit.plate} → ${row.dest_name} ✗ (${result.http_status}) ${result.response_http?.slice(0,150) || ''}`);
+
       } catch (err) {
         forwardResp = err.message?.slice(0, 500) || 'driver_error';
         console.error(`[TCP] ${unit.plate} → ${row.dest_name} driver error:`, err.message);
       }
       await saveEvent(unit, parsed, row.dest_id, forwardOk, forwardResp);
-      continue; // saltar el flow genérico de field_schema
+      continue;
     }
 
-    // ── Construir payload usando field_schema del destino ────────────────────
     let fieldSchema = [];
-    try {
-      fieldSchema = typeof row.field_schema === 'string'
-        ? JSON.parse(row.field_schema)
-        : (row.field_schema || []);
-    } catch (_) {}
+    try { fieldSchema = typeof row.field_schema === 'string' ? JSON.parse(row.field_schema) : (row.field_schema || []); } catch (_) {}
 
-    const { payload: payloadArray, missing, warnings } = buildPayload(fieldSchema, unit, parsed, clienteData);
+    // buildPayload ahora es async (para resolver 'address')
+    const { payload: payloadArray, missing, warnings } = await buildPayload(fieldSchema, unit, parsed, clienteData);
 
-    // ── Campos requeridos faltantes → no enviar ───────────────────────────────
     if (missing.length > 0) {
       const faltantes = missing.map(f => `${f.apiKey}(${f.source})`).join(', ');
       const errMsg    = `CAMPOS_FALTANTES: ${faltantes}`;
@@ -745,42 +665,30 @@ if (parsed.lat === 0 && parsed.lon === 0) {
       continue;
     }
 
-    // ── Coordenadas inválidas (0,0) → skip ──────────────────────────────────
     if (parsed.lat === 0 && parsed.lon === 0) {
       console.warn(`[TCP] ${unit.plate} → ${row.dest_name} ⚠ coordenadas 0,0 — paquete descartado`);
       await saveEvent(unit, parsed, row.dest_id, false, 'invalid_coords_0_0');
       continue;
     }
 
-    // ── Advertencias de campos opcionales vacíos ─────────────────────────────
     if (warnings.length > 0) {
-      const warnFields = warnings.map(f => f.apiKey).join(', ');
-      console.warn(`[TCP] ${unit.plate} → ${row.dest_name} ⚠ campos opcionales vacíos: ${warnFields}`);
+      console.warn(`[TCP] ${unit.plate} → ${row.dest_name} ⚠ campos opcionales vacíos: ${warnings.map(f => f.apiKey).join(', ')}`);
     }
 
-    // ── Auth headers ─────────────────────────────────────────────────────────
     let auth = null;
-    try {
-      auth = typeof row.auth === 'string' ? JSON.parse(row.auth) : row.auth;
-    } catch (_) {}
+    try { auth = typeof row.auth === 'string' ? JSON.parse(row.auth) : row.auth; } catch (_) {}
     const authHeaders = buildAuthHeaders(auth);
 
-
-    // Loguear modo
     const mappedFields = fieldSchema.filter(f => f.source).length;
     const mode = mappedFields > 0 ? `mapeo(${mappedFields} campos)` : 'genérico';
     console.log(`[TCP] ${unit.plate} → ${row.dest_name} [${mode}]`);
 
-    // ── Log de diagnóstico ───────────────────────────────────────────────────
     if (process.env.DEBUG_AUTH) {
       console.log(`[AUTH-DEBUG] ${row.dest_name} | type=${auth?.type} | token_len=${auth?.token?.length} | token_end=${auth?.token?.slice(-8)}`);
       console.log(`[PAYLOAD-DEBUG] ${unit.plate} | url=${row.api_url} | body=${JSON.stringify(payloadArray).slice(0,300)}`);
     }
 
-    // ── Enviar ───────────────────────────────────────────────────────────────
     let forwardOk = false, forwardResp = null;
-
-    // Inyectar credenciales en el body si el tipo de auth lo requiere
     const finalBody = injectAuthInBody(auth, payloadArray);
 
     try {
@@ -791,40 +699,21 @@ if (parsed.lat === 0 && parsed.lon === 0) {
         signal:  AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
       });
       forwardOk   = res.ok;
-      const respBody = await res.text().catch(()=>'');
-      // Guardar: "STATUS | body_json" para que el validador pueda ver la respuesta completa
+      const respBody = await res.text().catch(() => '');
       forwardResp = `${res.status} | ${respBody}`.slice(0, 500);
-      if (!forwardOk) {
-        console.error(`[TCP] ${unit.plate} → ${row.dest_name} ✗ (${res.status}) body: ${respBody.slice(0,200)}`);
-      } else {
-        console.log(`[TCP] ${unit.plate} → ${row.dest_name} ✓ (${res.status})`);
-      }
+      if (!forwardOk) console.error(`[TCP] ${unit.plate} → ${row.dest_name} ✗ (${res.status}) body: ${respBody.slice(0,200)}`);
+      else            console.log(`[TCP] ${unit.plate} → ${row.dest_name} ✓ (${res.status})`);
     } catch (err) {
       forwardResp = err.message?.slice(0, 500) || 'error';
       console.error(`[TCP] ${unit.plate} → ${row.dest_name} error:`, err.message);
     }
-
     await saveEvent(unit, parsed, row.dest_id, forwardOk, forwardResp);
   }
 }
 
 // ─── Buffer FIFO por IMEI — ordena eventos antes de reenviar ─────────────────
-/**
- * Solo activo cuando se detectan eventos fuera de orden.
- * Si los eventos llegan en orden, se despachan inmediatamente sin latencia.
- *
- * Lógica:
- *  1. Al recibir un evento, comparar su wialon_ts con el último ts visto para ese IMEI.
- *  2. Si llega EN ORDEN → despachar inmediatamente (sin buffer).
- *  3. Si llega FUERA DE ORDEN → activar buffer para ese IMEI durante BUFFER_WINDOW_MS.
- *     Todos los eventos del IMEI se acumulan en el buffer y se ordenan al vencer la ventana.
- *  4. Al vencer la ventana → ordenar por wialon_ts y despachar en orden.
- */
-
-const BUFFER_WINDOW_MS = 3000; // 3 segundos
-
-// Map<imei, { events: [], timer: Timeout, lastTs: number }>
-const _fifoBuffers = new Map();
+const BUFFER_WINDOW_MS = 3000;
+const _fifoBuffers     = new Map();
 
 function _tsMs(wialon_ts) {
   if (!wialon_ts) return Date.now();
@@ -836,49 +725,33 @@ async function _flushBuffer(imei) {
   const buf = _fifoBuffers.get(imei);
   if (!buf) return;
   _fifoBuffers.delete(imei);
-
-  // Ordenar por timestamp GPS ascendente
   buf.events.sort((a, b) => _tsMs(a.parsed.wialon_ts) - _tsMs(b.parsed.wialon_ts));
   console.log(`[FIFO] ${imei} — flush ${buf.events.length} eventos ordenados`);
-
-  for (const { unit, parsed } of buf.events) {
-    await forwardToDestinations(unit, parsed);
-  }
+  for (const { unit, parsed } of buf.events) await forwardToDestinations(unit, parsed);
 }
 
 async function enqueueEvent(unit, parsed) {
-  const imei  = unit.imei;
-  const tsMs  = _tsMs(parsed.wialon_ts);
-  const buf   = _fifoBuffers.get(imei);
+  const imei = unit.imei;
+  const tsMs = _tsMs(parsed.wialon_ts);
+  const buf  = _fifoBuffers.get(imei);
 
-  // Sin buffer activo — verificar si el evento llega en orden
   if (!buf) {
-    // Primer evento de este IMEI o llegó en orden → despachar inmediatamente
-    // Guardar el ts para comparar el siguiente
     _fifoBuffers.set(imei, { lastTs: tsMs, events: null, timer: null });
     await forwardToDestinations(unit, parsed);
     return;
   }
-
-  // Buffer activo (hay acumulación en curso) → agregar al buffer
   if (buf.events) {
     buf.events.push({ unit, parsed });
-    // Reiniciar timer: esperar BUFFER_WINDOW_MS desde el último evento recibido
     clearTimeout(buf.timer);
     buf.timer = setTimeout(() => _flushBuffer(imei), BUFFER_WINDOW_MS);
     return;
   }
-
-  // No hay buffer activo pero hay lastTs → verificar orden
   if (tsMs < buf.lastTs - 1000) {
-    // Llegó fuera de orden (más de 1s antes del último) → activar buffer
     console.warn(`[FIFO] ${imei} evento fuera de orden (ts=${new Date(tsMs).toISOString()} < last=${new Date(buf.lastTs).toISOString()}) — activando buffer`);
     buf.events = [{ unit, parsed }];
     buf.timer  = setTimeout(() => _flushBuffer(imei), BUFFER_WINDOW_MS);
     return;
   }
-
-  // Llegó en orden → despachar inmediatamente y actualizar lastTs
   buf.lastTs = Math.max(buf.lastTs, tsMs);
   await forwardToDestinations(unit, parsed);
 }
@@ -893,7 +766,7 @@ function startTcpServer() {
   const server = net.createServer((socket) => {
     const remoteAddr = socket.remoteAddress || '?';
     let sessionImei = null;
-    let protocol    = null; // 'ips' | 'retranslator' | null
+    let protocol    = null;
     let ipsBuffer   = '';
     let rtBuffer    = Buffer.alloc(0);
 
@@ -907,10 +780,9 @@ function startTcpServer() {
     socket.on('data', async (chunk) => {
       clearTimeout(noDataTimer);
 
-      // Detectar protocolo por el primer byte
       if (protocol === null) {
         const firstByte = chunk[0];
-        if (firstByte === 0x23) { // '#'
+        if (firstByte === 0x23) {
           protocol = 'ips';
           console.log(`[TCP] Protocolo: Wialon IPS (texto) desde ${remoteAddr}`);
         } else {
@@ -919,7 +791,6 @@ function startTcpServer() {
         }
       }
 
-      // ── Wialon IPS ─────────────────────────────────────────────────────────
       if (protocol === 'ips') {
         ipsBuffer += chunk.toString('ascii');
         const lines = ipsBuffer.split('\r\n');
@@ -949,25 +820,18 @@ function startTcpServer() {
         }
       }
 
-      // ── Wialon Retranslator ─────────────────────────────────────────────────
       if (protocol === 'retranslator') {
         rtBuffer = Buffer.concat([rtBuffer, chunk]);
 
         while (rtBuffer.length >= 4) {
           const packetSize = rtBuffer.readUInt32LE(0);
           if (rtBuffer.length < packetSize + 4) break;
-
           const packetBuf = rtBuffer.slice(0, packetSize + 4);
           rtBuffer        = rtBuffer.slice(packetSize + 4);
 
           console.log(`[TCP-RT] Paquete recibido: ${packetSize + 4} bytes desde ${remoteAddr}`);
           const parsed = parseRetranslatorPacket(packetBuf);
-
-          if (!parsed) {
-            console.warn(`[TCP-RT] Paquete no parseable desde ${remoteAddr}`);
-            socket.write(Buffer.from([0x11]));
-            continue;
-          }
+          if (!parsed) { console.warn(`[TCP-RT] Paquete no parseable desde ${remoteAddr}`); socket.write(Buffer.from([0x11])); continue; }
 
           console.log(`[TCP-RT] UID: ${parsed.uid} | lat: ${parsed.lat} lon: ${parsed.lon} speed: ${parsed.speed}`);
           socket.write(Buffer.from([0x11]));
@@ -996,7 +860,6 @@ function startTcpServer() {
       clearTimeout(noDataTimer);
       console.error(`[TCP] Socket error desde ${remoteAddr}:`, err.message);
     });
-
     socket.on('close', () => {
       clearTimeout(noDataTimer);
       console.log(`[TCP] Conexión cerrada${sessionImei ? ' IMEI:' + sessionImei : ''} (${remoteAddr}) protocolo:${protocol || 'desconocido'}`);
@@ -1006,7 +869,6 @@ function startTcpServer() {
   server.listen(TCP_PORT, '0.0.0.0', () => {
     console.log(`[TCP] Servidor escuchando en puerto ${TCP_PORT} (IPS + Retranslator v1.0)`);
   });
-
   server.on('error', (err) => console.error('[TCP] Server error:', err.message));
   return server;
 }
