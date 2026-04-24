@@ -28,7 +28,7 @@
  *   TRACKTEC_EVENTO   — código de evento (default: 46)
  */
 
-const ENV_URL     = process.env.TRACKTEC_URL     || 'https://track3ws.gpschile.com/api/inyeccion';
+const ENV_URL     = process.env.TRACKTEC_URL     || 'https://wshub.tracktec.cl/ws/wspos';
 const ENV_USER    = process.env.TRACKTEC_USER    || '';
 const ENV_PASS    = process.env.TRACKTEC_PASS    || '';
 const ENV_PGPS    = process.env.TRACKTEC_PGPS    || 'SIGUELOGPS';
@@ -65,8 +65,9 @@ function toFechaChile(wialon_ts) {
 
 /* ── Leer configuración desde route ─────────────────────────── */
 function readConfig(route) {
-  let url         = route?.url ? String(route.url).replace(/\/+$/, '') : ENV_URL;
-  let bearerToken = null;   // ← nuevo: Bearer Token del header
+  // URL: prioridad → route.url (viene de api_url en la DB) → ENV
+  let url         = ENV_URL;
+  let bearerToken = null;
   let login       = ENV_USER;
   let clave       = ENV_PASS;
   let pgps        = ENV_PGPS;
@@ -74,7 +75,12 @@ function readConfig(route) {
   let empresa     = ENV_EMPRESA;
   let eve         = ENV_EVE;
 
-  // 1. Leer auth del destino (GUI → Autenticación de la API)
+  // 1. URL del destino — tcp-server la pasa como route.url (viene de api_url en DB)
+  if (route?.url && String(route.url).trim()) {
+    url = String(route.url).trim().replace(/\/+$/, '');
+  }
+
+  // 2. Leer auth del destino (GUI → Autenticación de la API)
   try {
     const auth = typeof route?.auth === 'string' ? JSON.parse(route.auth) : route?.auth;
     if (auth) {
@@ -82,7 +88,7 @@ function readConfig(route) {
       if (auth.type === 'bearer' && auth.token) {
         bearerToken = String(auth.token).trim();
       }
-      // También soportar token directo sin type
+      // Token directo sin type
       else if (auth.token && !auth.username) {
         bearerToken = String(auth.token).trim();
       }
@@ -92,7 +98,8 @@ function readConfig(route) {
     }
   } catch (_) {}
 
-  // 2. field_schema overrides (GUI → Mapeo de campos → Valor fijo)
+  // 3. field_schema overrides — solo sobreescribe si el campo está definido
+  //    (la URL normalmente NO viene en field_schema, viene de api_url del destino)
   try {
     let schema = route?.field_schema || [];
     if (typeof schema === 'string') {
@@ -105,12 +112,16 @@ function readConfig(route) {
         if (k === 'empresa'          || k === 'tracktec_empresa') empresa = f.fixedValue;
         if (k === 'pgps'             || k === 'tracktec_pgps')    pgps    = f.fixedValue;
         if (k === 'eve'              || k === 'tracktec_evento')  eve     = f.fixedValue;
-        if (k === 'tracktec_url'     || k === 'url')              url     = String(f.fixedValue).replace(/\/+$/, '');
+        // URL solo se sobreescribe si hay un campo explícito en field_schema
+        if (k === 'tracktec_url'     || k === 'url')              url     = String(f.fixedValue).trim().replace(/\/+$/, '');
         if (k === 'tracktec_login'   || k === 'login')            login   = f.fixedValue;
         if (k === 'tracktec_clave'   || k === 'clave')            clave   = f.fixedValue;
       }
     }
   } catch (_) {}
+
+  // Log de configuración resuelta (siempre visible para diagnóstico)
+  console.log(`[tracktec] config → url=${url} | pgps=${pgps} | tercero=${tercero} | empresa=${empresa} | eve=${eve} | auth=${bearerToken ? 'Bearer(***'+bearerToken.slice(-6)+')' : login ? 'Basic('+login+')' : 'NINGUNA'}`);
 
   return { url, bearerToken, login, clave, pgps, tercero, empresa, eve };
 }
