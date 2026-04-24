@@ -28,7 +28,7 @@
  *   TRACKTEC_EVENTO   — código de evento (default: 46)
  */
 
-const ENV_URL     = process.env.TRACKTEC_URL     || 'https://wshub.tracktec.cl/ws/wspos';
+const ENV_URL     = process.env.TRACKTEC_URL     || 'https://track3ws.gpschile.com/api/inyeccion';
 const ENV_USER    = process.env.TRACKTEC_USER    || '';
 const ENV_PASS    = process.env.TRACKTEC_PASS    || '';
 const ENV_PGPS    = process.env.TRACKTEC_PGPS    || 'SIGUELOGPS';
