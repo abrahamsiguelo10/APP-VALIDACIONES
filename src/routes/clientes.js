@@ -124,7 +124,7 @@ router.get('/', requireRole('admin'), async (_req, res) => {
 
       /* ── último evento: subquery con índice por imei ── */
       (
-        SELECT MAX(ge.created_at)
+        SELECT MAX(ge.received_at)
         FROM public.gps_events ge
         WHERE ge.imei IN (
           SELECT imei FROM public.units WHERE cliente_id = c.id
@@ -133,7 +133,7 @@ router.get('/', requireRole('admin'), async (_req, res) => {
 
       /* ── último reenvío exitoso ── */
       (
-        SELECT MAX(ge.created_at)
+        SELECT MAX(ge.received_at)
         FROM public.gps_events ge
         WHERE ge.forward_ok = true
           AND ge.imei IN (
@@ -180,10 +180,10 @@ router.get('/:id/units', requireRole('admin'), async (req, res) => {
 
       /* ── último evento recibido ── */
       (
-        SELECT ge.created_at
+        SELECT ge.received_at
         FROM public.gps_events ge
         WHERE ge.imei = u.imei
-        ORDER BY ge.created_at DESC
+        ORDER BY ge.received_at DESC
         LIMIT 1
       ) AS last_event_at,
 
@@ -192,16 +192,16 @@ router.get('/:id/units', requireRole('admin'), async (req, res) => {
         SELECT ge.ignition
         FROM public.gps_events ge
         WHERE ge.imei = u.imei AND ge.ignition IS NOT NULL
-        ORDER BY ge.created_at DESC
+        ORDER BY ge.received_at DESC
         LIMIT 1
       ) AS last_ignition,
 
       /* ── último reenvío exitoso ── */
       (
-        SELECT ge.created_at
+        SELECT ge.received_at
         FROM public.gps_events ge
         WHERE ge.imei = u.imei AND ge.forward_ok = true
-        ORDER BY ge.created_at DESC
+        ORDER BY ge.received_at DESC
         LIMIT 1
       ) AS last_forward_at
 
