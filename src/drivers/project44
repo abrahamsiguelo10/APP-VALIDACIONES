@@ -5,34 +5,40 @@
  * ─────────────────────────────────────────────────────────────────
  * Driver para project44 Unified Integrations API
  *
- * Endpoint: POST /services/unified-integrations/v1/connections/{id}/ingestions
- *
- * Payload esperado por p44:
- * [{
- *   owner_id:     "CLETFCRJ",          // fijo, desde field_schema
- *   device_id:    "869671077365722",   // IMEI
- *   license_plate:"BRDS55",            // patente
- *   position: {                         // ← objeto anidado (no soportado por field_schema)
- *     latitude:  -23.57342,
- *     longitude: -70.394682
- *   },
- *   timestamp:    1714123456,          // epoch segundos UTC
- *   speed:        60,
- *   direction:    180,
- *   altitude:     850,
- *   odometer:     12345.5,
- *   moving:       true,                // booleano: speed > 0 (omitir si null)
- *   ignition:     true                 // booleano (omitir si null)
- * }]
- *
+ * Throttle: máximo 1 envío cada 5 minutos por IMEI (requerimiento p44)
  * Autenticación: Basic Auth desde route.auth
- *   { type: "basic", username: "...", password: "..." }
- *
- * Configuración fija desde field_schema:
- *   owner_id → fixedValue (ej: "CLETFCRJ")
+ * owner_id: fijo desde field_schema
  */
 
+// ── Throttle: 1 envío cada 5 minutos por IMEI ────────────────────
+const THROTTLE_MS = 5 * 60 * 1000; // 5 minutos
+const _lastSent   = new Map();      // imei → timestamp último envío exitoso
+
+// Limpiar entradas antiguas cada hora para evitar memory leak
+setInterval(() => {
+  const cutoff = Date.now() - THROTTLE_MS * 2;
+  for (const [imei, ts] of _lastSent) {
+    if (ts < cutoff) _lastSent.delete(imei);
+  }
+}, 60 * 60 * 1000);
+
 async function send({ event, unit, route }) {
+  // ── Throttle: saltear si no han pasado 5 minutos ──────────────
+  const now      = Date.now();
+  const lastSent = _lastSent.get(unit.imei) || 0;
+  const elapsed  = now - lastSent;
+
+  if (elapsed < THROTTLE_MS) {
+    const remaining = Math.round((THROTTLE_MS - elapsed) / 1000);
+    console.log(`[p44] ⏱ plate=${unit.plate} throttled — faltan ${remaining}s para el próximo envío`);
+    return {
+      ok:            true,
+      http_status:   0,
+      status:        'throttled',
+      response_http: `throttled — next in ${remaining}s`,
+    };
+  }
+
   // ── Leer owner_id desde field_schema ─────────────────────────
   let owner_id = '';
   try {
@@ -51,10 +57,9 @@ async function send({ event, unit, route }) {
   // ── Construir payload ─────────────────────────────────────────
   const payload = {
     owner_id,
-    device_id:    unit.imei  || '',
-    license_plate:(unit.plate || '').toUpperCase(),
+    device_id:     unit.imei  || '',
+    license_plate: (unit.plate || '').toUpperCase(),
 
-    // Objeto anidado — esto es lo que el field_schema no puede hacer
     position: {
       latitude:  event.lat ?? 0,
       longitude: event.lon ?? event.lng ?? 0,
@@ -84,7 +89,7 @@ async function send({ event, unit, route }) {
     payload.ignition = event.ignition === true || event.ignition === 1;
   }
 
-  // ── Auth: Basic desde route.auth ──────────────────────────────
+  // ── Auth ──────────────────────────────────────────────────────
   const headers = { 'Content-Type': 'application/json' };
   try {
     const auth = typeof route?.auth === 'string' ? JSON.parse(route.auth) : route?.auth;
@@ -110,7 +115,7 @@ async function send({ event, unit, route }) {
     const res = await fetch(url, {
       method:  'POST',
       headers,
-      body:    JSON.stringify([payload]), // p44 espera un array
+      body:    JSON.stringify([payload]),
       signal:  AbortSignal.timeout(10000),
     });
 
@@ -119,6 +124,8 @@ async function send({ event, unit, route }) {
     const ok      = res.ok;
 
     if (ok) {
+      // Solo actualizar el throttle si el envío fue exitoso
+      _lastSent.set(unit.imei, Date.now());
       console.log(`[p44] ✓ plate=${payload.license_plate} (${res.status}) ${latency}ms`);
     } else {
       console.error(`[p44] ✗ plate=${payload.license_plate} http=${res.status} resp=${resText.slice(0, 200)}`);
