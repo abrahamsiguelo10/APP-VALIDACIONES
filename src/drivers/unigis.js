@@ -34,14 +34,24 @@ function esc(v) {
 function pad2(n) { return String(n).padStart(2, '0'); }
 
 /**
- * Formatea fecha en ISO 8601 compatible con xsd:dateTime:
- * "YYYY-MM-DDTHH:MM:SS" (UTC)
+ * Formatea fecha en UTC-4 (requerimiento Unigis).
+ * Resta 4 horas al timestamp UTC antes de formatear.
+ * Resultado: "YYYY-MM-DDTHH:MM:SS" en hora UTC-4.
+ *
+ * Ejemplo:
+ *   UTC  2026-04-27T14:00:00Z  →  UTC-4  2026-04-27T10:00:00
  */
-function toXsdDateTime(wialon_ts) {
+function toXsdDateTimeUTC4(wialon_ts) {
   const d = wialon_ts ? new Date(wialon_ts) : new Date();
-  if (isNaN(d)) return new Date().toISOString().slice(0, 19);
-  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth()+1)}-${pad2(d.getUTCDate())}` +
-         `T${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`;
+  if (isNaN(d)) {
+    // Fallback: hora actual menos 4 horas
+    const now = new Date(Date.now() - 4 * 3600 * 1000);
+    return now.toISOString().slice(0, 19);
+  }
+  // Restar 4 horas (UTC-4)
+  const utc4 = new Date(d.getTime() - 4 * 3600 * 1000);
+  return `${utc4.getUTCFullYear()}-${pad2(utc4.getUTCMonth()+1)}-${pad2(utc4.getUTCDate())}` +
+         `T${pad2(utc4.getUTCHours())}:${pad2(utc4.getUTCMinutes())}:${pad2(utc4.getUTCSeconds())}`;
 }
 
 // ── Construir envelope SOAP 1.1 ───────────────────────────────────
@@ -70,32 +80,22 @@ function buildEnvelope({ user, pass, dominio, nroSerie, codigo, lat, lon, alt, v
 }
 
 // ── Parsear resultado entero de la respuesta ──────────────────────
-// El WS retorna <LoginYInsertarEventoResult>int</LoginYInsertarEventoResult>
-// Valores positivos = ID del evento insertado (éxito)
-// Valores <= 0 = error
 function parseResult(xml) {
   const m = xml.match(/<LoginYInsertarEventoResult[^>]*>(-?\d+)<\/LoginYInsertarEventoResult>/i);
   return m ? parseInt(m[1], 10) : null;
 }
 
 // ── Función principal del driver ──────────────────────────────────
-/**
- * @param {object} options
- * @param {object} options.event  — datos GPS del evento
- * @param {object} options.unit   — datos de la unidad (imei, plate, ...)
- * @param {object} options.route  — datos del destino (field_schema, etc.)
- */
 async function send({ event, unit, route }) {
-  const imei    = unit.imei   || event.imei  || '';
-  const plate   = (unit.plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-  const nroSerie = plate || imei; // preferir patente, fallback a IMEI
+  const imei     = unit.imei  || event.imei || '';
+  const plate    = (unit.plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const nroSerie = plate || imei;
 
   if (!nroSerie) {
     return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing plate/imei' };
   }
 
   // Leer dominio y codigo desde field_schema si están configurados como fixed
-  // Esto permite sobreescribir las variables de entorno por destino desde la UI
   let dominio = DOMINIO;
   let codigo  = CODIGO;
   try {
@@ -108,20 +108,24 @@ async function send({ event, unit, route }) {
     }
   } catch (_) {}
 
-  const now          = new Date().toISOString();
-  const fechaEvento  = toXsdDateTime(event.wialon_ts || now);
-  const fechaRecepcion = toXsdDateTime(now);
+  const now = new Date().toISOString();
+
+  // FIX: ambas fechas en UTC-4 según requerimiento Unigis
+  const fechaEvento    = toXsdDateTimeUTC4(event.wialon_ts || now);
+  const fechaRecepcion = toXsdDateTimeUTC4(now);
+
+  console.log(`[unigis] fechaEvento=${fechaEvento} fechaRecepcion=${fechaRecepcion} (UTC-4)`);
 
   const xml = buildEnvelope({
-    user:            USER,
-    pass:            PASS,
+    user:   USER,
+    pass:   PASS,
     dominio,
     nroSerie,
     codigo,
-    lat:             event.lat      ?? 0,
-    lon:             event.lon      ?? event.lng ?? 0,
-    alt:             event.alt      ?? 0,
-    vel:             event.speed    ?? 0,
+    lat:    event.lat   ?? 0,
+    lon:    event.lon   ?? event.lng ?? 0,
+    alt:    event.alt   ?? 0,
+    vel:    event.speed ?? 0,
     fechaEvento,
     fechaRecepcion,
   });
@@ -153,7 +157,6 @@ async function send({ event, unit, route }) {
     const resultCode = parseResult(resText);
 
     if (resultCode === null) {
-      // No se pudo parsear — puede ser HTML de error o respuesta inesperada
       const looksLikeHtml = /<html/i.test(resText);
       console.error(`[unigis] Respuesta no parseable (${looksLikeHtml ? 'HTML' : 'XML inesperado'}): ${resText.slice(0, 200)}`);
       return { ok: false, http_status: httpStatus, status: 'failed', response_http: resText.slice(0, 500), latency_ms: latency };
