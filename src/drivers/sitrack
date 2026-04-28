@@ -1,0 +1,225 @@
+'use strict';
+
+/**
+ * src/drivers/sitrack.js
+ * ─────────────────────────────────────────────────────────────────
+ * Driver REST/JSON para Sitrack.io — Blue Express
+ *
+ * Endpoint: POST https://api.sitrack.io/event/flow/message
+ * Auth:     Authorization: Apikey {UUID}  ← configurado en route.auth
+ *
+ * Credenciales desde GUI → Autenticación → Custom Headers:
+ *   Key:   Authorization
+ *   Value: Apikey {UUID}  (testing: 3faa78e1ff204bd98760c8aa4d0be110)
+ *                          (prod:    el que entregue Sitrack)
+ *
+ * Ambiente desde field_schema:
+ *   message = "events.bx.gps.report.test"  (testing)
+ *   message = "events.bx.gps.report"        (producción)
+ *
+ * Particularidades:
+ *   - time: UTC+00:00 "yyyy-MM-dd HH:mm:ss"
+ *   - eventType: 2 (tiempo), 163 (ign ON), 164 (ign OFF) — integer
+ *   - rutTransporte: sin puntos ni guión con dígito verificador
+ *   - assetId: patente sin separadores
+ *   - hourmeter: float (0.0 si no disponible)
+ *   - gpsDop, gpsSpeed, odometer: float
+ *   - gpsSatellites, heading, eventType: integer
+ *   - ignition: boolean
+ */
+
+const ENDPOINT = 'https://api.sitrack.io/event/flow/message';
+
+// ── Helpers ───────────────────────────────────────────────────────
+function pad2(n) { return String(n).padStart(2, '0'); }
+
+/**
+ * Fecha UTC pura: "YYYY-MM-DD HH:MM:SS"
+ * Sitrack requiere UTC+00:00 sin zona horaria
+ */
+function toFechaUTC(iso) {
+  const d = iso ? new Date(iso) : new Date();
+  if (isNaN(d)) return new Date().toISOString().replace('T', ' ').slice(0, 19);
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth()+1)}-${pad2(d.getUTCDate())} ` +
+         `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`;
+}
+
+/**
+ * RUT limpio: "96.521.450-1" → "965214501"
+ */
+function limpiarRut(rut) {
+  return String(rut || '').replace(/\./g, '').replace(/-/g, '').trim();
+}
+
+/**
+ * Patente limpia: sin separadores, mayúsculas
+ */
+function limpiarPatente(plate) {
+  return String(plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+/**
+ * eventType según ignición y velocidad:
+ *   163 = Ignition ON
+ *   164 = Ignition OFF
+ *     2 = Reporte por tiempo (normal)
+ */
+function resolveEventType(ignition, speed) {
+  const ign     = ignition === true || ignition === 1;
+  const moving  = Number(speed || 0) > 0;
+  // Si hay movimiento → reporte normal (2)
+  // Si ignición ON sin movimiento → 163
+  // Si ignición OFF → 164
+  if (moving) return 2;
+  return ign ? 163 : 164;
+}
+
+/**
+ * Leer Authorization header desde route.auth
+ * Soporta:
+ *   - custom-headers: [{ key: "Authorization", value: "Apikey UUID" }]
+ *   - apikey:         { value: "UUID", header: "..." }
+ *   - bearer:         { token: "UUID" } → "Apikey UUID"
+ */
+function readAuthHeader(route) {
+  try {
+    const auth = typeof route?.auth === 'string' ? JSON.parse(route.auth) : route?.auth;
+    if (!auth) return null;
+
+    // Custom headers (configuración recomendada en GUI)
+    if (auth.type === 'custom-headers' && Array.isArray(auth.headers)) {
+      const authHeader = auth.headers.find(h =>
+        h.key?.toLowerCase() === 'authorization' && h.value
+      );
+      if (authHeader) return authHeader.value;
+    }
+
+    // Apikey directo
+    if (auth.type === 'apikey' && auth.value && auth.value !== '0') {
+      return `Apikey ${auth.value}`;
+    }
+
+    // Bearer usado como Apikey
+    if (auth.type === 'bearer' && auth.token) {
+      return `Apikey ${auth.token}`;
+    }
+  } catch (_) {}
+  return null;
+}
+
+/**
+ * Leer message (ambiente) desde field_schema
+ * Default: "events.bx.gps.report" (producción)
+ */
+function readMessage(route) {
+  try {
+    const schema = typeof route?.field_schema === 'string'
+      ? JSON.parse(route.field_schema)
+      : (route?.field_schema || []);
+    const f = schema.find(f => f.apiKey === 'message' && f.source === 'fixed' && f.fixedValue);
+    if (f) return f.fixedValue;
+  } catch (_) {}
+  return 'events.bx.gps.report';
+}
+
+// ── Función principal ─────────────────────────────────────────────
+async function send({ event, unit, route }) {
+  // ── Autenticación ───────────────────────────────────────────────
+  const authValue = readAuthHeader(route);
+  if (!authValue) {
+    console.error('[sitrack] ❌ Authorization no configurado — configura en GUI → Autenticación → Custom Headers → Authorization: Apikey {UUID}');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing Authorization header' };
+  }
+
+  // ── Validaciones básicas ────────────────────────────────────────
+  const plate = limpiarPatente(unit.plate);
+  if (!plate) {
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing plate' };
+  }
+
+  if (!event.lat || !event.lon || (event.lat === 0 && event.lon === 0)) {
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Invalid coords' };
+  }
+
+  // ── RUT transportista ───────────────────────────────────────────
+  // Prioridad: cliente_rut → unit.rut → vacío
+  const rutRaw     = unit.clienteRut || unit.rut || '';
+  const rutLimpio  = limpiarRut(rutRaw);
+
+  // ── Construir payload ───────────────────────────────────────────
+  const payload = {
+    message:        readMessage(route),
+    time:           toFechaUTC(event.wialon_ts),
+    eventType:      resolveEventType(event.ignition, event.speed),  // integer
+    gpsDop:         parseFloat((event.hdop   ?? 0).toFixed(1)),     // float
+    gpsSatellites:  parseInt(event.sats   ?? 0, 10),                // integer
+    gpsSpeed:       parseFloat((event.speed  ?? 0).toFixed(1)),     // float
+    heading:        parseInt(event.heading ?? 0, 10),               // integer
+    hourmeter:      parseFloat((event.hourmeter ?? 0).toFixed(2)),  // float — horas motor encendido
+    ignition:       event.ignition === true || event.ignition === 1, // boolean
+    latitude:       parseFloat((event.lat).toFixed(6)),             // float
+    longitude:      parseFloat((event.lon ?? event.lng).toFixed(6)),// float
+    odometer:       parseFloat((event.odometro ?? 0).toFixed(1)),   // float
+    rutTransporte:  rutLimpio,                                       // sin puntos ni guión
+    assetId:        plate,                                           // patente limpia
+  };
+
+  // location es opcional — incluir si hay address disponible
+  if (event.address) {
+    payload.location = String(event.address).slice(0, 200);
+  }
+
+  console.log(`[sitrack] enviando plate=${plate} rut=${rutLimpio} eventType=${payload.eventType} time=${payload.time}`);
+
+  // ── Headers ─────────────────────────────────────────────────────
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': authValue,
+  };
+
+  const url = route?.url || ENDPOINT;
+  const t0  = Date.now();
+
+  try {
+    const res = await fetch(url, {
+      method:  'POST',
+      headers,
+      body:    JSON.stringify(payload),
+      signal:  AbortSignal.timeout(10000),
+    });
+
+    const latency = Date.now() - t0;
+    const resText = await res.text().catch(() => '');
+    const ok      = res.ok;
+
+    if (ok) {
+      // Parsear triggerId de la respuesta exitosa
+      let triggerId = '';
+      try { triggerId = JSON.parse(resText)?.triggerId || ''; } catch (_) {}
+      console.log(`[sitrack] ✓ plate=${plate} triggerId=${triggerId} (${latency}ms)`);
+    } else {
+      console.error(`[sitrack] ✗ plate=${plate} http=${res.status} resp=${resText.slice(0, 200)}`);
+    }
+
+    return {
+      ok,
+      http_status:   res.status,
+      status:        ok ? 'ok' : 'failed',
+      response_http: resText.slice(0, 500),
+      latency_ms:    latency,
+    };
+
+  } catch (err) {
+    const latency = Date.now() - t0;
+    console.error(`[sitrack] Error fetch: ${err.message}`);
+    return {
+      ok:            false,
+      http_status:   0,
+      status:        'failed',
+      response_http: err.message?.slice(0, 500) || 'fetch_error',
+      latency_ms:    latency,
+    };
+  }
+}
+
+module.exports = { send };
