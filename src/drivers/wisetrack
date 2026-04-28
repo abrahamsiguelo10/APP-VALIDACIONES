@@ -5,24 +5,64 @@
  * ─────────────────────────────────────────────────────────────────
  * Driver REST/JSON para Wisetrack — InsertarPosicion
  *
- * Endpoint: POST https://gw2.wisetrack.cl/service/emsa/InsertarPosicion
- * Auth:     Authorization: Bearer TOKEN
+ * URLs por empresa (configurar en GUI → URL del destino):
+ *   Testing EMSA:     http://ei.wisetrack.cl/API/EMSA/Testing/InsertarPosicion
+ *   Producción EMSA:  https://gw2.wisetrack.cl/Emsa/1.0/InsertarPosicion
+ *   Otras empresas:   http://ei.wisetrack.cl/API/{empresa}/InsertarPosicion
  *
- * Particularidades Wisetrack:
+ * Auth → Bearer Token: token entregado por Wisetrack (desde GUI)
+ *
+ * Consideraciones técnicas del manual:
+ *   - Máximo 3 llamados por minuto (rate limiting implementado)
+ *   - Estado 4 = móvil no existe → bloquear 24 horas
+ *   - Estado 5 = duplicado → no es error
+ *   - Estado 1 = éxito
  *   - Todos los campos son STRING
- *   - Decimales con COMA (no punto): "-33,435654"
- *   - Odómetro con 2 decimales y coma: "1859,55"
- *   - Payload: { "posicion": [ {...} ] }
- *   - Máximo 300 posiciones por llamado
- *   - Máximo 3 llamados por minuto
- *
- * Credenciales desde GUI → Autenticación → Bearer Token:
- *   Token: {token entregado por Wisetrack}
- *
- * Campos opcionales desde field_schema (valor fijo):
- *   wisetrack_transportista — nombre transportista
- *   wisetrack_codigo_interno — código interno del móvil
+ *   - Latitud/Longitud: coma decimal, 8 decimales
+ *   - Odómetro: 2 decimales con coma
  */
+
+// ── Rate limiting: máx 3 llamados/minuto por URL ──────────────────
+const _callTimes = new Map(); // url → [timestamps]
+
+function checkRateLimit(url) {
+  const now  = Date.now();
+  const key  = url;
+  const times = (_callTimes.get(key) || []).filter(t => now - t < 60000);
+  if (times.length >= 3) {
+    const waitMs = 60000 - (now - times[0]);
+    console.warn(`[wisetrack] ⚠ rate limit — 3 llamados/min alcanzado, esperar ${Math.ceil(waitMs/1000)}s`);
+    return false;
+  }
+  times.push(now);
+  _callTimes.set(key, times);
+  return true;
+}
+
+// ── Bloqueo 24h para móviles inexistentes (Estado 4) ─────────────
+const _blockedPlates = new Map(); // plate → unblockAt timestamp
+
+function isBlocked(plate) {
+  const unblockAt = _blockedPlates.get(plate);
+  if (!unblockAt) return false;
+  if (Date.now() > unblockAt) { _blockedPlates.delete(plate); return false; }
+  const horas = Math.ceil((unblockAt - Date.now()) / 3600000);
+  console.warn(`[wisetrack] ⛔ plate=${plate} bloqueada 24h por Estado 4 — faltan ~${horas}h`);
+  return true;
+}
+
+function blockPlate(plate) {
+  _blockedPlates.set(plate, Date.now() + 24 * 3600 * 1000);
+  console.warn(`[wisetrack] ⛔ plate=${plate} bloqueada 24h — móvil no existe en Wisetrack`);
+}
+
+// Limpiar bloqueos expirados cada hora
+setInterval(() => {
+  const now = Date.now();
+  for (const [plate, ts] of _blockedPlates) {
+    if (now > ts) _blockedPlates.delete(plate);
+  }
+}, 3600000);
 
 // ── Helpers ───────────────────────────────────────────────────────
 function stripPlate(plate) {
@@ -30,15 +70,14 @@ function stripPlate(plate) {
 }
 
 /**
- * Número a string con coma decimal (formato Wisetrack)
- * toComma(-33.435654) → "-33,435654"
- * toComma(1520.15, 2) → "1520,15"
+ * Número a string con coma decimal — 8 decimales para lat/lon
+ * toComma(-33.435654, 8) → "-33,43565400"
+ * toComma(1520.15, 2)    → "1520,15"
  */
 function toComma(v, decimals) {
   const n = Number(v);
-  if (!Number.isFinite(n)) return '0';
-  const s = decimals !== undefined ? n.toFixed(decimals) : String(n);
-  return s.replace('.', ',');
+  if (!Number.isFinite(n)) return '0,00';
+  return n.toFixed(decimals ?? 8).replace('.', ',');
 }
 
 /** Fecha UTC → "YYYY-MM-DD HH:MM:SS" */
@@ -52,7 +91,7 @@ function formatFechaUTC(wialon_ts) {
 
 /**
  * numero_evento según ignición:
- *   45 = Posición online con ignición ON
+ *   45 = Posición online con ignición ON (conectado a red)
  *   46 = Posición con motor apagado
  */
 function resolveEvento(ignition) {
@@ -64,14 +103,20 @@ function safeStr(v) {
   return String(v);
 }
 
-/** Leer token desde route.auth (Bearer, apikey, custom-headers) */
+/** Direccion validada 0-359 */
+function safeDireccion(heading) {
+  const h = Math.round(Number(heading) || 0) % 360;
+  return safeStr(h < 0 ? h + 360 : h);
+}
+
+/** Leer token desde route.auth */
 function readToken(route) {
   try {
     const auth = typeof route?.auth === 'string' ? JSON.parse(route.auth) : route?.auth;
     if (!auth) return '';
-    if (auth.type === 'bearer'  && auth.token)    return auth.token;
-    if (auth.type === 'apikey'  && auth.value)     return auth.value;
-    if (auth.type === 'basic'   && auth.password)  return auth.password;
+    if (auth.type === 'bearer' && auth.token)   return auth.token;
+    if (auth.type === 'apikey' && auth.value)   return auth.value;
+    if (auth.type === 'basic'  && auth.password) return auth.password;
     if (auth.type === 'custom-headers' && Array.isArray(auth.headers)) {
       const h = auth.headers.find(h => h.key?.toLowerCase() === 'authorization');
       if (h?.value) return h.value.replace(/^Bearer\s+/i, '').trim();
@@ -81,17 +126,23 @@ function readToken(route) {
 }
 
 /** Leer campos opcionales desde field_schema */
-function readOptionals(route) {
-  let transportista   = process.env.WISETRACK_TRANSPORTISTA || '';
-  let codigo_interno  = '';
+function readOptionals(route, unit, clienteData) {
+  let transportista  = process.env.WISETRACK_TRANSPORTISTA || '';
+  let codigo_interno = '';
 
   try {
     let schema = route?.field_schema || [];
     if (typeof schema === 'string') schema = JSON.parse(schema);
     for (const f of schema) {
-      if (f.source === 'fixed' && f.fixedValue) {
-        if (f.apiKey === 'wisetrack_transportista')   transportista  = f.fixedValue;
-        if (f.apiKey === 'wisetrack_codigo_interno')  codigo_interno = f.fixedValue;
+      if (f.apiKey === 'wisetrack_transportista' || f.apiKey === 'transportista') {
+        if (f.source === 'fixed' && f.fixedValue)  transportista = f.fixedValue;
+        else if (f.source === 'cliente_nombre')    transportista = clienteData?.nombre || unit?.name || '';
+        else if (f.source === 'unit_name')         transportista = unit?.name || '';
+      }
+      if (f.apiKey === 'wisetrack_codigo_interno' || f.apiKey === 'codigo_interno') {
+        if (f.source === 'fixed' && f.fixedValue)  codigo_interno = f.fixedValue;
+        else if (f.source === 'unit_imei')         codigo_interno = unit?.imei || '';
+        else if (f.source === 'unit_plate')        codigo_interno = unit?.plate || '';
       }
     }
   } catch (_) {}
@@ -101,7 +152,6 @@ function readOptionals(route) {
 
 // ── Función principal ─────────────────────────────────────────────
 async function send({ event, unit, route } = {}) {
-  // ── URL ─────────────────────────────────────────────────────────
   const url = route?.url
     ? String(route.url).replace(/\/+$/, '')
     : (process.env.WISETRACK_URL || '').replace(/\/+$/, '');
@@ -111,17 +161,20 @@ async function send({ event, unit, route } = {}) {
     return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_url' };
   }
 
-  // ── Token ────────────────────────────────────────────────────────
   const token = readToken(route);
   if (!token) {
     console.warn('[wisetrack] TOKEN no configurado');
     return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_token' };
   }
 
-  // ── Validaciones ─────────────────────────────────────────────────
   const plate = stripPlate(unit?.plate);
   if (!plate) {
     return { ok: false, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'missing_plate' };
+  }
+
+  // ── Verificar bloqueo 24h (Estado 4) ─────────────────────────────
+  if (isBlocked(plate)) {
+    return { ok: true, status: 'blocked_24h', http_status: 0, latency_ms: 0, response_http: 'plate_blocked_24h' };
   }
 
   const lat = event?.lat ?? null;
@@ -130,27 +183,31 @@ async function send({ event, unit, route } = {}) {
     return { ok: true, status: 'skipped', http_status: 0, latency_ms: 0, response_http: 'no_coords' };
   }
 
-  const opts = readOptionals(route);
+  // ── Rate limiting: máx 3 llamados/minuto ──────────────────────────
+  if (!checkRateLimit(url)) {
+    return { ok: true, status: 'rate_limited', http_status: 0, latency_ms: 0, response_http: 'rate_limited_3_per_min' };
+  }
 
-  // ── Construir posicion — TODOS los campos como STRING ────────────
-  // Orden según manual Wisetrack
+  const opts = readOptionals(route, unit, {});
+
+  // ── Construir posicion — orden exacto del manual ──────────────────
   const posicion = {};
 
-  // codigo_interno (opcional)
+  // codigo_interno (opcional) — va primero según manual
   if (opts.codigo_interno) posicion.codigo_interno = opts.codigo_interno;
 
   // Campos obligatorios
   posicion.patente          = plate;
   posicion.fecha_hora       = formatFechaUTC(event?.wialon_ts);
-  posicion.latitud          = toComma(lat);
-  posicion.longitud         = toComma(lon);
-  posicion.direccion        = safeStr(Math.round(Number(event?.heading) || 0));
-  posicion.altitud          = safeStr(Math.round(Number(event?.alt)     || 0));
-  posicion.velocidad        = safeStr(Math.round(Number(event?.speed)   || 0));
+  posicion.latitud          = toComma(lat, 8);           // 8 decimales como el manual
+  posicion.longitud         = toComma(lon, 8);           // 8 decimales como el manual
+  posicion.direccion        = safeDireccion(event?.heading); // validado 0-359
+  posicion.altitud          = safeStr(Math.round(Number(event?.alt) || 0)); // opcional pero incluido
+  posicion.velocidad        = safeStr(Math.round(Number(event?.speed) || 0));
   posicion.estado_registro  = '1';
   posicion.estado_ignicion  = (event?.ignition === true || event?.ignition === 1) ? '1' : '0';
   posicion.numero_evento    = resolveEvento(event?.ignition);
-  posicion.odometro         = toComma(Number(event?.odometro) || 0, 2);
+  posicion.odometro         = toComma(Number(event?.odometro) || 0, 2); // 2 decimales con coma
 
   // transportista (opcional)
   if (opts.transportista) posicion.transportista = opts.transportista;
@@ -185,9 +242,8 @@ async function send({ event, unit, route } = {}) {
   const latency_ms = Date.now() - t0;
 
   // ── Evaluar respuesta ─────────────────────────────────────────────
-  // Estado 1 = Llamada exitosa
-  // Estado 5 = Registro duplicado (no es error real)
-  let ok = false;
+  let ok    = false;
+  let estado = null;
   try {
     let json = JSON.parse(resText);
     if (typeof json === 'string') json = JSON.parse(json);
@@ -196,10 +252,12 @@ async function send({ event, unit, route } = {}) {
     if (Array.isArray(resultado)) {
       ok = resultado.some(r => {
         const e = r?.ResultadoTransaccion?.Estado;
+        if (e === 4) blockPlate(plate); // Estado 4 → bloquear 24h
         return e === 1 || e === 5;
       });
     } else {
-      const estado = resultado?.ResultadoTransaccion?.Estado;
+      estado = resultado?.ResultadoTransaccion?.Estado;
+      if (estado === 4) blockPlate(plate); // Estado 4 → bloquear 24h
       ok = estado === 1 || estado === 5;
     }
   } catch (_) {
@@ -207,9 +265,9 @@ async function send({ event, unit, route } = {}) {
   }
 
   if (ok) {
-    console.log(`[wisetrack] ✓ ${plate} (${res.status}) ${latency_ms}ms`);
+    console.log(`[wisetrack] ✓ ${plate} estado=${estado} (${res.status}) ${latency_ms}ms`);
   } else {
-    console.warn(`[wisetrack] ✗ ${plate} (${res.status}) ${resText.slice(0, 200)}`);
+    console.warn(`[wisetrack] ✗ ${plate} estado=${estado} (${res.status}) ${resText.slice(0, 200)}`);
   }
 
   return {
