@@ -140,6 +140,9 @@ function parseWialonIPS(raw) {
       }
       const odometro = parsedParams['odometer'] ?? parsedParams['odo'] ?? parsedParams['mileage'] ?? null;
       const hdopVal  = parsedParams['hdop'] ?? null;
+      // Horometro: horas de motor encendido acumuladas
+      const hourmeter = parsedParams['engine_hours'] ?? parsedParams['engine_hours_adj'] ?? 
+                        parsedParams['hourmeter']    ?? parsedParams['total_time']       ?? null;
 
       function nmea2dec(raw, hem) {
         const v = parseFloat(raw);
@@ -181,6 +184,7 @@ function parseWialonIPS(raw) {
         ignition,
         odometro,
         hdop: hdopVal,
+        hourmeter,
         wialon_ts,
         raw: str,
       };
@@ -416,6 +420,15 @@ function resolveSource(source, unit, parsed, clienteData) {
       return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ` +
              `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} +00:00`;
     }
+    case 'fecha_utc': {
+      // Formato UTC puro: "YYYY-MM-DD HH:MM:SS" (sin zona horaria) — requerido por Sitrack
+      const iso = parsed.wialon_ts || new Date().toISOString();
+      const d   = new Date(iso);
+      if (isNaN(d)) return iso;
+      const p = n => String(n).padStart(2, '0');
+      return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ` +
+             `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+    }
     case 'fecha_gmt': {
       const iso = parsed.wialon_ts || new Date().toISOString();
       const d   = new Date(iso);
@@ -476,8 +489,14 @@ function resolveSource(source, unit, parsed, clienteData) {
     }
     case 'unit_imei':      return unit.imei        || '';
     case 'unit_name':      return unit.name        || '';
+    case 'unit_rut_limpio':
+      // RUT de la unidad sin puntos ni guión
+      return (unit.rut || '').replace(/\./g, '').replace(/-/g, '').trim();
     case 'unit_rut':       return unit.rut         || '';
     case 'cliente_nombre': return clienteData?.nombre || unit.name || null;
+    case 'cliente_rut_limpio':
+      // RUT sin puntos ni guión: "96.521.450-1" → "965214501"
+      return (clienteData?.rut || unit.rut || '').replace(/\./g, '').replace(/-/g, '').trim();
     case 'cliente_rut':    return clienteData?.rut    || unit.rut  || null;
     case 'plate':          return unit.plate || '';
     case 'imei':           return unit.imei  || '';
@@ -623,9 +642,10 @@ async function forwardToDestinations(unit, parsed) {
           alt:        parsed.alt   || 0,
           ignition:   parsed.ignition,
           engineOn:   parsed.ignition,
-          odometro:   parsed.odometro ?? 0,
-          hdop:       parsed.hdop     ?? 0,
-          sats:       parsed.sats     ?? 0,
+          odometro:   parsed.odometro  ?? 0,
+          hdop:       parsed.hdop      ?? 0,
+          sats:       parsed.sats      ?? 0,
+          hourmeter:  parsed.hourmeter ?? 0,
           wialon_ts:  parsed.wialon_ts,
           time_epoch: parsed.wialon_ts
             ? Math.floor(new Date(parsed.wialon_ts).getTime() / 1000)
