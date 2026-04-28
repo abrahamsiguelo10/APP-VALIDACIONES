@@ -5,41 +5,29 @@
  * ─────────────────────────────────────────────────────────────────
  * Driver para project44 Unified Integrations API
  *
- * Throttle: máximo 1 envío cada 5 minutos por IMEI (requerimiento p44)
- * Autenticación: Basic Auth desde route.auth
- * owner_id: fijo desde field_schema
+ * Frecuencia: exactamente cada 5 minutos por IMEI.
+ * Estrategia: timer fijo — cada 5 min envía el último evento recibido.
+ * Esto garantiza intervalos regulares independiente de cuándo llegan
+ * los paquetes GPS.
  */
 
-// ── Throttle: 1 envío cada 5 minutos por IMEI ────────────────────
-const THROTTLE_MS = 5 * 60 * 1000; // 5 minutos
-const _lastSent   = new Map();      // imei → timestamp último envío exitoso
+const INTERVAL_MS = 5 * 60 * 1000; // 5 minutos exactos
 
-// Limpiar entradas antiguas cada hora para evitar memory leak
-setInterval(() => {
-  const cutoff = Date.now() - THROTTLE_MS * 2;
-  for (const [imei, ts] of _lastSent) {
-    if (ts < cutoff) _lastSent.delete(imei);
-  }
-}, 60 * 60 * 1000);
+// ── Estado por IMEI ───────────────────────────────────────────────
+// _pending: último evento recibido esperando ser enviado
+// _timers:  setInterval activo por IMEI
+const _pending = new Map(); // imei → { event, unit, route }
+const _timers  = new Map(); // imei → intervalId
 
-async function send({ event, unit, route }) {
-  // ── Throttle: saltear si no han pasado 5 minutos ──────────────
-  const now      = Date.now();
-  const lastSent = _lastSent.get(unit.imei) || 0;
-  const elapsed  = now - lastSent;
+// ── Función que hace el envío real a p44 ─────────────────────────
+async function _doSend(imei) {
+  const entry = _pending.get(imei);
+  if (!entry) return; // nada que enviar
 
-  if (elapsed < THROTTLE_MS) {
-    const remaining = Math.round((THROTTLE_MS - elapsed) / 1000);
-    console.log(`[p44] ⏱ plate=${unit.plate} throttled — faltan ${remaining}s para el próximo envío`);
-    return {
-      ok:            true,
-      http_status:   0,
-      status:        'throttled',
-      response_http: `throttled — next in ${remaining}s`,
-    };
-  }
+  const { event, unit, route } = entry;
+  _pending.delete(imei); // limpiar — si no llega nada nuevo en 5 min, no enviamos de nuevo
 
-  // ── Leer owner_id desde field_schema ─────────────────────────
+  // ── Leer owner_id desde field_schema ───────────────────────────
   let owner_id = '';
   try {
     const schema = typeof route?.field_schema === 'string'
@@ -51,45 +39,37 @@ async function send({ event, unit, route }) {
 
   if (!owner_id) {
     console.error('[p44] ❌ owner_id no configurado en field_schema');
-    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing owner_id' };
+    return;
   }
 
-  // ── Construir payload ─────────────────────────────────────────
+  // ── Construir payload ──────────────────────────────────────────
   const payload = {
     owner_id,
     device_id:     unit.imei  || '',
     license_plate: (unit.plate || '').toUpperCase(),
-
     position: {
       latitude:  event.lat ?? 0,
       longitude: event.lon ?? event.lng ?? 0,
     },
-
     timestamp: event.wialon_ts
       ? Math.floor(new Date(event.wialon_ts).getTime() / 1000)
       : Math.floor(Date.now() / 1000),
-
     speed:     Number(event.speed   ?? 0),
     direction: Number(event.heading ?? 0),
     altitude:  Number(event.alt     ?? 0),
   };
 
-  // Odómetro — solo incluir si tiene valor
   if (event.odometro != null && event.odometro !== 0) {
     payload.odometer = Number(event.odometro);
   }
-
-  // moving — booleano derivado de speed, omitir si no hay datos
   if (event.speed != null) {
     payload.moving = Number(event.speed) > 0;
   }
-
-  // ignition — booleano, omitir si null/undefined
   if (event.ignition != null) {
     payload.ignition = event.ignition === true || event.ignition === 1;
   }
 
-  // ── Auth ──────────────────────────────────────────────────────
+  // ── Auth ───────────────────────────────────────────────────────
   const headers = { 'Content-Type': 'application/json' };
   try {
     const auth = typeof route?.auth === 'string' ? JSON.parse(route.auth) : route?.auth;
@@ -103,14 +83,13 @@ async function send({ event, unit, route }) {
 
   const url = route?.url;
   if (!url) {
-    console.error('[p44] ❌ URL no configurada en el destino');
-    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing URL' };
+    console.error('[p44] ❌ URL no configurada');
+    return;
   }
 
-  console.log(`[p44] enviando plate=${payload.license_plate} imei=${payload.device_id} moving=${payload.moving} pos=${payload.position.latitude},${payload.position.longitude}`);
+  console.log(`[p44] ⏰ timer enviando plate=${payload.license_plate} moving=${payload.moving} pos=${payload.position.latitude},${payload.position.longitude}`);
 
   const t0 = Date.now();
-
   try {
     const res = await fetch(url, {
       method:  'POST',
@@ -118,38 +97,51 @@ async function send({ event, unit, route }) {
       body:    JSON.stringify([payload]),
       signal:  AbortSignal.timeout(10000),
     });
-
     const latency = Date.now() - t0;
     const resText = await res.text().catch(() => '');
-    const ok      = res.ok;
 
-    if (ok) {
-      // Solo actualizar el throttle si el envío fue exitoso
-      _lastSent.set(unit.imei, Date.now());
+    if (res.ok) {
       console.log(`[p44] ✓ plate=${payload.license_plate} (${res.status}) ${latency}ms`);
     } else {
-      console.error(`[p44] ✗ plate=${payload.license_plate} http=${res.status} resp=${resText.slice(0, 200)}`);
+      console.error(`[p44] ✗ plate=${payload.license_plate} http=${res.status} resp=${resText.slice(0,200)}`);
     }
-
-    return {
-      ok,
-      http_status:   res.status,
-      status:        ok ? 'ok' : 'failed',
-      response_http: resText.slice(0, 500),
-      latency_ms:    latency,
-    };
-
   } catch (err) {
-    const latency = Date.now() - t0;
     console.error(`[p44] Error fetch: ${err.message}`);
-    return {
-      ok:            false,
-      http_status:   0,
-      status:        'failed',
-      response_http: err.message?.slice(0, 500) || 'fetch_error',
-      latency_ms:    latency,
-    };
   }
+}
+
+// ── Iniciar timer para un IMEI (solo si no existe ya) ─────────────
+function _ensureTimer(imei) {
+  if (_timers.has(imei)) return;
+  console.log(`[p44] ⏱ iniciando timer 5min para imei=${imei}`);
+  const id = setInterval(() => _doSend(imei), INTERVAL_MS);
+  _timers.set(imei, id);
+}
+
+// ── Función principal del driver ──────────────────────────────────
+// Recibe cada evento GPS y lo guarda como "pendiente".
+// El timer lo enviará en el próximo tick de 5 minutos.
+async function send({ event, unit, route }) {
+  const imei = unit.imei;
+  if (!imei) {
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing imei' };
+  }
+
+  // Guardar el evento más reciente (sobreescribe el anterior si no se envió aún)
+  _pending.set(imei, { event, unit, route });
+
+  // Asegurar que el timer esté corriendo para este IMEI
+  _ensureTimer(imei);
+
+  console.log(`[p44] 📥 plate=${unit.plate} evento recibido — en cola para timer 5min`);
+
+  // Retornar ok:true — el envío real ocurre en el timer
+  return {
+    ok:            true,
+    http_status:   0,
+    status:        'queued',
+    response_http: 'queued for 5min timer',
+  };
 }
 
 module.exports = { send };
