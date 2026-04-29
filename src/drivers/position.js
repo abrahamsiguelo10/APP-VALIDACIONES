@@ -38,9 +38,36 @@ function pad2(n) { return String(n).padStart(2, '0'); }
 
 function formatFecha(wialon_ts) {
   const d = wialon_ts ? new Date(wialon_ts) : new Date();
-  if (isNaN(d)) return new Date().toISOString().replace('T', ' ').slice(0, 19);
-  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth()+1)}-${pad2(d.getUTCDate())} ` +
-         `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`;
+  
+  // Si la fecha no es válida, usamos la actual como fallback
+  if (isNaN(d)) return formatFecha(Date.now());
+
+  try {
+    // Configuramos el formateador para la zona horaria de Chile
+    // 'sv-SE' (Suecia) se usa porque su formato base es YYYY-MM-DD, lo que facilita el trabajo
+    const formatter = new Intl.DateTimeFormat('sv-SE', {
+      timeZone: 'America/Santiago',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false
+    });
+
+    // Obtenemos las partes de la fecha ya convertidas a la hora local de Santiago
+    const parts = formatter.formatToParts(d);
+    const f = {};
+    parts.forEach(p => { f[p.type] = p.value; });
+
+    // Retornamos el formato exacto que pide el WS: YYYY-MM-DD HH:mm:ss
+    return `${f.year}-${f.month}-${f.day} ${f.hour}:${f.minute}:${f.second}`;
+  } catch (e) {
+    console.error("[position] Error al formatear fecha:", e);
+    // Fallback básico en caso de error extremo
+    return d.toISOString().replace('T', ' ').slice(0, 19);
+  }
 }
 
 // ── Construir SOAP envelopes ──────────────────────────────────────
