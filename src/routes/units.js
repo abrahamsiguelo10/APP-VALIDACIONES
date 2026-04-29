@@ -11,6 +11,8 @@
  * POST   /units/:imei/destinations       — asignar destino
  * PATCH  /units/:imei/destinations/:did  — actualizar asignación
  * DELETE /units/:imei/destinations/:did  — quitar destino
+ *
+ * GET    /units/:imei/preview-payload    — payload simulado por destino (para validador)
  */
 
 const router  = require('express').Router();
@@ -180,7 +182,7 @@ router.patch('/:imei', requireRole('admin'), async (req, res) => {
   const updates = [];
   const values  = [];
   let   i       = 1;
-  
+
   if (plate      !== undefined) { updates.push(`plate      = $${i++}`); values.push(plate?.trim() || null); }
   if (name       !== undefined) { updates.push(`name       = $${i++}`); values.push(name?.trim()  || null); }
   if (rut        !== undefined) { updates.push(`rut        = $${i++}`); values.push(rut || null); }
@@ -337,7 +339,6 @@ router.patch('/:imei/change-imei', requireRole('admin'), async (req, res) => {
     return res.status(400).json({ error: 'El IMEI nuevo es igual al actual.' });
   }
 
-  // Verificar que la unidad original existe
   const { rows: original } = await query(
     'SELECT * FROM public.units WHERE imei = $1', [oldImei]
   );
@@ -345,7 +346,6 @@ router.patch('/:imei/change-imei', requireRole('admin'), async (req, res) => {
     return res.status(404).json({ error: 'Unidad no encontrada.' });
   }
 
-  // Verificar que el nuevo IMEI no esté en uso
   const { rows: existing } = await query(
     'SELECT imei FROM public.units WHERE imei = $1', [newImei]
   );
@@ -353,12 +353,10 @@ router.patch('/:imei/change-imei', requireRole('admin'), async (req, res) => {
     return res.status(409).json({ error: `El IMEI "${newImei}" ya está en uso por otra unidad.` });
   }
 
-  // Ejecutar el cambio en una transacción
   const client = await require('../db/pool').pool.connect();
   try {
     await client.query('BEGIN');
 
-    // 1. Crear la nueva unidad como copia de la vieja
     await client.query(
       `INSERT INTO public.units (imei, plate, name, rut, enabled, cliente_id, created_at, updated_at)
        SELECT $1, plate, name, rut, enabled, cliente_id, created_at, now()
@@ -366,19 +364,16 @@ router.patch('/:imei/change-imei', requireRole('admin'), async (req, res) => {
       [newImei, oldImei]
     );
 
-    // 2. Mover unit_destinations al nuevo IMEI
     await client.query(
       'UPDATE public.unit_destinations SET imei = $1 WHERE imei = $2',
       [newImei, oldImei]
     );
 
-    // 3. Actualizar gps_events
     await client.query(
       'UPDATE public.gps_events SET imei = $1 WHERE imei = $2',
       [newImei, oldImei]
     );
 
-    // 4. Eliminar la unidad vieja (ya no tiene referencias)
     await client.query(
       'DELETE FROM public.units WHERE imei = $1',
       [oldImei]
@@ -386,7 +381,6 @@ router.patch('/:imei/change-imei', requireRole('admin'), async (req, res) => {
 
     await client.query('COMMIT');
 
-    // Audit log
     await audit.log({
       req,
       action: 'UNIT_CHANGE_IMEI',
@@ -404,6 +398,201 @@ router.patch('/:imei/change-imei', requireRole('admin'), async (req, res) => {
   } finally {
     client.release();
   }
+});
+
+/* ══════════════════════════════════════════
+   PREVIEW PAYLOAD
+══════════════════════════════════════════ */
+
+/* ── GET /units/:imei/preview-payload ────────────────────────────
+   Devuelve el payload exacto que el tcp-server construiría para cada
+   destino activo de esta unidad, usando el último evento GPS disponible.
+   Permite verificar qué valores fijos y dinámicos se están enviando.
+   ────────────────────────────────────────────────────────────── */
+router.get('/:imei/preview-payload', async (req, res) => {
+  const { imei } = req.params;
+
+  // Último evento GPS
+  const { rows: eventRows } = await query(`
+    SELECT lat, lon, speed, heading, ignition, alt, sats, hdop,
+           odometro, wialon_ts, received_at
+    FROM public.gps_events
+    WHERE imei = $1
+    ORDER BY received_at DESC
+    LIMIT 1
+  `, [imei]);
+
+  const ev = eventRows[0] || {};
+
+  // Datos de unidad + cliente
+  const { rows: unitRows } = await query(`
+    SELECT u.imei, u.plate, u.name, u.rut, u.cliente_id,
+           c.nombre AS cliente_nombre, c.rut AS cliente_rut
+    FROM public.units u
+    LEFT JOIN public.clientes c ON c.id = u.cliente_id
+    WHERE u.imei = $1
+  `, [imei]);
+
+  if (!unitRows.length) return res.status(404).json({ error: 'Unidad no encontrada.' });
+  const unit = unitRows[0];
+
+  // Destinos activos con field_schema
+  const { rows: destRows } = await query(`
+    SELECT d.id, d.name, d.api_url, d.field_schema, d.driver_slug,
+           ud.shadow, ud.enabled
+    FROM public.unit_destinations ud
+    JOIN public.destinations d ON d.id = ud.destination_id
+    WHERE ud.imei = $1
+      AND ud.enabled = true
+      AND d.enabled  = true
+    ORDER BY d.name
+  `, [imei]);
+
+  // Resolver source → valor (misma lógica que tcp-server resolveSource)
+  function resolveSource(source, fixedValue) {
+    // Campos fixed: source === 'fixed' O source vacío pero con fixedValue
+    if (
+      source === 'fixed' ||
+      ((!source || source === '') && fixedValue !== undefined && fixedValue !== null && fixedValue !== '')
+    ) {
+      return fixedValue;
+    }
+
+    const pad = n => String(n).padStart(2, '0');
+    const iso  = ev.wialon_ts ? new Date(ev.wialon_ts).toISOString() : new Date().toISOString();
+    const d    = new Date(iso);
+    const chile = () => {
+      try { return new Date(new Date(iso).toLocaleString('en-US', { timeZone: 'America/Santiago' })); }
+      catch (_) { return new Date(d.getTime() - 3 * 3600 * 1000); }
+    };
+
+    switch (source) {
+      case 'lat':                return ev.lat         ?? 0;
+      case 'lon':                return ev.lon         ?? 0;
+      case 'speed':              return ev.speed       ?? 0;
+      case 'heading':            return ev.heading     ?? 0;
+      case 'ignition':           return ev.ignition    ?? false;
+      case 'ignition01':         return ev.ignition ? 1 : 0;
+      case 'alt':                return ev.alt         ?? 0;
+      case 'sats':               return ev.sats        ?? 0;
+      case 'hdop':               return ev.hdop        ?? 0;
+      case 'odometro':           return ev.odometro    ?? 0;
+      case 'unit_plate':
+      case 'plate':              return unit.plate     || '';
+      case 'unit_imei':
+      case 'imei':               return unit.imei      || '';
+      case 'unit_name':          return unit.name      || '';
+      case 'unit_rut':           return unit.rut       || '';
+      case 'cliente_nombre':     return unit.cliente_nombre || unit.name || '';
+      case 'cliente_rut':        return unit.cliente_rut    || unit.rut  || '';
+      case 'cliente_rut_limpio': return (unit.cliente_rut || unit.rut || '').replace(/\./g,'').replace(/-/g,'').trim();
+      case 'unit_rut_limpio':    return (unit.rut || '').replace(/\./g,'').replace(/-/g,'').trim();
+      case 'wialon_ts':          return iso;
+      case 'fecha_hora': {
+        if (isNaN(d)) return iso;
+        return `${pad(d.getUTCDate())}-${pad(d.getUTCMonth()+1)}-${d.getUTCFullYear()} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+      }
+      case 'fecha_utc': {
+        if (isNaN(d)) return iso;
+        return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+      }
+      case 'fecha_chile_iso': {
+        const loc = chile();
+        return `${loc.getFullYear()}-${pad(loc.getMonth()+1)}-${pad(loc.getDate())} ${pad(loc.getHours())}:${pad(loc.getMinutes())}:${pad(loc.getSeconds())}`;
+      }
+      case 'fecha_chile': {
+        const loc = chile();
+        return `${pad(loc.getDate())}-${pad(loc.getMonth()+1)}-${loc.getFullYear()} ${pad(loc.getHours())}:${pad(loc.getMinutes())}:${pad(loc.getSeconds())}`;
+      }
+      case 'fecha_utc_off': {
+        if (isNaN(d)) return iso;
+        return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} +00:00`;
+      }
+      case 'sitrack_evento': {
+        const ign = ev.ignition === true || ev.ignition === 1;
+        return ign ? 163 : 164;
+      }
+      case 'skynav_evento': {
+        const ign    = ev.ignition === true || ev.ignition === 1;
+        const moving = Number(ev.speed || 0) > 0;
+        if (moving) return ign ? 41 : 52;
+        return ign ? 51 : 42;
+      }
+      case 'unix_timestamp':    return Math.floor(new Date(iso).getTime() / 1000);
+      case 'unix_timestamp_ms': return new Date(iso).getTime();
+      case 'address':           return '[reverse_geocoding — ver logs Railway]';
+      default:                  return `[${source}]`;
+    }
+  }
+
+  // Construir payload por destino — misma lógica que buildPayload del tcp-server
+  const payloads = {};
+
+  for (const dest of destRows) {
+    if (dest.shadow) {
+      payloads[dest.name] = { _info: 'shadow — registra pero no envía' };
+      continue;
+    }
+    if (dest.driver_slug) {
+      payloads[dest.name] = { _info: `driver:${dest.driver_slug} — payload manejado internamente, ver logs Railway` };
+      continue;
+    }
+
+    let schema = [];
+    try {
+      schema = typeof dest.field_schema === 'string'
+        ? JSON.parse(dest.field_schema)
+        : (dest.field_schema || []);
+    } catch (_) {}
+
+    // Sin schema → payload genérico
+    if (!schema.length) {
+      payloads[dest.name] = {
+        imei:     unit.imei,
+        plate:    unit.plate,
+        lat:      ev.lat,
+        lon:      ev.lon,
+        speed:    ev.speed,
+        heading:  ev.heading,
+        ignition: ev.ignition,
+        ts:       ev.wialon_ts,
+      };
+      continue;
+    }
+
+    const obj     = {};
+    const missing = [];
+
+    for (const f of schema.sort((a, b) => (a.order || 0) - (b.order || 0))) {
+      // Mismo isFixed que buildPayload del tcp-server
+      const isFixed =
+        f.source === 'fixed' ||
+        ((!f.source || f.source === '') && f.fixedValue !== undefined && f.fixedValue !== null && f.fixedValue !== '');
+
+      const val = isFixed
+        ? f.fixedValue
+        : resolveSource(f.source, f.fixedValue);
+
+      const isEmpty = val === null || val === undefined || val === '';
+
+      if (isEmpty && f.required) {
+        missing.push(f.apiKey);
+      } else {
+        obj[f.apiKey] = val;
+      }
+    }
+
+    if (missing.length) obj._campos_faltantes_required = missing;
+    payloads[dest.name] = obj;
+  }
+
+  res.json({
+    imei,
+    plate:         unit.plate,
+    cliente:       unit.cliente_nombre || unit.name,
+    ultimo_evento: ev.received_at || null,
+    payloads,
+  });
 });
 
 module.exports = router;
