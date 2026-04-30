@@ -290,13 +290,13 @@ async function findUnit(imei) {
 }
 
 // ─── Guardar evento GPS ───────────────────────────────────────────────────────
-async function saveEvent(unit, parsed, destinationId, forwardOk, forwardResp) {
+async function saveEvent(unit, parsed, destinationId, forwardOk, forwardResp, payloadSent) {
   try {
     await query(`
       INSERT INTO public.gps_events
         (plate, imei, lat, lon, speed, heading, ignition, wialon_ts,
-         destination_id, forward_ok, forward_resp, raw_hex)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         destination_id, forward_ok, forward_resp, raw_hex, payload_sent)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
     `, [
       unit.plate, unit.imei,
       parsed.lat, parsed.lon, parsed.speed, parsed.heading, parsed.ignition,
@@ -305,6 +305,7 @@ async function saveEvent(unit, parsed, destinationId, forwardOk, forwardResp) {
       forwardOk     ?? null,
       forwardResp   || null,
       parsed.raw    || null,
+      payloadSent   ? JSON.stringify(payloadSent) : null,
     ]);
   } catch (err) {
     console.error('[TCP] saveEvent error:', err.message);
@@ -733,7 +734,7 @@ async function forwardToDestinations(unit, parsed) {
       forwardResp = err.message?.slice(0, 500) || 'error';
       console.error(`[TCP] ${unit.plate} → ${row.dest_name} error:`, err.message);
     }
-    await saveEvent(unit, parsed, row.dest_id, forwardOk, forwardResp);
+    await saveEvent(unit, parsed, row.dest_id, forwardOk, forwardResp, finalBody?.[0] || null);
   }
 }
 
