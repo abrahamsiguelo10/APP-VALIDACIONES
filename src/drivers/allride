@@ -2,37 +2,28 @@
  * drivers/allride.js
  * Integración con AllRide GPS Tracking API
  *
- * Documentación:
- *   POST {route.url}
- *   Headers: Authorization: Bearer {route.auth.token}
- *   Body: { plate, timestamp, speed, location: { latitude, longitude }, ... }
+ * Configuración en GUI:
+ *   driver_slug : allride
+ *   api_url     : URL de AllRide
+ *   auth → type : bearer
+ *   auth → token: YOUR_API_KEY
  *
- * Configuración desde GUI:
- *   - URL: campo api_url del destino
- *   - Token: campo auth → type: bearer, token: YOUR_API_KEY
- *   - Campos extra: field_schema del destino (se fusionan al payload base)
+ * field_schema: campos opcionales extra (driverName, temperature, accuracy, etc.)
  */
 
 'use strict';
 
-/**
- * build — construye el payload para AllRide
- * @param {object} event   — datos GPS del tcp-server (lat, lon, speed, heading, ignition, alt, odometro, wialon_ts)
- * @param {object} unit    — datos de la unidad (plate, imei, name, rut, cliente_nombre, cliente_rut)
- * @param {object} route   — configuración del destino (url, auth, field_schema)
- * @returns {object}       — payload listo para enviar
- */
-function build(event, unit, route) {
+async function send({ event, unit, route }) {
   const speed = Number(event.speed || 0);
 
-  // ── Payload base según documentación AllRide ──────────────────
+  // ── Payload base ──────────────────────────────────────────────
   const payload = {
-    plate:       unit.plate || '',
-    timestamp:   new Date(event.wialon_ts || Date.now()).toISOString(),
-    speed:       speed,
+    plate:     unit.plate || '',
+    timestamp: new Date(event.wialon_ts || Date.now()).toISOString(),
+    speed:     speed,
     location: {
-      latitude:  Number(event.lat  || 0),
-      longitude: Number(event.lon  || 0),
+      latitude:  Number(event.lat || 0),
+      longitude: Number(event.lon || 0),
     },
     speedStatus: speed > 120 ? 'excessive' : 'ok',
     altitude:    Number(event.alt      || 0),
@@ -40,97 +31,78 @@ function build(event, unit, route) {
     mileage:     Number(event.odometro || 0),
   };
 
-  // ── Campos extra desde field_schema de la GUI ─────────────────
-  // Permite agregar driverName, temperature, accuracy, externalId, etc.
-  // sin tocar el driver — solo se agregan campos que no existan ya en el payload base.
+  // ── Campos extra desde field_schema ──────────────────────────
   const schema = Array.isArray(route.field_schema) ? route.field_schema : [];
-
   for (const f of schema) {
     if (!f.apiKey) continue;
-
-    // Determinar valor del campo
-    let val;
-    const isFixed = f.source === 'fixed' ||
-      ((!f.source || f.source === '') && f.fixedValue !== undefined && f.fixedValue !== null && f.fixedValue !== '');
-
-    if (isFixed) {
-      val = f.fixedValue;
-    } else {
-      val = resolveSource(f.source, event, unit);
-    }
-
+    const isFixed =
+      f.source === 'fixed' ||
+      ((!f.source || f.source === '') &&
+        f.fixedValue !== undefined && f.fixedValue !== null && f.fixedValue !== '');
+    const val = isFixed ? f.fixedValue : resolveSource(f.source, event, unit);
     if (val === undefined || val === null || val === '') continue;
-
-    // Soporte para campos anidados con notación punto (ej: "location.latitude")
     if (f.apiKey.includes('.')) {
-      const parts  = f.apiKey.split('.');
-      const parent = parts[0];
-      const child  = parts[1];
-      if (!payload[parent] || typeof payload[parent] !== 'object') {
-        payload[parent] = {};
-      }
+      const [parent, child] = f.apiKey.split('.');
+      if (!payload[parent] || typeof payload[parent] !== 'object') payload[parent] = {};
       payload[parent][child] = val;
     } else {
-      // Solo sobreescribe si no es un campo base ya definido,
-      // o si el campo schema tiene override explícito
-      if (!(f.apiKey in payload) || f.override === true) {
-        payload[f.apiKey] = val;
-      }
+      if (!(f.apiKey in payload) || f.override === true) payload[f.apiKey] = val;
     }
   }
 
-  return payload;
+  // ── Headers ───────────────────────────────────────────────────
+  const headers = { 'Content-Type': 'application/json' };
+  const auth = route.auth || {};
+  if (auth.type === 'bearer' && auth.token) {
+    headers['Authorization'] = `Bearer ${auth.token}`;
+  } else if (Array.isArray(auth.headers)) {
+    for (const h of auth.headers) {
+      if (h.key && h.value) headers[h.key] = h.value;
+    }
+  }
+
+  // ── Envío ─────────────────────────────────────────────────────
+  const body = JSON.stringify(payload);
+  console.log(`[PAYLOAD] ${unit.plate} → allride | ${body.slice(0, 400)}`);
+
+  const res  = await fetch(route.url, { method: 'POST', headers, body });
+  const text = await res.text();
+
+  return {
+    ok:            res.status >= 200 && res.status < 300,
+    http_status:   res.status,
+    response_http: text.slice(0, 300),
+  };
 }
 
-/**
- * resolveSource — resuelve sources dinámicos del field_schema
- * Misma lógica que tcp-server para consistencia.
- */
 function resolveSource(source, event, unit) {
-  const pad = n => String(n).padStart(2, '0');
-  const iso  = event.wialon_ts ? new Date(event.wialon_ts).toISOString() : new Date().toISOString();
-  const d    = new Date(iso);
+  const iso = event.wialon_ts
+    ? new Date(event.wialon_ts).toISOString()
+    : new Date().toISOString();
 
   switch (source) {
-    case 'lat':             return Number(event.lat    || 0);
-    case 'lon':             return Number(event.lon    || 0);
-    case 'speed':           return Number(event.speed  || 0);
-    case 'heading':         return Number(event.heading|| 0);
-    case 'ignition':        return Boolean(event.ignition);
-    case 'ignition01':      return event.ignition ? 1 : 0;
-    case 'alt':             return Number(event.alt    || 0);
-    case 'sats':            return Number(event.sats   || 0);
-    case 'hdop':            return Number(event.hdop   || 0);
-    case 'odometro':        return Number(event.odometro || 0);
+    case 'lat':               return Number(event.lat      || 0);
+    case 'lon':               return Number(event.lon      || 0);
+    case 'speed':             return Number(event.speed    || 0);
+    case 'heading':           return Number(event.heading  || 0);
+    case 'ignition':          return Boolean(event.ignition);
+    case 'ignition01':        return event.ignition ? 1 : 0;
+    case 'alt':               return Number(event.alt      || 0);
+    case 'sats':              return Number(event.sats     || 0);
+    case 'hdop':              return Number(event.hdop     || 0);
+    case 'odometro':          return Number(event.odometro || 0);
     case 'unit_plate':
-    case 'plate':           return unit.plate  || '';
+    case 'plate':             return unit.plate  || '';
     case 'unit_imei':
-    case 'imei':            return unit.imei   || '';
-    case 'unit_name':       return unit.name   || '';
-    case 'cliente_nombre':  return unit.cliente_nombre || unit.name || '';
-    case 'cliente_rut':     return unit.cliente_rut    || unit.rut  || '';
-    case 'wialon_ts':       return iso;
-    case 'fecha_utc': {
-      if (isNaN(d)) return iso;
-      const pad = n => String(n).padStart(2,'0');
-      return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
-    }
+    case 'imei':              return unit.imei   || '';
+    case 'unit_name':         return unit.name   || '';
+    case 'cliente_nombre':    return unit.cliente_nombre || unit.name || '';
+    case 'cliente_rut':       return unit.cliente_rut    || unit.rut  || '';
+    case 'wialon_ts':         return iso;
     case 'unix_timestamp':    return Math.floor(new Date(iso).getTime() / 1000);
     case 'unix_timestamp_ms': return new Date(iso).getTime();
     default:                  return undefined;
   }
 }
 
-/**
- * headers — construye los headers HTTP para AllRide
- * Lee el token Bearer desde route.auth (configurado en GUI)
- */
-function headers(route) {
-  const h = { 'Content-Type': 'application/json' };
-  if (route.auth?.type === 'bearer' && route.auth?.token) {
-    h['Authorization'] = `Bearer ${route.auth.token}`;
-  }
-  return h;
-}
-
-module.exports = { build, headers };
+module.exports = { send };
