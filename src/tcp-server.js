@@ -712,11 +712,11 @@ async function forwardToDestinations(unit, parsed) {
 
     if (process.env.DEBUG_AUTH) {
       console.log(`[AUTH-DEBUG] ${row.dest_name} | type=${auth?.type} | token_len=${auth?.token?.length} | token_end=${auth?.token?.slice(-8)}`);
-      console.log(`[PAYLOAD-DEBUG] ${unit.plate} | url=${row.api_url} | body=${JSON.stringify(payloadArray).slice(0,300)}`);
     }
-
     let forwardOk = false, forwardResp = null;
     const finalBody = injectAuthInBody(auth, payloadArray);
+    // Log permanente del payload enviado a cada destino
+    console.log(`[PAYLOAD] ${unit.plate} → ${row.dest_name} | ${JSON.stringify(finalBody).slice(0, 500)}`);
 
     try {
       const res = await fetch(row.api_url, {
