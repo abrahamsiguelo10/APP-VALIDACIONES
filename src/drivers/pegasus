@@ -2,13 +2,6 @@
  * drivers/pegasus.js
  * Integración con Pegasus GPS (analyzegps.cl)
  *
- * Endpoint: POST https://pro.analyzegps.cl/receivers/json
- * Headers:
- *   Content-Type: application/json
- *   Authenticate: RECEIVER_TOKEN
- *   X-pegasus-route: ##
- * Body: array de eventos [{...}]
- *
  * Configuración en GUI:
  *   driver_slug : pegasus
  *   api_url     : https://pro.analyzegps.cl/receivers/json
@@ -18,13 +11,12 @@
  *      { "key": "X-pegasus-route", "value": "1"        }]
  *
  * field_schema: campos opcionales extra (driverName, temperature, etc.)
- * Los campos base (timestamp, position, protocol, device) los construye el driver.
  */
 
 'use strict';
 
-function build(event, unit, route) {
-  // ── Payload base requerido por Pegasus ────────────────────────
+async function send({ event, unit, route }) {
+  // ── Payload base ──────────────────────────────────────────────
   const payload = {
     timestamp: Math.floor(new Date(event.wialon_ts || Date.now()).getTime() / 1000),
     position: {
@@ -47,25 +39,17 @@ function build(event, unit, route) {
   };
 
   // ── Campos extra desde field_schema ──────────────────────────
-  // Permite agregar driverName, temperature, accuracy, externalId, etc.
   const schema = Array.isArray(route.field_schema) ? route.field_schema : [];
-
   for (const f of schema) {
     if (!f.apiKey) continue;
-
     const isFixed =
       f.source === 'fixed' ||
       ((!f.source || f.source === '') &&
         f.fixedValue !== undefined && f.fixedValue !== null && f.fixedValue !== '');
-
     const val = isFixed ? f.fixedValue : resolveSource(f.source, event, unit);
     if (val === undefined || val === null || val === '') continue;
-
-    // Notación punto → objeto anidado (ej: "device.externalId")
     if (f.apiKey.includes('.')) {
-      const parts  = f.apiKey.split('.');
-      const parent = parts[0];
-      const child  = parts[1];
+      const [parent, child] = f.apiKey.split('.');
       if (!payload[parent] || typeof payload[parent] !== 'object') payload[parent] = {};
       payload[parent][child] = val;
     } else {
@@ -73,8 +57,27 @@ function build(event, unit, route) {
     }
   }
 
-  // Pegasus espera siempre un array
-  return [payload];
+  // ── Headers desde auth custom-headers de la GUI ───────────────
+  const headers = { 'Content-Type': 'application/json' };
+  const auth = route.auth || {};
+  if (Array.isArray(auth.headers)) {
+    for (const h of auth.headers) {
+      if (h.key && h.value) headers[h.key] = h.value;
+    }
+  }
+
+  // ── Envío ─────────────────────────────────────────────────────
+  const body = JSON.stringify([payload]);
+  console.log(`[PAYLOAD] ${unit.plate} → pegasus | ${body.slice(0, 400)}`);
+
+  const res = await fetch(route.url, { method: 'POST', headers, body });
+  const text = await res.text();
+
+  return {
+    ok:            res.status >= 200 && res.status < 300,
+    http_status:   res.status,
+    response_http: text.slice(0, 300),
+  };
 }
 
 function resolveSource(source, event, unit) {
@@ -107,4 +110,4 @@ function resolveSource(source, event, unit) {
   }
 }
 
-module.exports = { build, headers: null };
+module.exports = { send };
