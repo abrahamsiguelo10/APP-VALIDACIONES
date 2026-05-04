@@ -1,0 +1,126 @@
+/**
+ * drivers/pegasus.js
+ * Integración con Pegasus GPS (analyzegps.cl)
+ *
+ * Documentación:
+ *   POST https://pro.analyzegps.cl/receivers/json
+ *   Headers:
+ *     Content-Type: application/json
+ *     Authenticate: RECEIVER_TOKEN
+ *     X-pegasus-route: route##
+ *   Body: ARRAY_OF_EVENTS (JSON array)
+ *
+ * Configuración desde GUI:
+ *   - URL: https://pro.analyzegps.cl/receivers/json
+ *   - auth → type: "custom"
+ *   - auth → token: RECEIVER_TOKEN (el que da el admin de Pegasus)
+ *   - auth → extra: número de ruta (X-pegasus-route), ej: "1"
+ *   - field_schema: todos los campos del evento se configuran desde aquí
+ *
+ * Campos mínimos recomendados en field_schema:
+ *   timestamp          → source: unix_timestamp
+ *   position.latitude  → source: lat
+ *   position.longitude → source: lon
+ *   protocol.id        → source: fixed, fixedValue: "rt.platform"
+ *   device.type.id     → source: fixed, fixedValue: "rt.platform"
+ *   device.id          → source: unit_plate
+ *   protocol.vendor    → source: fixed, fixedValue: "SIGUELO"
+ *   device.name        → source: unit_plate
+ */
+
+'use strict';
+
+/**
+ * build — construye el payload para Pegasus desde el field_schema
+ * Pegasus espera un ARRAY de eventos: [{ ...campos }]
+ * Los campos con notación punto se expanden a objetos anidados.
+ */
+function build(event, unit, route) {
+  const schema = Array.isArray(route.field_schema) ? route.field_schema : [];
+  const obj    = {};
+
+  for (const f of schema) {
+    if (!f.apiKey) continue;
+
+    const isFixed =
+      f.source === 'fixed' ||
+      ((!f.source || f.source === '') &&
+        f.fixedValue !== undefined && f.fixedValue !== null && f.fixedValue !== '');
+
+    const val = isFixed ? f.fixedValue : resolveSource(f.source, event, unit);
+    if (val === undefined || val === null || val === '') continue;
+
+    // Soporte notación punto → objetos anidados (ej: "position.latitude")
+    if (f.apiKey.includes('.')) {
+      const [parent, child] = f.apiKey.split('.');
+      if (!obj[parent] || typeof obj[parent] !== 'object') obj[parent] = {};
+      obj[parent][child] = val;
+    } else {
+      obj[f.apiKey] = val;
+    }
+  }
+
+  // Pegasus espera siempre un array
+  return [obj];
+}
+
+/**
+ * headers — construye los headers HTTP para Pegasus
+ * Lee token y ruta desde route.auth (configurado en GUI):
+ *   auth.token → valor del header "Authenticate"
+ *   auth.extra → valor del header "X-pegasus-route" (número de ruta)
+ */
+function headers(route) {
+  const h = { 'Content-Type': 'application/json' };
+
+  if (route.auth?.token) {
+    h['Authenticate'] = route.auth.token;
+  }
+
+  // X-pegasus-route: número de ruta dado por el admin de Pegasus
+  const routeNum = route.auth?.extra || route.auth?.route || '1';
+  h['X-pegasus-route'] = String(routeNum);
+
+  return h;
+}
+
+/**
+ * resolveSource — resuelve sources dinámicos del field_schema
+ */
+function resolveSource(source, event, unit) {
+  const iso = event.wialon_ts
+    ? new Date(event.wialon_ts).toISOString()
+    : new Date().toISOString();
+  const d   = new Date(iso);
+  const pad = n => String(n).padStart(2, '0');
+
+  switch (source) {
+    case 'lat':               return Number(event.lat     || 0);
+    case 'lon':               return Number(event.lon     || 0);
+    case 'speed':             return Number(event.speed   || 0);
+    case 'heading':           return Number(event.heading || 0);
+    case 'ignition':          return Boolean(event.ignition);
+    case 'ignition01':        return event.ignition ? 1 : 0;
+    case 'alt':               return Number(event.alt     || 0);
+    case 'sats':              return Number(event.sats    || 0);
+    case 'hdop':              return Number(event.hdop    || 0);
+    case 'odometro':          return Number(event.odometro || 0);
+    case 'unit_plate':
+    case 'plate':             return unit.plate  || '';
+    case 'unit_imei':
+    case 'imei':              return unit.imei   || '';
+    case 'unit_name':         return unit.name   || '';
+    case 'cliente_nombre':    return unit.cliente_nombre || unit.name || '';
+    case 'cliente_rut':       return unit.cliente_rut    || unit.rut  || '';
+    case 'wialon_ts':         return iso;
+    case 'unix_timestamp':    return Math.floor(new Date(iso).getTime() / 1000);
+    case 'unix_timestamp_ms': return new Date(iso).getTime();
+    case 'fecha_utc': {
+      if (isNaN(d)) return iso;
+      return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+    }
+    default: return undefined;
+  }
+}
+
+module.exports = { build, headers };
