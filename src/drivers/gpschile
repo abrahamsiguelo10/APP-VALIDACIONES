@@ -1,105 +1,84 @@
 'use strict';
 
 /**
- * src/drivers/tracktec.js  (también usado como gpschile.js)
+ * src/drivers/gpschile.js
  * ─────────────────────────────────────────────────────────────────
- * Driver SOAP/XML para TrackTec / GPS Chile — Hub de Gestión Vial
+ * Driver REST/JSON para GPS Chile — Multiflota Track
  *
- * Método:  Post_XMLRequest (SOAP 1.1)
- * WSDL QA: https://qa-wshub.tracktec.cl/ws/wspos.wsdl
- * WSDL PR: https://wshub.tracktec.cl/ws/wspos.wsdl
+ * Endpoint: POST https://trackws.gpschile.com/api/inyeccion
+ * Auth:     Authorization: <Token en Base64>
+ * Body:     JSON array de actividades
  *
- * Autenticación (prioridad):
- *   1. Bearer Token desde route.auth  → Authorization: Bearer <token>
- *   2. Basic Auth desde route.auth    → login/clave dentro del XML
- *   3. Variables de entorno Railway   → TRACKTEC_USER / TRACKTEC_PASS
+ * Configuración en GUI:
+ *   driver_slug : gpschile
+ *   api_url     : https://trackws.gpschile.com/api/inyeccion
+ *   auth → type : bearer
+ *   auth → token: TOKEN_PRODUCCION (proporcionado por GPSChile)
  *
- * Configuración de campos (prioridad):
- *   1. field_schema valores fijos (GUI → Mapeo de campos)
- *   2. Variables de entorno Railway
+ * Campos mutables desde field_schema (source: fixed):
+ *   rutCliente   — RUT del mandante sin puntos, con guión (ej: 90227000-0)
+ *   rutConductor — RUT del conductor (default: "")
+ *   idConductor  — ID del conductor (default: "")
+ *   codigoActividad — código de evento (default: 20 = ACTUALIZACION PROGRAMADA)
+ *   ubicacion    — descripción de ubicación (default: "" → usa reverse geocoding si está disponible)
  *
- * Variables de entorno Railway (fallback global):
- *   TRACKTEC_URL      — endpoint SOAP
- *   TRACKTEC_USER     — login XML (solo si no hay Bearer Token)
- *   TRACKTEC_PASS     — clave XML (solo si no hay Bearer Token)
- *   TRACKTEC_PGPS     — nombre proveedor GPS (ej: SIGUELOGPS)
- *   TRACKTEC_TERCERO  — nombre transportista/cliente
- *   TRACKTEC_EMPRESA  — nombre empresa (default: controlsellos)
- *   TRACKTEC_EVENTO   — código de evento (default: 46)
+ * Campos calculados automáticamente:
+ *   idActividad        — timestamp_ms + imei sufijo (único por evento)
+ *   fechaActividad     — wialon_ts en formato ISO UTC
+ *   fechaRecepcion     — now() en formato ISO UTC
+ *   latitud/longitud   — coordenadas GPS
+ *   velocidadActual    — speed del evento
+ *   velocidadMaxima    — igual a velocidadActual (no tenemos max entre puntos)
+ *   nroSatelites       — sats del evento
+ *   hdop               — hdop del evento
+ *   odometro           — odometro del evento
+ *   altura             — alt del evento
+ *   heading            — heading del evento
+ *   ignicion           — 1/0 desde ignition
+ *   imei               — IMEI de la unidad
+ *   gpsValid           — calculado desde sats y hdop
+ *   horasMotor         — hourmeter del evento
+ *   patente            — plate sin guiones en mayúsculas
+ *   distanciaRecorrida — 0 (no disponible)
+ *   distanciaAcumulada — 0 (no disponible)
+ *   idGeocerca         — siempre -1 (requerido por manual)
+ *   actividadExtendidaTipo  — 0 (sin actividad extendida)
+ *   actividadExtendidaValor — ""
  */
 
-const ENV_URL     = process.env.TRACKTEC_URL     || 'https://wshub.tracktec.cl/ws/wspos';
-const ENV_USER    = process.env.TRACKTEC_USER    || '';
-const ENV_PASS    = process.env.TRACKTEC_PASS    || '';
-const ENV_PGPS    = process.env.TRACKTEC_PGPS    || 'SIGUELOGPS';
-const ENV_TERCERO = process.env.TRACKTEC_TERCERO || '';
-const ENV_EMPRESA = process.env.TRACKTEC_EMPRESA || 'controlsellos';
-const ENV_EVE     = process.env.TRACKTEC_EVENTO  || '46';
+// Códigos de actividad según manual
+const COD_ACTUALIZACION = 20; // ACTUALIZACION PROGRAMADA (default)
 
-const SOAP_ACTION = 'http://wspos.tracktec.cl/wspos/Post_XMLRequest';
+// ── Helpers ──────────────────────────────────────────────────────
 
-/* ── Helpers ─────────────────────────────────────────────────── */
-function esc(v) {
-  return String(v ?? '')
-    .replace(/&/g,  '&amp;')
-    .replace(/</g,  '&lt;')
-    .replace(/>/g,  '&gt;')
-    .replace(/"/g,  '&quot;')
-    .replace(/'/g,  '&apos;');
+function toISOLocal(wialon_ts) {
+  const iso = wialon_ts ? new Date(wialon_ts).toISOString() : new Date().toISOString();
+  // Formato requerido: "2020-05-07T22:59:59.000"
+  return iso.replace('Z', '').slice(0, 23) + '.000';
 }
 
-function pad2(n) { return String(n).padStart(2, '0'); }
-
-function toFechaChile(wialon_ts) {
-  const iso = wialon_ts || new Date().toISOString();
-  try {
-    const d = new Date(new Date(iso).toLocaleString('en-US', { timeZone: 'America/Santiago' }));
-    return `${pad2(d.getDate())}/${pad2(d.getMonth()+1)}/${d.getFullYear()} ` +
-           `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
-  } catch (_) {
-    const d = new Date(new Date(iso).getTime() - 4 * 3600 * 1000);
-    return `${pad2(d.getUTCDate())}/${pad2(d.getUTCMonth()+1)}/${d.getUTCFullYear()} ` +
-           `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`;
-  }
+function calcGpsValid(sats, hdop) {
+  const s = Number(sats || 0);
+  const h = Number(hdop || 0);
+  if (s > 5 && h > 0 && h < 1.2) return 1;
+  if (s > 5 && h === 0) return 1; // si no hay hdop, confiar en satélites
+  return 0;
 }
 
-/* ── Leer configuración desde route ─────────────────────────── */
-function readConfig(route) {
-  // URL: prioridad → route.url (viene de api_url en la DB) → ENV
-  let url         = ENV_URL;
-  let bearerToken = null;
-  let login       = ENV_USER;
-  let clave       = ENV_PASS;
-  let pgps        = ENV_PGPS;
-  let tercero     = ENV_TERCERO;
-  let empresa     = ENV_EMPRESA;
-  let eve         = ENV_EVE;
+function genIdActividad(wialon_ts, imei) {
+  const ts = wialon_ts ? new Date(wialon_ts).getTime() : Date.now();
+  const suffix = String(imei || '000000').slice(-6);
+  return `${ts}${suffix}`;
+}
 
-  // 1. URL del destino — tcp-server la pasa como route.url (viene de api_url en DB)
-  if (route?.url && String(route.url).trim()) {
-    url = String(route.url).trim().replace(/\/+$/, '');
-  }
+// ── Leer configuración desde field_schema ────────────────────────
+function readSchema(route) {
+  let rutCliente        = '';
+  let rutConductor      = '';
+  let idConductor       = '';
+  let codigoActividad   = COD_ACTUALIZACION;
+  let ubicacion         = '';
 
-  // 2. Leer auth del destino (GUI → Autenticación de la API)
-  try {
-    const auth = typeof route?.auth === 'string' ? JSON.parse(route.auth) : route?.auth;
-    if (auth) {
-      // Bearer Token (tipo seleccionado en GUI)
-      if (auth.type === 'bearer' && auth.token) {
-        bearerToken = String(auth.token).trim();
-      }
-      // Token directo sin type
-      else if (auth.token && !auth.username) {
-        bearerToken = String(auth.token).trim();
-      }
-      // Basic Auth (login/clave en XML)
-      if (auth.username) login = auth.username;
-      if (auth.password) clave = auth.password;
-    }
-  } catch (_) {}
-
-  // 3. field_schema overrides — solo sobreescribe si el campo está definido
-  //    (la URL normalmente NO viene en field_schema, viene de api_url del destino)
   try {
     let schema = route?.field_schema || [];
     if (typeof schema === 'string') {
@@ -108,191 +87,126 @@ function readConfig(route) {
     for (const f of schema) {
       if (f.source === 'fixed' && f.fixedValue !== undefined && f.fixedValue !== '') {
         const k = f.apiKey || '';
-        if (k === 'tercero'          || k === 'tracktec_tercero') tercero = f.fixedValue;
-        if (k === 'empresa'          || k === 'tracktec_empresa') empresa = f.fixedValue;
-        if (k === 'pgps'             || k === 'tracktec_pgps')    pgps    = f.fixedValue;
-        if (k === 'eve'              || k === 'tracktec_evento')  eve     = f.fixedValue;
-        // URL solo se sobreescribe si hay un campo explícito en field_schema
-        if (k === 'tracktec_url'     || k === 'url')              url     = String(f.fixedValue).trim().replace(/\/+$/, '');
-        if (k === 'tracktec_login'   || k === 'login')            login   = f.fixedValue;
-        if (k === 'tracktec_clave'   || k === 'clave')            clave   = f.fixedValue;
+        if (k === 'rutCliente')      rutCliente      = String(f.fixedValue);
+        if (k === 'rutConductor')    rutConductor    = String(f.fixedValue);
+        if (k === 'idConductor')     idConductor     = String(f.fixedValue);
+        if (k === 'codigoActividad') codigoActividad = parseInt(f.fixedValue, 10) || COD_ACTUALIZACION;
+        if (k === 'ubicacion')       ubicacion       = String(f.fixedValue);
       }
     }
   } catch (_) {}
 
-  // Log de configuración resuelta (siempre visible para diagnóstico)
-  console.log(`[tracktec] config → url=${url} | pgps=${pgps} | tercero=${tercero} | empresa=${empresa} | eve=${eve} | auth=${bearerToken ? 'Bearer(***'+bearerToken.slice(-6)+')' : login ? 'Basic('+login+')' : 'NINGUNA'}`);
-
-  return { url, bearerToken, login, clave, pgps, tercero, empresa, eve };
+  return { rutCliente, rutConductor, idConductor, codigoActividad, ubicacion };
 }
 
-/* ── Construir XML interno ───────────────────────────────────── */
-function buildDatosXml({ pgps, tercero, empresa, pat, fn, lat, lon,
-                          ori, vel, mot, hdop, odo, eve,
-                          conductor, numSAT, sens1, sens2,
-                          login, clave, includeCredentials }) {
-  // Si hay Bearer Token, las credenciales van vacías en el XML
-  // Si hay Basic Auth, van rellenas
-  const xmlLogin = includeCredentials ? login : '';
-  const xmlClave = includeCredentials ? clave : '';
-
-  return `<?xml version="1.0" encoding="ISO-8859-1"?><datos>` +
-    `<movil>` +
-      `<pgps>${esc(pgps)}</pgps>` +
-      `<tercero>${esc(tercero)}</tercero>` +
-      `<empresa>${esc(empresa)}</empresa>` +
-      `<pat>${esc(pat)}</pat>` +
-      `<fn>${esc(fn)}</fn>` +
-      `<lat>${lat}</lat>` +
-      `<lon>${lon}</lon>` +
-      `<ori>${ori}</ori>` +
-      `<vel>${vel}</vel>` +
-      `<mot>${mot}</mot>` +
-      `<hdop>${hdop}</hdop>` +
-      `<odo>${odo}</odo>` +
-      `<eve>${esc(eve)}</eve>` +
-      `<conductor>${esc(conductor)}</conductor>` +
-      `<numSAT>${numSAT}</numSAT>` +
-      `<sens1>${sens1}</sens1>` +
-      `<sens2>${sens2}</sens2>` +
-    `</movil>` +
-    `<usuario xmlns="user">` +
-      `<login>${esc(xmlLogin)}</login>` +
-      `<clave>${esc(xmlClave)}</clave>` +
-    `</usuario>` +
-  `</datos>`;
-}
-
-/* ── Construir envelope SOAP ─────────────────────────────────── */
-function buildEnvelope(datosXml) {
-  return `<?xml version="1.0" encoding="utf-8"?>` +
-    `<soapenv:Envelope ` +
-      `xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" ` +
-      `xmlns:wsp="http://wspos.tracktec.cl/wspos">` +
-      `<soapenv:Header/>` +
-      `<soapenv:Body>` +
-        `<wsp:Post_XMLRequest>` +
-          `<wsp:xmldoc><![CDATA[${datosXml}]]></wsp:xmldoc>` +
-        `</wsp:Post_XMLRequest>` +
-      `</soapenv:Body>` +
-    `</soapenv:Envelope>`;
-}
-
-/* ── Función principal ───────────────────────────────────────── */
+// ── Función principal ─────────────────────────────────────────────
 async function send({ event, unit, route }) {
-  const cfg = readConfig(route);
+  // Auth: token en header Authorization
+  const auth = (() => {
+    try { return typeof route?.auth === 'string' ? JSON.parse(route.auth) : route?.auth; }
+    catch (_) { return null; }
+  })();
 
-  // Validar autenticación disponible
-  if (!cfg.bearerToken && !cfg.login && !cfg.clave) {
-    console.error('[tracktec] ❌ Sin credenciales — configura Bearer Token en la GUI o variables de entorno');
-    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing credentials' };
-  }
-  if (!cfg.tercero) {
-    console.error('[tracktec] ❌ Campo "tercero" no configurado en field_schema');
-    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing tercero' };
+  const token = auth?.token || auth?.bearer || '';
+  if (!token) {
+    console.error('[gpschile] ❌ Token no configurado en auth del destino');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing token' };
   }
 
-  const pat = (unit.plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-  if (!pat) {
+  // Campos mutables desde field_schema
+  const cfg = readSchema(route);
+
+  if (!cfg.rutCliente) {
+    console.error('[gpschile] ❌ Campo "rutCliente" no configurado en field_schema');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing rutCliente' };
+  }
+
+  // Patente: mayúsculas sin guiones (según manual: "CHFX37")
+  const patente = (unit.plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (!patente) {
     return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing plate' };
   }
 
   const vel    = Math.round(Number(event.speed   || 0));
-  const ori    = Math.round(Number(event.heading || 0));
-  const mot    = (event.ignition === true || event.ignition === 1) ? 1 : 0;
-  const hdop   = Math.round(Number(event.hdop    || 0));
-  const odo    = Number(event.odometro || 0).toFixed(2);
-  const numSAT = Math.round(Number(event.sats    || 0));
+  const sats   = Math.round(Number(event.sats    || 0));
+  const hdop   = Number(event.hdop               || 0);
+  const odo    = Math.round(Number(event.odometro|| 0));
+  const alt    = Math.round(Number(event.alt     || 0));
+  const head   = Math.round(Number(event.heading || 0));
+  const ign    = (event.ignition === true || event.ignition === 1) ? 1 : 0;
+  const hours  = Number(event.hourmeter          || 0);
+  const now    = new Date().toISOString().replace('Z', '').slice(0, 23) + '.000';
 
-  // Si hay Bearer Token, las credenciales XML van vacías
-  const includeCredentials = !cfg.bearerToken;
-
-  const datosXml = buildDatosXml({
-    pgps:      cfg.pgps,
-    tercero:   cfg.tercero,
-    empresa:   cfg.empresa,
-    pat,
-    fn:        toFechaChile(event.wialon_ts),
-    lat:       event.lat ?? 0,
-    lon:       event.lon ?? event.lng ?? 0,
-    ori, vel, mot, hdop, odo,
-    eve:       cfg.eve,
-    conductor: 'No Asignado',
-    numSAT,
-    sens1:     0,
-    sens2:     0,
-    login:     cfg.login,
-    clave:     cfg.clave,
-    includeCredentials,
-  });
-
-  const envelope = buildEnvelope(datosXml);
-
-  // Construir headers HTTP
-  const headers = {
-    'Content-Type': 'text/xml; charset=utf-8',
-    'SOAPAction':   `"${SOAP_ACTION}"`,
+  const actividad = {
+    idActividad:             genIdActividad(event.wialon_ts, unit.imei),
+    codigoActividad:         cfg.codigoActividad,
+    fechaActividad:          toISOLocal(event.wialon_ts),
+    fechaRecepcion:          now,
+    idGeocerca:              -1,
+    latitud:                 Number(event.lat  || 0),
+    longitud:                Number(event.lon  || 0),
+    velocidadActual:         vel,
+    velocidadMaxima:         vel,  // no tenemos velocidad max entre puntos
+    ubicacion:               cfg.ubicacion,
+    distanciaRecorrida:      0,
+    distanciaAcumulada:      0,
+    nroSatelites:            sats,
+    hdop,
+    odometro:                odo,
+    altura:                  alt,
+    heading:                 head,
+    ignicion:                ign,
+    imei:                    unit.imei || '',
+    gpsValid:                calcGpsValid(sats, hdop),
+    actividadExtendidaTipo:  0,
+    actividadExtendidaValor: '',
+    idConductor:             cfg.idConductor,
+    rutCliente:              cfg.rutCliente,
+    rutConductor:            cfg.rutConductor,
+    patente,
+    horasMotor:              hours,
   };
 
-  // Resolver Authorization header
-  // GPSChile envía el token como Base64(usuario:password) seleccionado como "Bearer Token"
-  // en la GUI — en realidad es Basic Auth. Detectar automáticamente por presencia de ':'
-  // al decodificar el Base64.
-  if (cfg.bearerToken) {
-    let authType = 'bearer';
-    try {
-      const decoded = Buffer.from(cfg.bearerToken, 'base64').toString('utf8');
-      if (decoded.includes(':')) authType = 'basic';
-    } catch (_) {}
+  const body = JSON.stringify([actividad]);
 
-    if (authType === 'basic') {
-      // El token ya es Base64(usuario:password) — enviarlo como Basic directamente
-      headers['Authorization'] = `Basic ${cfg.bearerToken}`;
-      console.log(`[tracktec] token Base64 detectado como Basic Auth → Authorization: Basic ***${cfg.bearerToken.slice(-6)}`);
-    } else {
-      headers['Authorization'] = `Bearer ${cfg.bearerToken}`;
-      console.log(`[tracktec] usando Bearer Token (***${cfg.bearerToken.slice(-6)})`);
-    }
-  } else {
-    console.log(`[tracktec] sin token HTTP — credenciales solo en XML (login=${cfg.login})`);
-  }
+  const headers = {
+    'Content-Type':  'application/json',
+    'Accept':        'application/json',
+    'Authorization': token, // token ya viene listo (puede ser Base64 o Bearer)
+  };
 
-  console.log(`[tracktec] enviando pat=${pat} tercero=${cfg.tercero} empresa=${cfg.empresa} url=${cfg.url}`);
+  const url = route?.url || 'https://trackws.gpschile.com/api/inyeccion';
+
+  console.log(`[gpschile] enviando patente=${patente} rutCliente=${cfg.rutCliente} url=${url}`);
+  console.log(`[gpschile] payload=${body.slice(0, 400)}`);
 
   const t0 = Date.now();
 
   try {
-    const res = await fetch(cfg.url, {
-      method:  'POST',
-      headers,
-      body:    envelope,
-      signal:  AbortSignal.timeout(10000),
-    });
-
+    const res     = await fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(10000) });
     const latency = Date.now() - t0;
     const resText = await res.text().catch(() => '');
 
-    const ok = res.ok && /Post_XMLResult[^>]*>OK</i.test(resText);
+    // GPSChile devuelve un batchId en la respuesta → éxito si HTTP 200/201
+    const ok = res.status >= 200 && res.status < 300;
 
     if (ok) {
-      console.log(`[tracktec] ✓ pat=${pat} (${latency}ms)`);
+      console.log(`[gpschile] ✓ patente=${patente} (${res.status}) ${latency}ms | ${resText.slice(0, 100)}`);
     } else {
-      const errMatch = resText.match(/Post_XMLResult[^>]*>([^<]+)</i);
-      const errMsg   = errMatch ? errMatch[1] : resText.slice(0, 200);
-      console.error(`[tracktec] ✗ pat=${pat} http=${res.status} err=${errMsg}`);
+      console.error(`[gpschile] ✗ patente=${patente} http=${res.status} | ${resText.slice(0, 200)}`);
     }
 
     return {
       ok,
       http_status:   res.status,
-      status:        ok ? 'ok' : 'failed',
+      status:        ok ? 'sent' : 'failed',
       response_http: resText.slice(0, 500),
       latency_ms:    latency,
     };
 
   } catch (err) {
     const latency = Date.now() - t0;
-    console.error(`[tracktec] Error fetch: ${err.message}`);
+    console.error(`[gpschile] Error fetch: ${err.message}`);
     return {
       ok:            false,
       http_status:   0,
