@@ -36,6 +36,20 @@ const _destCache    = new Map(); // imei       → { data, expiresAt }
 const _clienteCache = new Map(); // cliente_id → { data, expiresAt }
 const _geocodeCache = new Map(); // "lat,lon"  → { data, expiresAt } ← NUEVO
 
+// ─── Caché de último estado GPS por plate ─────────────────────────────────────
+// Permite al validador público consultar el estado sin tocar gps_events
+const _lastGpsState = new Map(); // plate → { lat, lon, speed, heading, ignition, wialon_ts, received_at }
+
+function setLastGpsState(plate, data) {
+  if (!plate) return;
+  _lastGpsState.set(plate.toUpperCase(), { ...data, received_at: new Date().toISOString() });
+}
+
+function getLastGpsState(plate) {
+  if (!plate) return null;
+  return _lastGpsState.get(plate.toUpperCase()) || null;
+}
+
 function cacheGet(map, key) {
   const entry = map.get(key);
   if (!entry) return undefined;
@@ -564,6 +578,17 @@ async function buildPayload(fieldSchema, unit, parsed, clienteData) {
 
 // ─── Reenviar a destinos ──────────────────────────────────────────────────────
 async function forwardToDestinations(unit, parsed) {
+  // Guardar último estado GPS en caché de memoria para el validador público
+  if (unit.plate && parsed.lat && parsed.lon) {
+    setLastGpsState(unit.plate, {
+      lat:       parsed.lat,
+      lon:       parsed.lon,
+      speed:     parsed.speed,
+      heading:   parsed.heading,
+      ignition:  parsed.ignition,
+      wialon_ts: parsed.wialon_ts,
+    });
+  }
   let clienteData = {};
   try {
     if (unit.cliente_id) {
@@ -900,4 +925,4 @@ function startTcpServer() {
   return server;
 }
 
-module.exports = { startTcpServer };
+module.exports = { startTcpServer, getLastGpsState };
