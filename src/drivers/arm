@@ -197,6 +197,7 @@ async function send({ event, unit, route } = {}) {
   const body = { paquetes: { paquetes: [paquete] } };
 
   console.log(`[arm] enviando plate=${plate} fecha=${paquete.Fecha} hora=${paquete.Hora}`);
+  console.log(`[arm] payload:`, JSON.stringify(body));
 
   const t0 = Date.now();
   let res, resText;
