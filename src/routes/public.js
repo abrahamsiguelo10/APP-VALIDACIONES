@@ -2,12 +2,20 @@
 /**
  * src/routes/public.js
  * Endpoints públicos — sin autenticación
- * IMPORTANTE: No consulta gps_events para evitar saturar el pool
- * Los datos GPS vienen del endpoint gps-proxy que tiene su propio caché
  */
 
 const router    = require('express').Router();
 const { query } = require('../db/pool');
+
+// Importar caché GPS del tcp-server (en memoria, sin tocar DB)
+let _getLastGpsState = null;
+try {
+  const tcpServer = require('../tcp-server');
+  _getLastGpsState = tcpServer.getLastGpsState;
+  console.log('[public] caché GPS del tcp-server disponible');
+} catch (e) {
+  console.warn('[public] tcp-server no disponible, GPS se omitirá:', e.message);
+}
 
 console.log('[public] ruta cargada OK');
 
@@ -21,7 +29,7 @@ router.get('/search', async (req, res) => {
       return res.status(400).json({ error: 'Mínimo 4 caracteres.' });
     }
 
-    // 1. Unidad — solo tabla units + clientes (rápido, sin gps_events)
+    // 1. Unidad
     const { rows: unitRows } = await query(`
       SELECT u.imei, u.plate, u.enabled, c.nombre AS cliente
       FROM public.units u
@@ -35,7 +43,7 @@ router.get('/search', async (req, res) => {
     }
     const unit = unitRows[0];
 
-    // 2. Destinos — tabla unit_destinations + destinations (rápido)
+    // 2. Destinos
     const { rows: destRows } = await query(`
       SELECT d.name AS nombre, ud.enabled
       FROM public.unit_destinations ud
@@ -44,8 +52,25 @@ router.get('/search', async (req, res) => {
       ORDER BY d.name
     `, [unit.imei]);
 
-    // Responder sin datos GPS — el frontend los puede obtener por separado
-    // o mostramos lo que ya tenemos sin bloquear el pool con gps_events
+    // 3. GPS desde caché en memoria del tcp-server (sin tocar DB)
+    let gps = null;
+    if (_getLastGpsState) {
+      const cached = _getLastGpsState(unit.plate);
+      if (cached) {
+        const ageMins = (Date.now() - new Date(cached.received_at).getTime()) / 60000;
+        gps = {
+          lat:          Number(cached.lat),
+          lon:          Number(cached.lon),
+          speed:        Number(cached.speed    || 0),
+          heading:      Number(cached.heading  || 0),
+          ignition:     Boolean(cached.ignition),
+          last_event:   cached.wialon_ts || cached.received_at,
+          received_at:  cached.received_at,
+          transmitting: ageMins < 20,
+        };
+      }
+    }
+
     res.json({
       unit: {
         plate:   unit.plate,
@@ -53,7 +78,7 @@ router.get('/search', async (req, res) => {
         enabled: unit.enabled,
         cliente: unit.cliente || null,
       },
-      gps:          null,   // se carga aparte vía /gps/unit-status
+      gps,
       destinations: destRows,
       history:      [],
     });
