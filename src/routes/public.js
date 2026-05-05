@@ -69,15 +69,15 @@ router.get('/search', async (req, res) => {
       cliente: unit.cliente,
     },
     gps: {
-      lat:          gps.lat       || null,
-      lon:          gps.lon       || null,
-      speed:        gps.speed     ?? null,
-      ignition:     gps.ignition  ?? null,
-      last_event:   gps.last_event || null,
-      transmitting: gps.last_event
-        ? (Date.now() - new Date(gps.last_event).getTime()) < 10 * 60 * 1000
-        : false,
-    },
+  lat:          gps.lat       ? Number(gps.lat)   : null,
+  lon:          gps.lon       ? Number(gps.lon)   : null,
+  speed:        gps.speed     != null ? Number(gps.speed) : null,
+  ignition:     gps.ignition  ?? null,
+  last_event:   gps.last_event || null,
+  transmitting: gps.last_event
+    ? (Date.now() - new Date(gps.last_event).getTime()) < 10 * 60 * 1000
+    : false,
+},
     destinations: unit.destinations,
     history:      histRows,
   });
