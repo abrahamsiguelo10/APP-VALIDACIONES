@@ -1,6 +1,7 @@
 /**
  * drivers/pegasus.js
  * Integración con Pegasus GPS (analyzegps.cl)
+ * Manual v7.4 - JUL/2025
  *
  * Endpoint: POST https://pro.analyzegps.cl/receivers/json
  * Headers:
@@ -17,37 +18,65 @@
  *     [{ "key": "Authenticate",    "value": "TU_TOKEN" },
  *      { "key": "X-pegasus-route", "value": "1"        }]
  *
- * field_schema: campos opcionales extra (io.ignition, metric.odometer, etc.)
+ * field_schema: campos opcionales extra (metric.odometer, metric.hourmeter, etc.)
+ * Campos mutables desde field_schema: protocol.vendor, protocol.id, device.type.id
  */
 
 'use strict';
 
-async function send({ event, unit, route }) {
-  // ── Campos mutables — pueden sobreescribirse desde field_schema ──
-  const MUTABLE = new Set(['protocol.vendor', 'protocol.id', 'device.type.id']);
+// Campos que pueden sobreescribirse desde el field_schema
+const MUTABLE = new Set(['protocol.vendor', 'protocol.id', 'device.type.id']);
 
-  // ── Payload en notación plana — exactamente como Pegasus espera ──
+async function send({ event, unit, route }) {
+
+  // ── device.id: patente limpia (6-12 chars, sin espacios ni especiales) ──
+  // El manual exige entre 6 y 12 caracteres alfanuméricos + guión
+  const rawPlate = (unit.plate || unit.imei || '').trim();
+  const deviceId = rawPlate.replace(/[^a-zA-Z0-9-]/g, '').slice(0, 12);
+
+  // ── server.timestamp: epoch en segundos del momento de envío ──────
+  const serverTs = Math.floor(Date.now() / 1000);
+
+  // ── Payload base ──────────────────────────────────────────────────
+  // IMPORTANTE (manual §9): No enviar campos con valor 0 si se desconoce el valor
+  // Solo se incluyen hdop, satellites y altitude si tienen valor real (> 0)
   const payload = {
     'timestamp':          Math.floor(new Date(event.wialon_ts || Date.now()).getTime() / 1000),
-    'device.id':          unit.plate || unit.imei || '',
+    'server.timestamp':   serverTs,
+    'device.id':          deviceId,
     'device.name':        unit.plate || '',
     'protocol.id':        'rt.platform',
     'device.type.id':     'rt.platform',
     'protocol.vendor':    'SIGUELO',
-    'position.latitude':  Number(event.lat     || 0),
-    'position.longitude': Number(event.lon     || 0),
-    'position.speed':     Number(event.speed   || 0),
+    'position.latitude':  Number(event.lat   || 0),
+    'position.longitude': Number(event.lon   || 0),
+    'position.speed':     Number(event.speed || 0),
     'position.direction': Number(event.heading || 0),
-    'position.altitude':  Number(event.alt     || 0),
-    'position.hdop':      Number(event.hdop    || 0),
-    'position.satellites':Number(event.sats    || 0),
+    'position.valid':     true,
     'io.ignition':        Boolean(event.ignition),
   };
 
+  // Altitude — solo si es un valor real distinto de 0
+  const alt = Number(event.alt || 0);
+  if (alt !== 0) payload['position.altitude'] = alt;
+
+  // HDOP — solo si tiene valor real (0 significa desconocido según manual)
+  const hdop = Number(event.hdop || 0);
+  if (hdop > 0) payload['position.hdop'] = hdop;
+
+  // Satélites — solo si tiene valor real
+  const sats = Number(event.sats || 0);
+  if (sats > 0) payload['position.satellites'] = sats;
+
+  // Odómetro — solo si viene informado
+  const odo = Number(event.odometro || 0);
+  if (odo > 0) payload['metric.odometer'] = odo;
+
+  // Hourmeter — solo si viene informado
+  const hours = Number(event.hourmeter || 0);
+  if (hours > 0) payload['metric.hourmeter'] = hours;
+
   // ── Campos extra desde field_schema ──────────────────────────────
-  // Campos mutables (protocol.vendor, protocol.id, device.type.id) siempre
-  // se sobreescriben si están en el field_schema.
-  // El resto solo se agrega si no existe ya en el payload base.
   const schema = Array.isArray(route.field_schema) ? route.field_schema : [];
   for (const f of schema) {
     if (!f.apiKey) continue;
@@ -57,13 +86,12 @@ async function send({ event, unit, route }) {
         f.fixedValue !== undefined && f.fixedValue !== null && f.fixedValue !== '');
     const val = isFixed ? f.fixedValue : resolveSource(f.source, event, unit);
     if (val === undefined || val === null || val === '') continue;
-    // Sobreescribir si: es campo mutable, tiene override:true, o no existe en payload
     if (MUTABLE.has(f.apiKey) || f.override === true || !(f.apiKey in payload)) {
       payload[f.apiKey] = val;
     }
   }
 
-  // ── Headers desde auth custom-headers de la GUI ──────────────────
+  // ── Headers desde auth custom-headers de la GUI ───────────────────
   const headers = { 'Content-Type': 'application/json' };
   const auth = route.auth || {};
   if (Array.isArray(auth.headers)) {
@@ -92,17 +120,17 @@ function resolveSource(source, event, unit) {
     : new Date().toISOString();
 
   switch (source) {
-    case 'lat':               return Number(event.lat      || 0);
-    case 'lon':               return Number(event.lon      || 0);
-    case 'speed':             return Number(event.speed    || 0);
-    case 'heading':           return Number(event.heading  || 0);
+    case 'lat':               return Number(event.lat       || 0);
+    case 'lon':               return Number(event.lon       || 0);
+    case 'speed':             return Number(event.speed     || 0);
+    case 'heading':           return Number(event.heading   || 0);
     case 'ignition':          return Boolean(event.ignition);
     case 'ignition01':        return event.ignition ? 1 : 0;
-    case 'alt':               return Number(event.alt      || 0);
-    case 'sats':              return Number(event.sats     || 0);
-    case 'hdop':              return Number(event.hdop     || 0);
-    case 'odometro':          return Number(event.odometro || 0);
-    case 'hourmeter':         return Number(event.hourmeter|| 0);
+    case 'alt':               return Number(event.alt       || 0);
+    case 'sats':              return Number(event.sats      || 0);
+    case 'hdop':              return Number(event.hdop      || 0);
+    case 'odometro':          return Number(event.odometro  || 0);
+    case 'hourmeter':         return Number(event.hourmeter || 0);
     case 'unit_plate':
     case 'plate':             return unit.plate  || '';
     case 'unit_imei':
