@@ -89,6 +89,7 @@ app.get('/health', async (_req, res) => {
 });
 
 /* ── Rutas ────────────────────────────────────────────────────── */
+app.use('/public', require('./routes/public'));
 app.use('/auth',         authRoutes);
 app.use('/users',        userRoutes);
 app.use('/destinations', destRoutes);
