@@ -2,6 +2,13 @@
  * drivers/pegasus.js
  * Integración con Pegasus GPS (analyzegps.cl)
  *
+ * Endpoint: POST https://pro.analyzegps.cl/receivers/json
+ * Headers:
+ *   Content-Type: application/json
+ *   Authenticate: RECEIVER_TOKEN
+ *   X-pegasus-route: ##
+ * Body: array de eventos con campos en notación plana con punto
+ *
  * Configuración en GUI:
  *   driver_slug : pegasus
  *   api_url     : https://pro.analyzegps.cl/receivers/json
@@ -10,35 +17,37 @@
  *     [{ "key": "Authenticate",    "value": "TU_TOKEN" },
  *      { "key": "X-pegasus-route", "value": "1"        }]
  *
- * field_schema: campos opcionales extra (driverName, temperature, etc.)
+ * field_schema: campos opcionales extra (io.ignition, metric.odometer, etc.)
  */
 
 'use strict';
 
 async function send({ event, unit, route }) {
-  // ── Payload base ──────────────────────────────────────────────
+  // ── Campos mutables — pueden sobreescribirse desde field_schema ──
+  const MUTABLE = new Set(['protocol.vendor', 'protocol.id', 'device.type.id']);
+
+  // ── Payload en notación plana — exactamente como Pegasus espera ──
   const payload = {
-    timestamp: Math.floor(new Date(event.wialon_ts || Date.now()).getTime() / 1000),
-    position: {
-      latitude:  Number(event.lat || 0),
-      longitude: Number(event.lon || 0),
-    },
-    protocol: {
-      id:     'rt.platform',
-      vendor: 'SIGUELO',
-    },
-    device: {
-      type: { id: 'rt.platform' },
-      id:   unit.plate || unit.imei || '',
-      name: unit.plate || '',
-    },
-    speed:    Number(event.speed   || 0),
-    heading:  Number(event.heading || 0),
-    ignition: Boolean(event.ignition),
-    altitude: Number(event.alt     || 0),
+    'timestamp':          Math.floor(new Date(event.wialon_ts || Date.now()).getTime() / 1000),
+    'device.id':          unit.plate || unit.imei || '',
+    'device.name':        unit.plate || '',
+    'protocol.id':        'rt.platform',
+    'device.type.id':     'rt.platform',
+    'protocol.vendor':    'SIGUELO',
+    'position.latitude':  Number(event.lat     || 0),
+    'position.longitude': Number(event.lon     || 0),
+    'position.speed':     Number(event.speed   || 0),
+    'position.direction': Number(event.heading || 0),
+    'position.altitude':  Number(event.alt     || 0),
+    'position.hdop':      Number(event.hdop    || 0),
+    'position.satellites':Number(event.sats    || 0),
+    'io.ignition':        Boolean(event.ignition),
   };
 
-  // ── Campos extra desde field_schema ──────────────────────────
+  // ── Campos extra desde field_schema ──────────────────────────────
+  // Campos mutables (protocol.vendor, protocol.id, device.type.id) siempre
+  // se sobreescriben si están en el field_schema.
+  // El resto solo se agrega si no existe ya en el payload base.
   const schema = Array.isArray(route.field_schema) ? route.field_schema : [];
   for (const f of schema) {
     if (!f.apiKey) continue;
@@ -48,16 +57,13 @@ async function send({ event, unit, route }) {
         f.fixedValue !== undefined && f.fixedValue !== null && f.fixedValue !== '');
     const val = isFixed ? f.fixedValue : resolveSource(f.source, event, unit);
     if (val === undefined || val === null || val === '') continue;
-    if (f.apiKey.includes('.')) {
-      const [parent, child] = f.apiKey.split('.');
-      if (!payload[parent] || typeof payload[parent] !== 'object') payload[parent] = {};
-      payload[parent][child] = val;
-    } else {
+    // Sobreescribir si: es campo mutable, tiene override:true, o no existe en payload
+    if (MUTABLE.has(f.apiKey) || f.override === true || !(f.apiKey in payload)) {
       payload[f.apiKey] = val;
     }
   }
 
-  // ── Headers desde auth custom-headers de la GUI ───────────────
+  // ── Headers desde auth custom-headers de la GUI ──────────────────
   const headers = { 'Content-Type': 'application/json' };
   const auth = route.auth || {};
   if (Array.isArray(auth.headers)) {
@@ -66,11 +72,11 @@ async function send({ event, unit, route }) {
     }
   }
 
-  // ── Envío ─────────────────────────────────────────────────────
+  // ── Envío — Pegasus siempre espera un array ───────────────────────
   const body = JSON.stringify([payload]);
-  console.log(`[PAYLOAD] ${unit.plate} → pegasus | ${body.slice(0, 400)}`);
+  console.log(`[PAYLOAD] ${unit.plate} → pegasus | ${body.slice(0, 500)}`);
 
-  const res = await fetch(route.url, { method: 'POST', headers, body });
+  const res  = await fetch(route.url, { method: 'POST', headers, body });
   const text = await res.text();
 
   return {
@@ -96,6 +102,7 @@ function resolveSource(source, event, unit) {
     case 'sats':              return Number(event.sats     || 0);
     case 'hdop':              return Number(event.hdop     || 0);
     case 'odometro':          return Number(event.odometro || 0);
+    case 'hourmeter':         return Number(event.hourmeter|| 0);
     case 'unit_plate':
     case 'plate':             return unit.plate  || '';
     case 'unit_imei':
