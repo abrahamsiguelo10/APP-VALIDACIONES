@@ -24,19 +24,24 @@ router.get('/search', async (req, res) => {
   console.log('[public/search] q=', req.query.q);
 
   try {
-    const q = (req.query.q || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const q = (req.query.q || '').trim().toUpperCase().replace(/[^A-Z0-9-]/g, '');
     if (!q || q.length < 4) {
       return res.status(400).json({ error: 'Mínimo 4 caracteres.' });
     }
 
     // 1. Unidad
+    // Buscar con match exacto Y sin guiones (para patentes como RDCR-56 o RDCR56)
+    const qClean = q.replace(/-/g, ''); // versión sin guión
     const { rows: unitRows } = await query(`
       SELECT u.imei, u.plate, u.enabled, c.nombre AS cliente
       FROM public.units u
       LEFT JOIN public.clientes c ON c.id = u.cliente_id
-      WHERE u.plate = $1 OR u.imei = $1
+      WHERE u.plate = $1
+         OR u.plate = $2
+         OR u.imei  = $1
+         OR REPLACE(u.plate, '-', '') = $2
       LIMIT 1
-    `, [q]);
+    `, [q, qClean]);
 
     if (!unitRows.length) {
       return res.status(404).json({ error: 'Unidad no encontrada.' });
