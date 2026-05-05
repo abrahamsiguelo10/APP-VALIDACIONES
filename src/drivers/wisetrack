@@ -25,13 +25,13 @@
 // ── Rate limiting: máx 3 llamados/minuto por URL ──────────────────
 const _callTimes = new Map(); // url → [timestamps]
 
-function checkRateLimit(url) {
-  const now  = Date.now();
-  const key  = url;
+function checkRateLimit(url, plate) {
+  const now   = Date.now();
+  const key   = `${url}||${plate}`; // rate limit por URL + patente, no global
   const times = (_callTimes.get(key) || []).filter(t => now - t < 60000);
   if (times.length >= 3) {
     const waitMs = 60000 - (now - times[0]);
-    console.warn(`[wisetrack] ⚠ rate limit — 3 llamados/min alcanzado, esperar ${Math.ceil(waitMs/1000)}s`);
+    console.warn(`[wisetrack] ⚠ rate limit plate=${plate} — 3 llamados/min alcanzado, esperar ${Math.ceil(waitMs/1000)}s`);
     return false;
   }
   times.push(now);
@@ -184,7 +184,7 @@ async function send({ event, unit, route } = {}) {
   }
 
   // ── Rate limiting: máx 3 llamados/minuto ──────────────────────────
-  if (!checkRateLimit(url)) {
+  if (!checkRateLimit(url, plate)) {
     return { ok: true, status: 'rate_limited', http_status: 0, latency_ms: 0, response_http: 'rate_limited_3_per_min' };
   }
 
