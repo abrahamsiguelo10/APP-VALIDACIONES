@@ -1,0 +1,207 @@
+'use strict';
+
+/**
+ * src/drivers/falabella.js
+ * ─────────────────────────────────────────────────────────────────
+ * Driver REST/JSON para Falabella — Transport Management GPS CORP API
+ *
+ * Endpoint: POST https://tms-services.falabella.supply/api/v1/ms-tms-gps-aggregator/gps/position/
+ * Headers requeridos:
+ *   apikey        — API key proporcionada por Falabella
+ *   authorization — Token de autorización
+ *   x-country     — País (CL, AR, PE, CO, MX)
+ *   User-Agent    — "GPS/1.0.0"
+ *   Content-Type  — application/json
+ *
+ * Configuración en GUI:
+ *   driver_slug : falabella
+ *   api_url     : https://tms-services.falabella.supply/api/v1/ms-tms-gps-aggregator/gps/position/
+ *   auth → type : custom-headers
+ *   auth → headers:
+ *     [{ "key": "apikey",        "value": "TU_APIKEY" },
+ *      { "key": "authorization", "value": "TU_TOKEN"  },
+ *      { "key": "x-country",    "value": "CL"         }]
+ *
+ * Campos mutables desde field_schema (source: fixed):
+ *   provider_id          — ID único del proveedor GPS (RUT o código asignado por Falabella)
+ *   provider_description — Descripción del proveedor (default: "Siguelo GPS")
+ *   x_country            — País (default: "CL")
+ *   speed_unit           — Unidad de velocidad (default: "KILOMETER")
+ */
+
+// ── Helpers ──────────────────────────────────────────────────────
+
+/**
+ * Formato ISO 8601 con offset de zona horaria Chile
+ * Requerido por Falabella: "2024-10-08T15:35:58-03:00"
+ */
+function toISOWithOffset(wialon_ts) {
+  const iso = wialon_ts ? new Date(wialon_ts).toISOString() : new Date().toISOString();
+  try {
+    // Calcular offset de Santiago (varía con horario de verano)
+    const utc     = new Date(iso);
+    const chile   = new Date(utc.toLocaleString('en-US', { timeZone: 'America/Santiago' }));
+    const diffMs  = chile.getTime() - utc.getTime();
+    const offMin  = Math.round(diffMs / 60000);
+    const sign    = offMin >= 0 ? '+' : '-';
+    const absMin  = Math.abs(offMin);
+    const hh      = String(Math.floor(absMin / 60)).padStart(2, '0');
+    const mm      = String(absMin % 60).padStart(2, '0');
+    const offset  = `${sign}${hh}:${mm}`;
+
+    // Formatear fecha en hora local de Santiago
+    const p = n => String(n).padStart(2, '0');
+    const local = `${chile.getFullYear()}-${p(chile.getMonth()+1)}-${p(chile.getDate())}` +
+                  `T${p(chile.getHours())}:${p(chile.getMinutes())}:${p(chile.getSeconds())}${offset}`;
+    return local;
+  } catch (_) {
+    // Fallback: UTC-3 fijo
+    const d = new Date(new Date(iso).getTime() - 3 * 3600 * 1000);
+    const p = n => String(n).padStart(2, '0');
+    return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())}` +
+           `T${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}-03:00`;
+  }
+}
+
+// ── Leer campos mutables desde field_schema ───────────────────────
+function readSchema(route) {
+  let provider_id          = '';
+  let provider_description = 'Siguelo GPS';
+  let x_country            = 'CL';
+  let speed_unit           = 'KILOMETER';
+
+  try {
+    let schema = route?.field_schema || [];
+    if (typeof schema === 'string') {
+      try { schema = JSON.parse(schema); } catch (_) { schema = []; }
+    }
+    for (const f of schema) {
+      if (f.source === 'fixed' && f.fixedValue !== undefined && f.fixedValue !== '') {
+        const k = f.apiKey || '';
+        if (k === 'provider_id')          provider_id          = String(f.fixedValue);
+        if (k === 'provider_description') provider_description = String(f.fixedValue);
+        if (k === 'x_country')            x_country            = String(f.fixedValue);
+        if (k === 'speed_unit')           speed_unit           = String(f.fixedValue);
+      }
+    }
+  } catch (_) {}
+
+  return { provider_id, provider_description, x_country, speed_unit };
+}
+
+// ── Función principal ─────────────────────────────────────────────
+async function send({ event, unit, route }) {
+
+  // Auth: custom-headers con apikey y authorization
+  const auth = (() => {
+    try { return typeof route?.auth === 'string' ? JSON.parse(route.auth) : route?.auth; }
+    catch (_) { return null; }
+  })();
+
+  // Leer headers de auth
+  let apikey        = '';
+  let authorization = '';
+  let x_country_hdr = '';
+
+  if (Array.isArray(auth?.headers)) {
+    for (const h of auth.headers) {
+      if (h.key === 'apikey')        apikey        = h.value;
+      if (h.key === 'authorization') authorization = h.value;
+      if (h.key === 'x-country')     x_country_hdr = h.value;
+    }
+  }
+
+  if (!apikey || !authorization) {
+    console.error('[falabella] ❌ apikey y authorization son requeridos en auth → headers');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing apikey or authorization' };
+  }
+
+  // Campos mutables desde field_schema
+  const cfg = readSchema(route);
+
+  if (!cfg.provider_id) {
+    console.error('[falabella] ❌ Campo "provider_id" no configurado en field_schema');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing provider_id' };
+  }
+
+  // Patente: tal como viene (Falabella usa patente con o sin formato)
+  const vehicleId = (unit.plate || '').toUpperCase();
+  if (!vehicleId) {
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing plate' };
+  }
+
+  // País: prioridad → header de auth → field_schema → "CL"
+  const country = x_country_hdr || cfg.x_country || 'CL';
+
+  // Construir payload según spec OpenAPI
+  const payload = {
+    provider: {
+      id:          cfg.provider_id,
+      description: cfg.provider_description,
+    },
+    vehicleId,
+    referenceId: unit.imei || vehicleId,
+    latitude:    Number((Number(event.lat || 0)).toFixed(6)),
+    longitude:   Number((Number(event.lon || 0)).toFixed(6)),
+    timestamp:   toISOWithOffset(event.wialon_ts),
+    speed: {
+      value: Number(event.speed || 0),
+      unit:  cfg.speed_unit,
+    },
+    ignited:  Boolean(event.ignition),
+    heading:  Math.round(Number(event.heading || 0)),
+  };
+
+  const body = JSON.stringify(payload);
+
+  const headers = {
+    'Content-Type': 'application/json',
+    'Accept':       'application/json',
+    'apikey':       apikey,
+    'authorization': authorization,
+    'x-country':    country,
+    'User-Agent':   'GPS/1.0.0',
+  };
+
+  const url = route?.url || 'https://tms-services.falabella.supply/api/v1/ms-tms-gps-aggregator/gps/position/';
+
+  console.log(`[falabella] enviando vehicleId=${vehicleId} provider=${cfg.provider_id} country=${country}`);
+  console.log(`[falabella] payload=${body.slice(0, 300)}`);
+
+  const t0 = Date.now();
+
+  try {
+    const res     = await fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(10000) });
+    const latency = Date.now() - t0;
+    const resText = await res.text().catch(() => '');
+
+    const ok = res.status >= 200 && res.status < 300;
+
+    if (ok) {
+      console.log(`[falabella] ✓ vehicleId=${vehicleId} (${res.status}) ${latency}ms | ${resText.slice(0, 100)}`);
+    } else {
+      console.error(`[falabella] ✗ vehicleId=${vehicleId} http=${res.status} | ${resText.slice(0, 300)}`);
+    }
+
+    return {
+      ok,
+      http_status:   res.status,
+      status:        ok ? 'sent' : 'failed',
+      response_http: resText.slice(0, 500),
+      latency_ms:    latency,
+    };
+
+  } catch (err) {
+    const latency = Date.now() - t0;
+    console.error(`[falabella] Error fetch: ${err.message}`);
+    return {
+      ok:            false,
+      http_status:   0,
+      status:        'failed',
+      response_http: err.message?.slice(0, 500) || 'fetch_error',
+      latency_ms:    latency,
+    };
+  }
+}
+
+module.exports = { send };
