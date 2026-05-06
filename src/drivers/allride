@@ -52,7 +52,10 @@ async function send({ event, unit, route }) {
 
   // ── Headers ───────────────────────────────────────────────────
   const headers = { 'Content-Type': 'application/json' };
-  const auth = route.auth || {};
+  const auth = (() => {
+    try { return typeof route?.auth === 'string' ? JSON.parse(route.auth) : (route?.auth || {}); }
+    catch (_) { return {}; }
+  })();
   if (auth.type === 'bearer' && auth.token) {
     headers['Authorization'] = `Bearer ${auth.token}`;
   } else if (Array.isArray(auth.headers)) {
