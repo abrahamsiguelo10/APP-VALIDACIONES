@@ -1,11 +1,9 @@
 /**
- * routes/clientes.js  (query GET /clientes optimizada)
+ * routes/clientes.js
  *
- * PROBLEMA: el JOIN de gps_events en GET /clientes cuelga la DB
- * si la tabla tiene muchos registros sin índice en imei.
- *
- * FIX: usar subqueries correlacionadas con LIMIT 1 en lugar de
- * LEFT JOIN + GROUP BY sobre toda gps_events.
+ * FIX GET /:id/units: reemplaza subqueries correlacionadas sobre gps_events
+ * (que hacen full scan por cada unidad) por CTEs con DISTINCT ON que usan
+ * el índice (imei, received_at DESC) — de timeout a milisegundos.
  */
 
 const router  = require('express').Router();
@@ -34,8 +32,8 @@ router.post('/login', async (req, res) => {
     [rut.trim()]
   );
   const cliente = rows[0];
-  if (!cliente)         return res.status(401).json({ error: 'RUT o contraseña incorrectos.' });
-  if (!cliente.enabled) return res.status(403).json({ error: 'Cuenta deshabilitada. Contacta al administrador.' });
+  if (!cliente)             return res.status(401).json({ error: 'RUT o contraseña incorrectos.' });
+  if (!cliente.enabled)     return res.status(403).json({ error: 'Cuenta deshabilitada. Contacta al administrador.' });
   if (!cliente.password_hash) return res.status(401).json({ error: 'Acceso no configurado. Contacta al administrador.' });
 
   const valid = await bcrypt.compare(password, cliente.password_hash);
@@ -84,8 +82,8 @@ router.get('/validate', async (req, res) => {
     `SELECT id, nombre, rut, enabled FROM public.clientes WHERE token = $1`,
     [token]
   );
-  if (!rows.length)      return res.status(404).json({ error: 'Token inválido.' });
-  if (!rows[0].enabled)  return res.status(403).json({ error: 'Cliente deshabilitado.' });
+  if (!rows.length)     return res.status(404).json({ error: 'Token inválido.' });
+  if (!rows[0].enabled) return res.status(403).json({ error: 'Cliente deshabilitado.' });
   res.json(rows[0]);
 });
 
@@ -93,9 +91,6 @@ router.get('/validate', async (req, res) => {
 router.use(requireAuth);
 
 /* ── GET /clientes ────────────────────────────────────────────── */
-// FIX: evitar JOIN directo a gps_events (puede ser muy lenta).
-// Se usa subquery sólo sobre units y unit_destinations, que son tablas pequeñas.
-// Los datos de último evento se obtienen con subquery correlacionada limitada.
 router.get('/', requireRole('admin'), async (_req, res) => {
   const { rows } = await query(`
     SELECT
@@ -107,14 +102,12 @@ router.get('/', requireRole('admin'), async (_req, res) => {
       c.created_at,
       c.updated_at,
 
-      /* ── total unidades ── */
       (
         SELECT COUNT(*)::int
         FROM public.units u
         WHERE u.cliente_id = c.id
       ) AS total_units,
 
-      /* ── total destinos activos únicos ── */
       (
         SELECT COUNT(DISTINCT ud.destination_id)::int
         FROM public.units u
@@ -122,7 +115,6 @@ router.get('/', requireRole('admin'), async (_req, res) => {
         WHERE u.cliente_id = c.id
       ) AS total_destinations,
 
-      /* ── último evento: subquery con índice por imei ── */
       (
         SELECT MAX(ge.received_at)
         FROM public.gps_events ge
@@ -131,7 +123,6 @@ router.get('/', requireRole('admin'), async (_req, res) => {
         )
       ) AS last_event_at,
 
-      /* ── último reenvío exitoso ── */
       (
         SELECT MAX(ge.received_at)
         FROM public.gps_events ge
@@ -148,6 +139,12 @@ router.get('/', requireRole('admin'), async (_req, res) => {
 });
 
 /* ── GET /clientes/:id/units ─────────────────────────────────── */
+/* FIX: CTEs con DISTINCT ON en lugar de subqueries correlacionadas.
+   Requiere índices:
+     idx_gps_events_imei_received  ON gps_events (imei, received_at DESC)
+     idx_gps_events_imei_forward   ON gps_events (imei, received_at DESC) WHERE forward_ok = true
+     idx_gps_events_imei_ignition  ON gps_events (imei, received_at DESC) WHERE ignition IS NOT NULL
+*/
 router.get('/:id/units', requireRole('admin'), async (req, res) => {
   const { rows: check } = await query(
     'SELECT id FROM public.clientes WHERE id = $1',
@@ -156,6 +153,29 @@ router.get('/:id/units', requireRole('admin'), async (req, res) => {
   if (!check.length) return res.status(404).json({ error: 'Cliente no encontrado.' });
 
   const { rows } = await query(`
+    WITH cliente_units AS (
+      SELECT u.imei, u.plate, u.name, u.rut, u.enabled, u.created_at
+      FROM public.units u
+      WHERE u.cliente_id = $1
+    ),
+    last_events AS (
+      SELECT DISTINCT ON (ge.imei)
+        ge.imei,
+        ge.received_at AS last_event_at,
+        ge.ignition    AS last_ignition
+      FROM public.gps_events ge
+      WHERE ge.imei IN (SELECT imei FROM cliente_units)
+      ORDER BY ge.imei, ge.received_at DESC
+    ),
+    last_forwards AS (
+      SELECT DISTINCT ON (ge.imei)
+        ge.imei,
+        ge.received_at AS last_forward_at
+      FROM public.gps_events ge
+      WHERE ge.imei IN (SELECT imei FROM cliente_units)
+        AND ge.forward_ok = true
+      ORDER BY ge.imei, ge.received_at DESC
+    )
     SELECT
       u.imei,
       u.plate,
@@ -163,8 +183,9 @@ router.get('/:id/units', requireRole('admin'), async (req, res) => {
       u.rut,
       u.enabled,
       u.created_at,
-
-      /* ── destinos asignados ── */
+      le.last_event_at,
+      le.last_ignition,
+      lf.last_forward_at,
       COALESCE(
         json_agg(
           json_build_object(
@@ -176,42 +197,15 @@ router.get('/:id/units', requireRole('admin'), async (req, res) => {
           )
         ) FILTER (WHERE ud.destination_id IS NOT NULL),
         '[]'
-      ) AS destinations,
-
-      /* ── último evento recibido ── */
-      (
-        SELECT ge.received_at
-        FROM public.gps_events ge
-        WHERE ge.imei = u.imei
-        ORDER BY ge.received_at DESC
-        LIMIT 1
-      ) AS last_event_at,
-
-      /* ── última ignición ── */
-      (
-        SELECT ge.ignition
-        FROM public.gps_events ge
-        WHERE ge.imei = u.imei AND ge.ignition IS NOT NULL
-        ORDER BY ge.received_at DESC
-        LIMIT 1
-      ) AS last_ignition,
-
-      /* ── último reenvío exitoso ── */
-      (
-        SELECT ge.received_at
-        FROM public.gps_events ge
-        WHERE ge.imei = u.imei AND ge.forward_ok = true
-        ORDER BY ge.received_at DESC
-        LIMIT 1
-      ) AS last_forward_at
-
-    FROM public.units u
+      ) AS destinations
+    FROM cliente_units u
+    LEFT JOIN last_events           le ON le.imei = u.imei
+    LEFT JOIN last_forwards         lf ON lf.imei = u.imei
     LEFT JOIN public.unit_destinations ud ON ud.imei = u.imei
     LEFT JOIN public.destinations       d  ON d.id   = ud.destination_id
-
-    WHERE u.cliente_id = $1
-
-    GROUP BY u.imei
+    GROUP BY
+      u.imei, u.plate, u.name, u.rut, u.enabled, u.created_at,
+      le.last_event_at, le.last_ignition, lf.last_forward_at
     ORDER BY u.plate ASC
   `, [req.params.id]);
 
