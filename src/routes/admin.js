@@ -31,11 +31,12 @@ router.get('/system-info', requireRole('admin'), async (_req, res) => {
 });
 
 /* ── GET /admin/audit ────────────────────────────────────────── */
+/* ── GET /admin/audit ────────────────────────────────────────── */
 router.get('/audit', requireRole('admin'), async (req, res) => {
   try {
     const {
-      limit  = 100,
-      offset = 0,
+      limit    = 100,
+      offset   = 0,
       action,
       username,
       from,
@@ -49,8 +50,8 @@ router.get('/audit', requireRole('admin'), async (req, res) => {
 
     if (action)   { conditions.push(`action ILIKE $${i++}`);   values.push(`%${action}%`); }
     if (username) { conditions.push(`username ILIKE $${i++}`); values.push(`%${username}%`); }
-    if (from)     { conditions.push(`received_at >= $${i++}`);  values.push(from); }
-    if (to)       { conditions.push(`received_at <= $${i++}`);  values.push(to); }
+    if (from)     { conditions.push(`at >= $${i++}`);          values.push(from); }
+    if (to)       { conditions.push(`at <= $${i++}`);          values.push(to); }
     if (search)   {
       conditions.push(`(action ILIKE $${i} OR target ILIKE $${i} OR username ILIKE $${i})`);
       values.push(`%${search}%`); i++;
@@ -61,10 +62,10 @@ router.get('/audit', requireRole('admin'), async (req, res) => {
     const [rows, total] = await Promise.all([
       query(
         `SELECT id, action, target, before_data, after_data,
-                user_id, username, role, ip, received_at
+                user_id, username, role, ip, at AS received_at
          FROM public.audit_log
          ${where}
-         ORDER BY received_at DESC
+         ORDER BY at DESC
          LIMIT $${i++} OFFSET $${i++}`,
         [...values, parseInt(limit), parseInt(offset)]
       ),
@@ -72,18 +73,12 @@ router.get('/audit', requireRole('admin'), async (req, res) => {
     ]);
 
     res.json({
-      rows:  rows.rows,
-      total: parseInt(total.rows[0].count),
-      limit: parseInt(limit),
+      rows:   rows.rows,
+      total:  parseInt(total.rows[0].count),
+      limit:  parseInt(limit),
       offset: parseInt(offset),
     });
   } catch (err) {
-    if (err.message?.includes('column') && err.message?.includes('does not exist')) {
-      return res.json({ rows: [], total: 0,
-        limit:  parseInt(req.query.limit  || 100),
-        offset: parseInt(req.query.offset || 0),
-        warning: 'Migraciones pendientes.' });
-    }
     res.status(500).json({ error: err.message });
   }
 });
