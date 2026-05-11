@@ -6,54 +6,30 @@
  * Driver REST/JSON para GPS Chile — Multiflota Track
  *
  * Endpoint: POST https://trackws.gpschile.com/api/inyeccion
- * Auth:     Authorization: <Token en Base64>
- * Body:     JSON array de actividades
+ * Auth:     Authorization: Basic <token_en_base64>
+ *           El token entregado por GPS Chile ya viene en Base64
+ *           → se envía como "Basic <token>" directamente.
  *
  * Configuración en GUI:
  *   driver_slug : gpschile
  *   api_url     : https://trackws.gpschile.com/api/inyeccion
  *   auth → type : bearer
- *   auth → token: TOKEN_PRODUCCION (proporcionado por GPSChile)
+ *   auth → token: TOKEN_EN_BASE64 (proporcionado por GPSChile)
  *
  * Campos mutables desde field_schema (source: fixed):
- *   rutCliente   — RUT del mandante sin puntos, con guión (ej: 90227000-0)
- *   rutConductor — RUT del conductor (default: "")
- *   idConductor  — ID del conductor (default: "")
+ *   rutCliente      — RUT del mandante sin puntos, con guión (ej: 90227000-0)
+ *   rutConductor    — RUT del conductor (default: "")
+ *   idConductor     — ID del conductor (default: "")
  *   codigoActividad — código de evento (default: 20 = ACTUALIZACION PROGRAMADA)
- *   ubicacion    — descripción de ubicación (default: "" → usa reverse geocoding si está disponible)
- *
- * Campos calculados automáticamente:
- *   idActividad        — timestamp_ms + imei sufijo (único por evento)
- *   fechaActividad     — wialon_ts en formato ISO UTC
- *   fechaRecepcion     — now() en formato ISO UTC
- *   latitud/longitud   — coordenadas GPS
- *   velocidadActual    — speed del evento
- *   velocidadMaxima    — igual a velocidadActual (no tenemos max entre puntos)
- *   nroSatelites       — sats del evento
- *   hdop               — hdop del evento
- *   odometro           — odometro del evento
- *   altura             — alt del evento
- *   heading            — heading del evento
- *   ignicion           — 1/0 desde ignition
- *   imei               — IMEI de la unidad
- *   gpsValid           — calculado desde sats y hdop
- *   horasMotor         — hourmeter del evento
- *   patente            — plate sin guiones en mayúsculas
- *   distanciaRecorrida — 0 (no disponible)
- *   distanciaAcumulada — 0 (no disponible)
- *   idGeocerca         — siempre -1 (requerido por manual)
- *   actividadExtendidaTipo  — 0 (sin actividad extendida)
- *   actividadExtendidaValor — ""
+ *   ubicacion       — descripción de ubicación (default: coordenadas lat,lon)
  */
 
-// Códigos de actividad según manual
-const COD_ACTUALIZACION = 20; // ACTUALIZACION PROGRAMADA (default)
+const COD_ACTUALIZACION = 20;
 
 // ── Helpers ──────────────────────────────────────────────────────
 
 function toISOLocal(wialon_ts) {
   const iso = wialon_ts ? new Date(wialon_ts).toISOString() : new Date().toISOString();
-  // Formato requerido: "2020-05-07T22:59:59.000"
   return iso.replace('Z', '').slice(0, 23) + '.000';
 }
 
@@ -61,23 +37,23 @@ function calcGpsValid(sats, hdop) {
   const s = Number(sats || 0);
   const h = Number(hdop || 0);
   if (s > 5 && h > 0 && h < 1.2) return 1;
-  if (s > 5 && h === 0) return 1; // si no hay hdop, confiar en satélites
+  if (s > 5 && h === 0) return 1;
   return 0;
 }
 
 function genIdActividad(wialon_ts, imei) {
-  const ts = wialon_ts ? new Date(wialon_ts).getTime() : Date.now();
+  const ts     = wialon_ts ? new Date(wialon_ts).getTime() : Date.now();
   const suffix = String(imei || '000000').slice(-6);
   return `${ts}${suffix}`;
 }
 
 // ── Leer configuración desde field_schema ────────────────────────
 function readSchema(route) {
-  let rutCliente        = '';
-  let rutConductor      = '';
-  let idConductor       = '';
-  let codigoActividad   = COD_ACTUALIZACION;
-  let ubicacion         = '';
+  let rutCliente      = '';
+  let rutConductor    = '';
+  let idConductor     = '';
+  let codigoActividad = COD_ACTUALIZACION;
+  let ubicacion       = '';
 
   try {
     let schema = route?.field_schema || [];
@@ -101,53 +77,64 @@ function readSchema(route) {
 
 // ── Función principal ─────────────────────────────────────────────
 async function send({ event, unit, route }) {
-  // Auth: token en header Authorization
+
+  // ── Auth ────────────────────────────────────────────────────────
+  // GPS Chile requiere: Authorization: Basic <token_base64>
+  // El token que entrega GPS Chile ya está en Base64 → solo agregar "Basic "
   const auth = (() => {
     try { return typeof route?.auth === 'string' ? JSON.parse(route.auth) : route?.auth; }
     catch (_) { return null; }
   })();
 
-  const token = auth?.token || auth?.bearer || '';
-  if (!token) {
+  const rawToken = auth?.token || auth?.bearer || '';
+  if (!rawToken) {
     console.error('[gpschile] ❌ Token no configurado en auth del destino');
     return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing token' };
   }
 
-  // Campos mutables desde field_schema
-  const cfg = readSchema(route);
+  // Si el token ya incluye "Basic " no lo duplicamos
+  const authHeader = rawToken.startsWith('Basic ') ? rawToken : `Basic ${rawToken}`;
 
+  // ── Campos desde field_schema ───────────────────────────────────
+  const cfg = readSchema(route);
   if (!cfg.rutCliente) {
     console.error('[gpschile] ❌ Campo "rutCliente" no configurado en field_schema');
     return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing rutCliente' };
   }
 
-  // Patente: mayúsculas sin guiones (según manual: "CHFX37")
+  // ── Patente ─────────────────────────────────────────────────────
   const patente = (unit.plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
   if (!patente) {
     return { ok: false, http_status: 0, status: 'failed', response_http: 'Missing plate' };
   }
 
-  const vel    = Math.round(Number(event.speed   || 0));
-  const sats   = Math.round(Number(event.sats    || 0));
-  const hdop   = Number(event.hdop               || 0);
-  const odo    = Math.round(Number(event.odometro|| 0));
-  const alt    = Math.round(Number(event.alt     || 0));
-  const head   = Math.round(Number(event.heading || 0));
-  const ign    = (event.ignition === true || event.ignition === 1) ? 1 : 0;
-  const hours  = Number(event.hourmeter          || 0);
-  const now    = new Date().toISOString().replace('Z', '').slice(0, 23) + '.000';
+  // ── Valores numéricos ───────────────────────────────────────────
+  const vel   = Math.round(Number(event.speed    || 0));
+  const sats  = Math.round(Number(event.sats     || 0));
+  const hdop  = Number(event.hdop                || 0);
+  const odo   = Math.round(Number(event.odometro || 0));
+  const alt   = Math.round(Number(event.alt      || 0));
+  const head  = Math.round(Number(event.heading  || 0));
+  const ign   = (event.ignition === true || event.ignition === 1) ? 1 : 0;
+  const hours = Number(event.hourmeter           || 0);
+  const now   = new Date().toISOString().replace('Z', '').slice(0, 23) + '.000';
 
+  // Ubicacion: usar coordenadas como fallback si no está configurada
+  const ubicacion = cfg.ubicacion ||
+    `${Number(event.lat || 0).toFixed(6)},${Number(event.lon || 0).toFixed(6)}`;
+
+  // ── Payload ─────────────────────────────────────────────────────
   const actividad = {
     idActividad:             genIdActividad(event.wialon_ts, unit.imei),
     codigoActividad:         cfg.codigoActividad,
     fechaActividad:          toISOLocal(event.wialon_ts),
     fechaRecepcion:          now,
     idGeocerca:              -1,
-    latitud:                 Number(event.lat  || 0),
-    longitud:                Number(event.lon  || 0),
+    latitud:                 Number(event.lat || 0),
+    longitud:                Number(event.lon || 0),
     velocidadActual:         vel,
-    velocidadMaxima:         vel,  // no tenemos velocidad max entre puntos
-    ubicacion:               cfg.ubicacion,
+    velocidadMaxima:         vel,
+    ubicacion,
     distanciaRecorrida:      0,
     distanciaAcumulada:      0,
     nroSatelites:            sats,
@@ -167,28 +154,24 @@ async function send({ event, unit, route }) {
     horasMotor:              hours,
   };
 
-  const body = JSON.stringify([actividad]);
-
+  const body    = JSON.stringify([actividad]);
+  const url     = route?.url || 'https://trackws.gpschile.com/api/inyeccion';
   const headers = {
     'Content-Type':  'application/json',
     'Accept':        'application/json',
-    'Authorization': token, // token ya viene listo (puede ser Base64 o Bearer)
+    'Authorization': authHeader,
   };
 
-  const url = route?.url || 'https://trackws.gpschile.com/api/inyeccion';
-
   console.log(`[gpschile] enviando patente=${patente} rutCliente=${cfg.rutCliente} url=${url}`);
+  console.log(`[gpschile] Authorization: Basic ${rawToken.slice(0,20)}...`);
   console.log(`[gpschile] payload=${body.slice(0, 400)}`);
 
   const t0 = Date.now();
-
   try {
     const res     = await fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(10000) });
     const latency = Date.now() - t0;
     const resText = await res.text().catch(() => '');
-
-    // GPSChile devuelve un batchId en la respuesta → éxito si HTTP 200/201
-    const ok = res.status >= 200 && res.status < 300;
+    const ok      = res.status >= 200 && res.status < 300;
 
     if (ok) {
       console.log(`[gpschile] ✓ patente=${patente} (${res.status}) ${latency}ms | ${resText.slice(0, 100)}`);
@@ -203,7 +186,6 @@ async function send({ event, unit, route }) {
       response_http: resText.slice(0, 500),
       latency_ms:    latency,
     };
-
   } catch (err) {
     const latency = Date.now() - t0;
     console.error(`[gpschile] Error fetch: ${err.message}`);
