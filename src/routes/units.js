@@ -100,34 +100,19 @@ router.post('/last-events', async (req, res) => {
   if (!Array.isArray(imeis) || !imeis.length) return res.json([]);
  
   const safeImeis = imeis.slice(0, 1000);
-  const BATCH = 20; // lotes pequeños para usar el índice eficientemente
-  const results = [];
+  const placeholders = safeImeis.map((_, i) => `$${i + 1}`).join(', ');
  
-  // Procesar en lotes de 20 en paralelo (máx 5 lotes simultáneos)
-  for (let i = 0; i < safeImeis.length; i += BATCH * 5) {
-    const superBatch = safeImeis.slice(i, i + BATCH * 5);
-    const chunks = [];
-    for (let j = 0; j < superBatch.length; j += BATCH) {
-      chunks.push(superBatch.slice(j, j + BATCH));
-    }
+  const { rows } = await query(`
+    SELECT DISTINCT ON (ge.imei)
+      ge.imei,
+      ge.received_at AS last_event_at,
+      ge.ignition    AS last_ignition
+    FROM public.gps_events ge
+    WHERE ge.imei IN (${placeholders})
+    ORDER BY ge.imei, ge.received_at DESC
+  `, safeImeis);
  
-    const chunkResults = await Promise.all(chunks.map(chunk => {
-      const placeholders = chunk.map((_, k) => `$${k + 1}`).join(', ');
-      return query(`
-        SELECT DISTINCT ON (ge.imei)
-          ge.imei,
-          ge.received_at AS last_event_at,
-          ge.ignition    AS last_ignition
-        FROM public.gps_events ge
-        WHERE ge.imei IN (${placeholders})
-        ORDER BY ge.imei, ge.received_at DESC
-      `, chunk);
-    }));
- 
-    for (const r of chunkResults) results.push(...r.rows);
-  }
- 
-  res.json(results);
+  res.json(rows);
 });
 
 
