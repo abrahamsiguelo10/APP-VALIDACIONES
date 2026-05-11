@@ -1,0 +1,384 @@
+/**
+ * src/routes/pipedrive.js
+ *
+ * Detecta unidades sin reporte GPS +15 días usando la API de Wialon
+ * y crea actividades en Pipedrive tipo "UNIDADES SIN REPORTAR".
+ *
+ * Flujo:
+ *  1. Login en Wialon con token → obtiene eid (session)
+ *  2. Pagina core/search_items (flags:4194305) para obtener todas las unidades
+ *  3. Filtra las que pos.t sea nulo o >= 15 días sin reporte
+ *  4. Cruza por nombre/uid con units de Supabase para enriquecer con cliente
+ *  5. Verifica duplicados en Pipedrive y crea actividad si no existe
+ *
+ * Variables de entorno Railway:
+ *   WIALON_TOKEN      — token de API Wialon
+ *   PIPEDRIVE_API_KEY — API key Pipedrive
+ */
+
+'use strict';
+
+const router    = require('express').Router();
+const { query } = require('../db/pool');
+const { requireAuth, requireRole } = require('../middleware/auth');
+
+// ── Constantes Pipedrive ──────────────────────────────────────────
+const PD_BASE          = 'https://api.pipedrive.com/v1';
+const PD_OWNER_ID      = 24878669;   // Gerald — integraciones@siguelogps.cl
+const DIAS_SIN_REPORTE = 15;
+
+// ── Constantes Wialon ─────────────────────────────────────────────
+const WIALON_BASE  = 'https://hst-api.wialon.com/wialon/ajax.html';
+const WIALON_FLAGS = 4194305; // 1 (nombre) + 4194304 (pos/último mensaje)
+const WIALON_PAGE  = 100;     // unidades por página
+
+// ── Helper Pipedrive ─────────────────────────────────────────────
+async function pdFetch(path, options = {}) {
+  const apiKey = process.env.PIPEDRIVE_API_KEY;
+  if (!apiKey) throw new Error('PIPEDRIVE_API_KEY no configurada');
+  const sep = path.includes('?') ? '&' : '?';
+  const url = `${PD_BASE}${path}${sep}api_token=${apiKey}`;
+  const res  = await fetch(url, {
+    ...options,
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+    signal: AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined,
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!json.success) throw new Error(json.error || `Pipedrive error ${path}`);
+  return json;
+}
+
+// ── Login Wialon → eid ────────────────────────────────────────────
+async function wialonLogin() {
+  const token = process.env.WIALON_TOKEN;
+  if (!token) throw new Error('WIALON_TOKEN no configurada');
+
+  const params = new URLSearchParams({
+    svc:    'token/login',
+    params: JSON.stringify({ token }),
+  });
+  const res  = await fetch(WIALON_BASE, {
+    method: 'POST',
+    body:   params,
+    signal: AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined,
+  });
+  const json = await res.json();
+  if (json.error) throw new Error(`Wialon login error: ${json.error} ${json.reason || ''}`);
+  return json.eid;
+}
+
+// ── Logout Wialon ─────────────────────────────────────────────────
+async function wialonLogout(eid) {
+  try {
+    const params = new URLSearchParams({ svc: 'core/logout', params: '{}', sid: eid });
+    await fetch(WIALON_BASE, { method: 'POST', body: params });
+  } catch (_) {}
+}
+
+// ── Obtener todas las unidades Wialon con su último reporte ───────
+async function getWialonUnidades(eid) {
+  const ahora = Math.floor(Date.now() / 1000);
+  const unidades = [];
+  let from = 0;
+
+  while (true) {
+    const params = new URLSearchParams({
+      svc: 'core/search_items',
+      params: JSON.stringify({
+        spec: {
+          itemsType:      'avl_unit',
+          propName:       'sys_name',
+          propValueMask:  '*',
+          sortType:       'sys_name',
+        },
+        force: 1,
+        flags: WIALON_FLAGS,
+        from,
+        to: from + WIALON_PAGE,
+      }),
+      sid: eid,
+    });
+
+    const res  = await fetch(WIALON_BASE, {
+      method: 'POST',
+      body:   params,
+      signal: AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined,
+    });
+    const json = await res.json();
+    if (json.error) throw new Error(`Wialon search_items error: ${json.error}`);
+
+    const items = json.items || [];
+    for (const u of items) {
+      const t    = u.pos?.t || null;
+      const dias = t ? Math.round((ahora - t) / 86400) : null;
+      unidades.push({
+        wialon_id:   u.id,
+        wialon_name: (u.nm || '').trim(),
+        uid:         u.uid  || null,
+        ultimo_reporte: t ? new Date(t * 1000).toISOString() : null,
+        dias_sin_reporte: dias,
+        sin_datos: t === null,
+      });
+    }
+
+    const total = json.totalItemsCount || 0;
+    from += WIALON_PAGE;
+    if (from >= total || items.length === 0) break;
+
+    // Pequeña pausa para no saturar la API de Wialon
+    await new Promise(r => setTimeout(r, 50));
+  }
+
+  return unidades;
+}
+
+// ── Cruzar Wialon con Supabase por IMEI/UID o nombre ─────────────
+async function enriquecerConSupabase(wialonUnidades) {
+  // Traer todas las unidades activas de Supabase
+  const { rows } = await query(`
+    SELECT u.imei, u.plate, u.name AS cliente_nombre, u.rut AS cliente_rut,
+           c.nombre AS cliente_razon_social
+    FROM public.units u
+    LEFT JOIN public.clientes c ON c.id = u.cliente_id
+    WHERE u.enabled = true
+  `);
+
+  // Mapa por IMEI para búsqueda O(1)
+  const porImei = {};
+  const porPlate = {};
+  for (const r of rows) {
+    if (r.imei)  porImei[r.imei]               = r;
+    if (r.plate) porPlate[r.plate.toUpperCase()] = r;
+  }
+
+  return wialonUnidades.map(u => {
+    // Intentar cruzar por UID (que suele ser el IMEI) o por nombre/patente
+    let supabase = null;
+    if (u.uid && porImei[u.uid])                    supabase = porImei[u.uid];
+    else if (u.wialon_name && porPlate[u.wialon_name.toUpperCase()]) {
+      supabase = porPlate[u.wialon_name.toUpperCase()];
+    }
+
+    return {
+      ...u,
+      plate:          supabase?.plate          || u.wialon_name,
+      imei:           supabase?.imei           || u.uid,
+      cliente_nombre: supabase?.cliente_razon_social || supabase?.cliente_nombre || 'Sin cliente',
+      cliente_rut:    supabase?.cliente_rut    || null,
+      en_supabase:    !!supabase,
+    };
+  });
+}
+
+// ── Buscar organización en Pipedrive ──────────────────────────────
+async function buscarOrganizacion(nombre) {
+  if (!nombre || nombre === 'Sin cliente') return null;
+  try {
+    const json = await pdFetch(
+      `/organizations/search?term=${encodeURIComponent(nombre)}&fields=name&limit=5`
+    );
+    const items = json.data?.items || [];
+    return items.find(i => i.item?.name?.toLowerCase().includes(nombre.toLowerCase()))?.item || null;
+  } catch { return null; }
+}
+
+// ── Buscar trato abierto de una organización ──────────────────────
+async function buscarTratoAbierto(orgId) {
+  if (!orgId) return null;
+  try {
+    const json = await pdFetch(`/organizations/${orgId}/deals?status=open&limit=1`);
+    return (json.data || [])[0] || null;
+  } catch { return null; }
+}
+
+// ── Verificar si ya existe actividad abierta para esta unidad ─────
+async function existeActividadAbierta(subject) {
+  try {
+    const json = await pdFetch(
+      `/activities/search?term=${encodeURIComponent(subject.slice(0, 30))}&fields=subject&limit=10`
+    );
+    return (json.data?.items || []).some(
+      i => i.item?.subject === subject && !i.item?.done
+    );
+  } catch { return false; }
+}
+
+// ── Crear actividad en Pipedrive ──────────────────────────────────
+async function crearActividad(unidad, orgId, dealId) {
+  const subject = `${unidad.plate} - Sin reporte +${unidad.dias_sin_reporte ?? DIAS_SIN_REPORTE} días`;
+  const nota = [
+    `🚗 Patente/Unidad: ${unidad.plate}`,
+    unidad.imei ? `📡 IMEI/UID: ${unidad.imei}` : null,
+    `👤 Cliente: ${unidad.cliente_nombre}`,
+    unidad.cliente_rut ? `🪪 RUT: ${unidad.cliente_rut}` : null,
+    unidad.ultimo_reporte
+      ? `📅 Último reporte GPS: ${new Date(unidad.ultimo_reporte).toLocaleString('es-CL')}`
+      : `📅 Último reporte GPS: Sin registro`,
+    unidad.dias_sin_reporte != null
+      ? `⏱ Días sin reportar: ${unidad.dias_sin_reporte}`
+      : `⏱ Días sin reportar: Sin datos`,
+    `🔗 Fuente: Wialon (${unidad.en_supabase ? 'cruzado con Síguelo' : 'solo Wialon'})`,
+    ``,
+    `⚙️ Actividad creada automáticamente por Síguelo GPS`,
+  ].filter(Boolean).join('\n');
+
+  const body = {
+    subject,
+    type:    'unidades_sin_reportar',
+    user_id: PD_OWNER_ID,
+    done:    false,
+    note:    nota,
+  };
+  if (dealId)      body.deal_id = dealId;
+  else if (orgId)  body.org_id  = orgId;
+
+  const json = await pdFetch('/activities', { method: 'POST', body: JSON.stringify(body) });
+  return json.data;
+}
+
+// ── Filtrar unidades sin reporte ──────────────────────────────────
+function filtrarSinReporte(unidades, dias) {
+  return unidades.filter(u =>
+    u.sin_datos || (u.dias_sin_reporte != null && u.dias_sin_reporte >= dias)
+  );
+}
+
+// ════════════════════════════════════════════════════════════════
+//  GET /pipedrive/preview-sin-reporte
+//  Vista previa sin crear nada (usa Wialon)
+// ════════════════════════════════════════════════════════════════
+router.get('/preview-sin-reporte', requireAuth, requireRole('admin'), async (req, res) => {
+  const dias = parseInt(req.query.dias || DIAS_SIN_REPORTE, 10);
+  let eid = null;
+  try {
+    eid = await wialonLogin();
+    const todas    = await getWialonUnidades(eid);
+    const filtradas = filtrarSinReporte(todas, dias);
+    const enriquecidas = await enriquecerConSupabase(filtradas);
+    res.json({
+      total_wialon:    todas.length,
+      sin_reporte:     filtradas.length,
+      dias,
+      unidades: enriquecidas,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    if (eid) wialonLogout(eid);
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+//  POST /pipedrive/sync-sin-reporte
+//  Crea actividades en Pipedrive para unidades sin reporte
+// ════════════════════════════════════════════════════════════════
+router.post('/sync-sin-reporte', requireAuth, requireRole('admin'), async (req, res) => {
+  const dias = parseInt(req.body?.dias || DIAS_SIN_REPORTE, 10);
+  let eid = null;
+
+  try {
+    eid = await wialonLogin();
+    const todas        = await getWialonUnidades(eid);
+    const filtradas    = filtrarSinReporte(todas, dias);
+    const unidades     = await enriquecerConSupabase(filtradas);
+
+    if (!unidades.length) {
+      return res.json({ ok: true, message: `Sin unidades con más de ${dias} días sin reporte.`, creadas: 0, omitidas: 0, errores: 0 });
+    }
+
+    const resultados = [];
+    let creadas = 0, omitidas = 0, errores = 0;
+
+    for (const u of unidades) {
+      const subject = `${u.plate} - Sin reporte +${u.dias_sin_reporte ?? dias} días`;
+      try {
+        // Anti-duplicado
+        const yaExiste = await existeActividadAbierta(subject);
+        if (yaExiste) {
+          omitidas++;
+          resultados.push({ plate: u.plate, status: 'omitida', razon: 'Actividad ya existe' });
+          continue;
+        }
+
+        // Buscar org y trato en Pipedrive
+        const org    = await buscarOrganizacion(u.cliente_nombre);
+        const orgId  = org?.id || null;
+        const trato  = orgId ? await buscarTratoAbierto(orgId) : null;
+        const dealId = trato?.id || null;
+
+        const actividad = await crearActividad(u, orgId, dealId);
+        creadas++;
+        resultados.push({
+          plate:       u.plate,
+          status:      'creada',
+          activity_id: actividad?.id,
+          subject,
+          asociada_a:  dealId ? 'trato' : orgId ? 'organización' : 'ninguna',
+          dias:        u.dias_sin_reporte,
+        });
+        console.log(`[Pipedrive] ${u.plate} ✓ (${u.dias_sin_reporte ?? '?'} días) → ${dealId ? 'trato' : orgId ? 'org' : 'suelta'}`);
+
+      } catch (err) {
+        errores++;
+        resultados.push({ plate: u.plate, status: 'error', error: err.message });
+        console.error(`[Pipedrive] ${u.plate} error:`, err.message);
+      }
+
+      // Rate limit Pipedrive: 100 req/10s
+      await new Promise(r => setTimeout(r, 120));
+    }
+
+    res.json({ ok: true, dias, total_wialon: todas.length, sin_reporte: unidades.length, creadas, omitidas, errores, resultados });
+
+  } catch (err) {
+    console.error('[Pipedrive] sync error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    if (eid) wialonLogout(eid);
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+//  Job automático — exportado para src/index.js
+// ════════════════════════════════════════════════════════════════
+async function runPipedriveSyncJob() {
+  if (!process.env.PIPEDRIVE_API_KEY || !process.env.WIALON_TOKEN) return;
+  console.log('[Pipedrive] Job automático — unidades sin reporte >15 días (Wialon)');
+
+  let eid = null;
+  try {
+    eid = await wialonLogin();
+    const todas     = await getWialonUnidades(eid);
+    const filtradas = filtrarSinReporte(todas, DIAS_SIN_REPORTE);
+    const unidades  = await enriquecerConSupabase(filtradas);
+
+    let creadas = 0, omitidas = 0, errores = 0;
+
+    for (const u of unidades) {
+      const subject = `${u.plate} - Sin reporte +${u.dias_sin_reporte ?? DIAS_SIN_REPORTE} días`;
+      try {
+        const yaExiste = await existeActividadAbierta(subject);
+        if (yaExiste) { omitidas++; continue; }
+
+        const org    = await buscarOrganizacion(u.cliente_nombre);
+        const orgId  = org?.id || null;
+        const trato  = orgId ? await buscarTratoAbierto(orgId) : null;
+        await crearActividad(u, orgId, trato?.id || null);
+        creadas++;
+        await new Promise(r => setTimeout(r, 120));
+      } catch (err) {
+        errores++;
+        console.error(`[Pipedrive] ${u.plate} error:`, err.message);
+      }
+    }
+
+    console.log(`[Pipedrive] ✅ Job completo — Wialon:${todas.length} sin_reporte:${filtradas.length} creadas:${creadas} omitidas:${omitidas} errores:${errores}`);
+  } catch (err) {
+    console.error('[Pipedrive] ❌ Job error:', err.message);
+  } finally {
+    if (eid) wialonLogout(eid);
+  }
+}
+
+module.exports = router;
+module.exports.runPipedriveSyncJob = runPipedriveSyncJob;
