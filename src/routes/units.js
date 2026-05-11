@@ -27,13 +27,36 @@ router.use(requireAuth);
 ══════════════════════════════════════════ */
 
 /* ── GET /units ───────────────────────────────────────────────── */
+
 router.get('/', async (req, res) => {
   const { search } = req.query;
 
-  let sql = `
+  const whereClause = search
+    ? `WHERE u.imei ILIKE $1 OR u.plate ILIKE $1 OR u.name ILIKE $1`
+    : '';
+  const values = search ? [`%${search}%`] : [];
+
+  const { rows } = await query(`
+    WITH filtered_units AS (
+      SELECT u.imei, u.plate, u.name, u.rut, u.enabled, u.cliente_id,
+             u.created_at, u.updated_at
+      FROM public.units u
+      ${whereClause}
+    ),
+    last_events AS (
+      SELECT DISTINCT ON (ge.imei)
+        ge.imei,
+        ge.received_at AS last_event_at,
+        ge.ignition    AS last_ignition
+      FROM public.gps_events ge
+      WHERE ge.imei IN (SELECT imei FROM filtered_units)
+      ORDER BY ge.imei, ge.received_at DESC
+    )
     SELECT
       u.imei, u.plate, u.name, u.rut, u.enabled, u.cliente_id,
       u.created_at, u.updated_at,
+      le.last_event_at,
+      le.last_ignition,
       COALESCE(
         json_agg(
           json_build_object(
@@ -46,20 +69,17 @@ router.get('/', async (req, res) => {
         ) FILTER (WHERE ud.destination_id IS NOT NULL),
         '[]'
       ) AS destinations
-    FROM public.units u
+    FROM filtered_units u
+    LEFT JOIN last_events            le ON le.imei = u.imei
     LEFT JOIN public.unit_destinations ud ON ud.imei = u.imei
-    LEFT JOIN public.destinations d       ON d.id    = ud.destination_id
-  `;
+    LEFT JOIN public.destinations       d  ON d.id   = ud.destination_id
+    GROUP BY
+      u.imei, u.plate, u.name, u.rut, u.enabled, u.cliente_id,
+      u.created_at, u.updated_at,
+      le.last_event_at, le.last_ignition
+    ORDER BY u.created_at DESC
+  `, values);
 
-  const values = [];
-  if (search) {
-    sql += ` WHERE u.imei ILIKE $1 OR u.plate ILIKE $1 OR u.name ILIKE $1`;
-    values.push(`%${search}%`);
-  }
-
-  sql += ` GROUP BY u.imei ORDER BY u.created_at DESC`;
-
-  const { rows } = await query(sql, values);
   res.json(rows);
 });
 
