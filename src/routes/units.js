@@ -30,33 +30,11 @@ router.use(requireAuth);
 
 router.get('/', async (req, res) => {
   const { search } = req.query;
-
-  const whereClause = search
-    ? `WHERE u.imei ILIKE $1 OR u.plate ILIKE $1 OR u.name ILIKE $1`
-    : '';
-  const values = search ? [`%${search}%`] : [];
-
-  const { rows } = await query(`
-    WITH filtered_units AS (
-      SELECT u.imei, u.plate, u.name, u.rut, u.enabled, u.cliente_id,
-             u.created_at, u.updated_at
-      FROM public.units u
-      ${whereClause}
-    ),
-    last_events AS (
-      SELECT DISTINCT ON (ge.imei)
-        ge.imei,
-        ge.received_at AS last_event_at,
-        ge.ignition    AS last_ignition
-      FROM public.gps_events ge
-      WHERE ge.imei IN (SELECT imei FROM filtered_units)
-      ORDER BY ge.imei, ge.received_at DESC
-    )
+ 
+  let sql = `
     SELECT
       u.imei, u.plate, u.name, u.rut, u.enabled, u.cliente_id,
       u.created_at, u.updated_at,
-      le.last_event_at,
-      le.last_ignition,
       COALESCE(
         json_agg(
           json_build_object(
@@ -69,17 +47,19 @@ router.get('/', async (req, res) => {
         ) FILTER (WHERE ud.destination_id IS NOT NULL),
         '[]'
       ) AS destinations
-    FROM filtered_units u
-    LEFT JOIN last_events            le ON le.imei = u.imei
+    FROM public.units u
     LEFT JOIN public.unit_destinations ud ON ud.imei = u.imei
-    LEFT JOIN public.destinations       d  ON d.id   = ud.destination_id
-    GROUP BY
-      u.imei, u.plate, u.name, u.rut, u.enabled, u.cliente_id,
-      u.created_at, u.updated_at,
-      le.last_event_at, le.last_ignition
-    ORDER BY u.created_at DESC
-  `, values);
-
+    LEFT JOIN public.destinations d       ON d.id    = ud.destination_id
+  `;
+ 
+  const values = [];
+  if (search) {
+    sql += ` WHERE u.imei ILIKE $1 OR u.plate ILIKE $1 OR u.name ILIKE $1`;
+    values.push(`%${search}%`);
+  }
+ 
+  sql += ` GROUP BY u.imei ORDER BY u.created_at DESC`;
+  const { rows } = await query(sql, values);
   res.json(rows);
 });
 
@@ -110,6 +90,36 @@ router.get('/:imei', async (req, res) => {
   if (!rows.length) return res.status(404).json({ error: 'Unidad no encontrada.' });
   res.json(rows[0]);
 });
+
+
+
+
+
+router.post('/last-events', async (req, res) => {
+  const { imeis } = req.body;
+ 
+  if (!Array.isArray(imeis) || !imeis.length) {
+    return res.json([]);
+  }
+ 
+  // Limitar a 1000 para seguridad
+  const safeImeis = imeis.slice(0, 1000);
+  const placeholders = safeImeis.map((_, i) => `$${i + 1}`).join(', ');
+ 
+  const { rows } = await query(`
+    SELECT DISTINCT ON (ge.imei)
+      ge.imei,
+      ge.received_at AS last_event_at,
+      ge.ignition    AS last_ignition
+    FROM public.gps_events ge
+    WHERE ge.imei IN (${placeholders})
+    ORDER BY ge.imei, ge.received_at DESC
+  `, safeImeis);
+ 
+  res.json(rows);
+});
+
+
 
 /* ── POST /units ──────────────────────────────────────────────── */
 router.post('/', requireRole('admin'), async (req, res) => {
