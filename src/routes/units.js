@@ -102,18 +102,12 @@ router.post('/last-events', async (req, res) => {
   const { imeis } = req.body;
   if (!Array.isArray(imeis) || !imeis.length) return res.json([]);
  
-  const safeImeis = imeis.slice(0, 1000);
-  const placeholders = safeImeis.map((_, i) => `$${i + 1}`).join(', ');
- 
+  const placeholders = imeis.map((_, i) => `$${i + 1}`).join(', ');
   const { rows } = await query(`
-    SELECT DISTINCT ON (ge.imei)
-      ge.imei,
-      ge.received_at AS last_event_at,
-      ge.ignition    AS last_ignition
-    FROM public.gps_events ge
-    WHERE ge.imei IN (${placeholders})
-    ORDER BY ge.imei, ge.received_at DESC
-  `, safeImeis);
+    SELECT imei, received_at AS last_event_at, ignition AS last_ignition
+    FROM public.unit_last_event
+    WHERE imei IN (${placeholders})
+  `, imeis.slice(0, 1000));
  
   res.json(rows);
 });
