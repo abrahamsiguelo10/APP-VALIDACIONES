@@ -321,11 +321,26 @@ async function saveEvent(unit, parsed, destinationId, forwardOk, forwardResp, pa
       parsed.raw    || null,
       payloadSent   ? JSON.stringify(payloadSent) : null,
     ]);
+ 
+    // Actualizar último evento en unit_last_event (1 fila por unidad, sin purge)
+    // Solo si el evento es más reciente que el que ya tenemos
+    query(`
+      INSERT INTO public.unit_last_event (imei, received_at, ignition)
+      VALUES ($1, NOW(), $2)
+      ON CONFLICT (imei) DO UPDATE SET
+        received_at = EXCLUDED.received_at,
+        ignition    = EXCLUDED.ignition,
+        updated_at  = now()
+      WHERE EXCLUDED.received_at > unit_last_event.received_at
+    `, [unit.imei, parsed.ignition ?? null]).catch(err => {
+      // No bloquear el flujo principal si falla esta actualización
+      console.warn('[TCP] unit_last_event upsert error:', err.message);
+    });
+ 
   } catch (err) {
     console.error('[TCP] saveEvent error:', err.message);
   }
 }
-
 // ─── Headers de autenticación ─────────────────────────────────────────────────
 function buildAuthHeaders(auth) {
   if (!auth || !auth.type || auth.type === 'none') return {};
