@@ -35,6 +35,8 @@ router.get('/', async (req, res) => {
     SELECT
       u.imei, u.plate, u.name, u.rut, u.enabled, u.cliente_id,
       u.created_at, u.updated_at,
+      le.received_at  AS last_event_at,
+      le.ignition     AS last_ignition,
       COALESCE(
         json_agg(
           json_build_object(
@@ -48,8 +50,9 @@ router.get('/', async (req, res) => {
         '[]'
       ) AS destinations
     FROM public.units u
-    LEFT JOIN public.unit_destinations ud ON ud.imei = u.imei
-    LEFT JOIN public.destinations d       ON d.id    = ud.destination_id
+    LEFT JOIN public.unit_last_event    le ON le.imei = u.imei
+    LEFT JOIN public.unit_destinations  ud ON ud.imei = u.imei
+    LEFT JOIN public.destinations        d ON d.id    = ud.destination_id
   `;
  
   const values = [];
@@ -58,7 +61,7 @@ router.get('/', async (req, res) => {
     values.push(`%${search}%`);
   }
  
-  sql += ` GROUP BY u.imei ORDER BY u.created_at DESC`;
+  sql += ` GROUP BY u.imei, le.received_at, le.ignition ORDER BY u.created_at DESC`;
   const { rows } = await query(sql, values);
   res.json(rows);
 });
