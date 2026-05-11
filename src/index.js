@@ -17,6 +17,8 @@ const validadorRoutes = require('./routes/validador');
 const gpsProxyRoutes  = require('./routes/gps-proxy');
 const certRoutes      = require('./routes/certificados');
 const adminRoutes     = require('./routes/admin');
+const pipedriveRouter          = require('./routes/pipedrive');
+const { runPipedriveSyncJob }  = require('./routes/pipedrive');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -100,6 +102,7 @@ app.use('/validador',    validadorRoutes);
 app.use('/gps',          gpsProxyRoutes);
 app.use('/certificados', certRoutes);
 app.use('/admin',        adminRoutes);
+app.use('/pipedrive', pipedriveRouter);
 
 /* ── 404 ──────────────────────────────────────────────────────── */
 app.use((_req, res) => {
@@ -124,6 +127,17 @@ async function start() {
     if (process.env.TCP_ENABLED !== 'false') {
       startTcpServer();
     }
+    
+    if (process.env.PIPEDRIVE_API_KEY) {
+  setTimeout(() => {
+    runPipedriveSyncJob();
+    setInterval(runPipedriveSyncJob, 24 * 60 * 60 * 1000);
+  }, 10 * 60 * 1000); // espera 10 min tras arranque
+  console.log('[Pipedrive] Job automático programado — cada 24h');
+} else {
+  console.log('[Pipedrive] PIPEDRIVE_API_KEY no configurada — job deshabilitado');
+}
+    
     app.listen(PORT, () => {
       console.log(`✓ Síguelo API escuchando en puerto ${PORT}`);
       console.log(`  CORS orígenes: ${_corsOrigins.join(', ') || '(solo siguelogps.com y vercel.app)'}`);
