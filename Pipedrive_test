@@ -1,0 +1,163 @@
+/**
+ * SCRIPT DE PRUEBA — pipedrive_test.js
+ * Ejecutar desde la raíz del proyecto: node pipedrive_test.js
+ *
+ * Toma las primeras 5 unidades de Wialon sin reporte y las sube a Pipedrive.
+ * NO requiere Supabase ni servidor corriendo — se ejecuta directo con Node.
+ *
+ * Variables requeridas (editar abajo):
+ */
+
+const WIALON_TOKEN    = 'cd5f16a83fd0572dc66fb952acf02b6b23114E997AB305827DC8191962A9E64AB4623FFF';
+const PIPEDRIVE_KEY   = '219c4e20f0d25fee0abfa68e3f38f0c5410e0e14';
+const DIAS_UMBRAL     = 15;
+const LIMITE_PRUEBA   = 5;   // solo 5 unidades de prueba
+const WIALON_BASE     = 'https://hst-api.wialon.com/wialon/ajax.html';
+const PD_BASE         = 'https://api.pipedrive.com/v1';
+const PD_OWNER_ID     = 24878669; // Gerald
+
+// ── Wialon login ─────────────────────────────────────────────────
+async function wialonLogin() {
+  const params = new URLSearchParams({
+    svc:    'token/login',
+    params: JSON.stringify({ token: WIALON_TOKEN }),
+  });
+  const res  = await fetch(WIALON_BASE, { method: 'POST', body: params });
+  const json = await res.json();
+  if (json.error) throw new Error(`Wialon login error ${json.error}: ${json.reason || ''}`);
+  console.log(`[Wialon] Login OK — eid: ${json.eid.slice(0,8)}...`);
+  return json.eid;
+}
+
+// ── Wialon logout ────────────────────────────────────────────────
+async function wialonLogout(eid) {
+  const params = new URLSearchParams({ svc: 'core/logout', params: '{}', sid: eid });
+  await fetch(WIALON_BASE, { method: 'POST', body: params }).catch(() => {});
+}
+
+// ── Buscar unidades Wialon sin reporte ────────────────────────────
+async function getUnidadesSinReporte(eid) {
+  const ahora = Math.floor(Date.now() / 1000);
+  const umbral = ahora - DIAS_UMBRAL * 86400;
+  const resultado = [];
+  let from = 0;
+
+  console.log('[Wialon] Buscando unidades...');
+
+  while (resultado.length < LIMITE_PRUEBA) {
+    const params = new URLSearchParams({
+      svc: 'core/search_items',
+      params: JSON.stringify({
+        spec: { itemsType: 'avl_unit', propName: 'sys_name', propValueMask: '*', sortType: 'sys_name' },
+        force: 1, flags: 4194305, from, to: from + 50,
+      }),
+      sid: eid,
+    });
+
+    const res  = await fetch(WIALON_BASE, { method: 'POST', body: params });
+    const json = await res.json();
+    if (json.error) throw new Error(`Wialon search error ${json.error}`);
+
+    const items = json.items || [];
+    const total = json.totalItemsCount || 0;
+
+    for (const u of items) {
+      if (resultado.length >= LIMITE_PRUEBA) break;
+      const t    = u.pos?.t || null;
+      const dias = t ? Math.round((ahora - t) / 86400) : null;
+      const sinReporte = !t || t < umbral;
+
+      if (sinReporte) {
+        resultado.push({
+          wialon_id:        u.id,
+          plate:            (u.nm || '').trim() || `ID-${u.id}`,
+          uid:              u.uid || null,
+          ultimo_reporte:   t ? new Date(t * 1000).toISOString() : null,
+          dias_sin_reporte: dias,
+          cliente_nombre:   'Sin cliente',
+        });
+      }
+    }
+
+    from += 50;
+    if (from >= total || items.length === 0) break;
+    await new Promise(r => setTimeout(r, 50));
+  }
+
+  return resultado;
+}
+
+// ── Crear actividad Pipedrive ─────────────────────────────────────
+async function crearActividad(unidad) {
+  const subject = `TEST - ${unidad.plate} - Sin reporte +${unidad.dias_sin_reporte ?? DIAS_UMBRAL} días`;
+  const nota = [
+    `🧪 PRUEBA — eliminar tras verificar`,
+    `🚗 Unidad: ${unidad.plate}`,
+    unidad.uid ? `📡 UID/IMEI: ${unidad.uid}` : null,
+    unidad.ultimo_reporte
+      ? `📅 Último reporte: ${new Date(unidad.ultimo_reporte).toLocaleString('es-CL')}`
+      : `📅 Último reporte: Sin registro`,
+    unidad.dias_sin_reporte != null
+      ? `⏱ Días sin reportar: ${unidad.dias_sin_reporte}`
+      : `⏱ Días sin reportar: Sin datos`,
+    `⚙️ Script de prueba Síguelo GPS`,
+  ].filter(Boolean).join('\n');
+
+  const url = `${PD_BASE}/activities?api_token=${PIPEDRIVE_KEY}`;
+  const res  = await fetch(url, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({
+      subject,
+      type:    'unidades_sin_reportar',
+      user_id: PD_OWNER_ID,
+      done:    false,
+      note:    nota,
+    }),
+  });
+  const json = await res.json();
+  if (!json.success) throw new Error(json.error || 'Pipedrive error');
+  return json.data;
+}
+
+// ── Main ──────────────────────────────────────────────────────────
+(async () => {
+  let eid = null;
+  try {
+    eid = await wialonLogin();
+    const unidades = await getUnidadesSinReporte(eid);
+
+    console.log(`\n[Wialon] Encontradas ${unidades.length} unidades sin reporte ≥${DIAS_UMBRAL} días:\n`);
+    unidades.forEach(u => {
+      const dt = u.ultimo_reporte ? new Date(u.ultimo_reporte).toLocaleDateString('es-CL') : 'Sin datos';
+      console.log(`  • ${u.plate} — ${u.dias_sin_reporte ?? '?'} días (último: ${dt})`);
+    });
+
+    if (!unidades.length) {
+      console.log('\n[!] No hay unidades que cumplan el criterio en los primeros resultados.');
+      return;
+    }
+
+    console.log('\n[Pipedrive] Creando actividades de prueba...\n');
+    for (const u of unidades) {
+      try {
+        const act = await crearActividad(u);
+        console.log(`  ✓ ${u.plate} → actividad ID ${act.id} creada`);
+        await new Promise(r => setTimeout(r, 200));
+      } catch (err) {
+        console.error(`  ✗ ${u.plate} → ${err.message}`);
+      }
+    }
+
+    console.log('\n✅ Prueba completada. Verifica las actividades en Pipedrive.');
+    console.log('   Todas tienen el prefijo "TEST -" para identificarlas y eliminarlas fácilmente.');
+
+  } catch (err) {
+    console.error('\n❌ Error:', err.message);
+  } finally {
+    if (eid) {
+      await wialonLogout(eid);
+      console.log('[Wialon] Sesión cerrada.');
+    }
+  }
+})();
