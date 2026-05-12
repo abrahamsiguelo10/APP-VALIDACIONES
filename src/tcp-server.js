@@ -27,8 +27,8 @@ const TCP_PORT = parseInt(process.env.TCP_PORT || '9001', 10);
 // Evita queries repetidas a Supabase por datos que casi nunca cambian.
 // Con 200 unidades × 1 evento/s = 600 queries/s sin caché → ~3 queries/s con caché.
 
-const CACHE_TTL_MS       = 60_000;   // 60 segundos TTL general
-const CACHE_DEST_TTL_MS  = 120_000;  // 2 minutos para destinos (cambian menos)
+const CACHE_TTL_MS       = 5 * 60_000;   //5 minutos para destinos (cambian menos)
+const CACHE_DEST_TTL_MS  = 5 * 60_000;  // 5 minutos para destinos (cambian menos)
 const CACHE_GEO_TTL_MS   = 30 * 60_000; // ← NUEVO: 30 min para direcciones
 
 const _unitCache    = new Map(); // imei       → { data, expiresAt }
