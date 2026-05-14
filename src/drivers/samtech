@@ -2,41 +2,22 @@
  * src/drivers/dduarte.js
  * Driver Transportes Duarte — Samtech SOAP/ASMX
  * Método: Post_XML con XML como CDATA
- *
- * Variables de entorno Railway:
- *   dduarte_URL      — URL WebService (default: https://wspos.samtech.cl/WSP.asmx)
- *   dduarte_USER     — Login WS
- *   dduarte_PASS     — Clave WS
- *   dduarte_PGPS     — Nombre proveedor GPS (default: SigueloGPS)
- *   dduarte_EMPRESA  — Nombre servicio (default: dduarte)
  */
 
 'use strict';
 
-const DEFAULT_URL    = 'https://wspos.samtech.cl/WSP.asmx';
-const SOAP_ACTION    = 'samtechpos/Post_XML';
+const DEFAULT_URL = 'https://wspos.samtech.cl/WSP.asmx';
+const SOAP_ACTION = 'samtechpos/Post_XML';
 
 function xmlEscape(s) {
   return String(s ?? '')
     .replace(/&/g, '&amp;').replace(/</g, '&lt;')
     .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
+function toInt(v, fb) { const n = Number(v); return Number.isFinite(n) ? Math.trunc(n) : (fb !== undefined ? fb : 0); }
+function toDec(v, fb) { const n = Number(v); return Number.isFinite(n) ? n : (fb !== undefined ? fb : 0); }
+function stripPlate(plate) { return String(plate || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); }
 
-function toInt(v, fb) {
-  const n = Number(v);
-  return Number.isFinite(n) ? Math.trunc(n) : (fb !== undefined ? fb : 0);
-}
-
-function toDec(v, fb) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : (fb !== undefined ? fb : 0);
-}
-
-function stripPlate(plate) {
-  return String(plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-}
-
-// Fecha UTC+0 en formato "DD/MM/YYYY HH:mm:ss"
 function formatUtc(isoStr) {
   const d = isoStr ? new Date(isoStr) : new Date();
   const p = n => String(n).padStart(2, '0');
@@ -44,37 +25,33 @@ function formatUtc(isoStr) {
          `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
 }
 
-// Construir el XML interno (datos GPS)
 function buildInnerXml(fields) {
   return '<?xml version="1.0" encoding="ISO-8859-1"?>' +
-    '<datos>' +
-      '<movil>' +
-        '<pgps>'      + xmlEscape(fields.pgps)      + '</pgps>'      +
-        '<empresa>'   + xmlEscape(fields.empresa)   + '</empresa>'   +
-        '<tercero>'   + xmlEscape(fields.tercero)   + '</tercero>'   +
-        '<pat>'       + xmlEscape(fields.pat)       + '</pat>'       +
-        '<fn>'        + xmlEscape(fields.fn)        + '</fn>'        +
-        '<lat>'       + fields.lat                  + '</lat>'       +
-        '<lon>'       + fields.lon                  + '</lon>'       +
-        '<ori>'       + fields.ori                  + '</ori>'       +
-        '<vel>'       + fields.vel                  + '</vel>'       +
-        '<mot>'       + fields.mot                  + '</mot>'       +
-        '<hdop>'      + fields.hdop                 + '</hdop>'      +
-        '<odo>'       + fields.odo                  + '</odo>'       +
-        '<eve>'       + fields.eve                  + '</eve>'       +
-        '<conductor>' + xmlEscape(fields.conductor) + '</conductor>' +
-        '<numSAT>'    + fields.numSAT               + '</numSAT>'    +
-        '<sens1>'     + fields.sens1                + '</sens1>'     +
-        '<sens2>'     + fields.sens2                + '</sens2>'     +
-      '</movil>' +
-      '<usuario xmlns="user">' +
-        '<login>' + xmlEscape(fields.login) + '</login>' +
-        '<clave>' + xmlEscape(fields.clave) + '</clave>' +
-      '</usuario>' +
-    '</datos>';
+    '<datos><movil>' +
+      '<pgps>'      + xmlEscape(fields.pgps)      + '</pgps>'      +
+      '<empresa>'   + xmlEscape(fields.empresa)   + '</empresa>'   +
+      '<tercero>'   + xmlEscape(fields.tercero)   + '</tercero>'   +
+      '<pat>'       + xmlEscape(fields.pat)       + '</pat>'       +
+      '<fn>'        + xmlEscape(fields.fn)        + '</fn>'        +
+      '<lat>'       + fields.lat                  + '</lat>'       +
+      '<lon>'       + fields.lon                  + '</lon>'       +
+      '<ori>'       + fields.ori                  + '</ori>'       +
+      '<vel>'       + fields.vel                  + '</vel>'       +
+      '<mot>'       + fields.mot                  + '</mot>'       +
+      '<hdop>'      + fields.hdop                 + '</hdop>'      +
+      '<odo>'       + fields.odo                  + '</odo>'       +
+      '<eve>'       + fields.eve                  + '</eve>'       +
+      '<conductor>' + xmlEscape(fields.conductor) + '</conductor>' +
+      '<numSAT>'    + fields.numSAT               + '</numSAT>'    +
+      '<sens1>'     + fields.sens1                + '</sens1>'     +
+      '<sens2>'     + fields.sens2                + '</sens2>'     +
+    '</movil>' +
+    '<usuario xmlns="user">' +
+      '<login>' + xmlEscape(fields.login) + '</login>' +
+      '<clave>' + xmlEscape(fields.clave) + '</clave>' +
+    '</usuario></datos>';
 }
 
-// Envelope SOAP 1.2 con XML como CDATA dentro de <xmldoc>
 function buildSoapEnvelope(innerXml) {
   return '<?xml version="1.0" encoding="utf-8"?>' +
     '<soap12:Envelope ' +
@@ -96,13 +73,6 @@ async function send({ event, unit, route } = {}) {
   let pgps    = (process.env.dduarte_PGPS    || 'SigueloGPS').trim();
   let empresa = (process.env.dduarte_EMPRESA || 'dduarte').trim();
 
-  // Leer overrides desde field_schema — permite múltiples destinos Samtech
-  // sin tocar Railway. Campos fijos a agregar en la UI:
-  //   samtech_empresa → dduarte | samtech | etc.
-  //   samtech_pgps    → SigueloGPS
-  //   samtech_login   → usuario WS
-  //   samtech_clave   → clave WS
-  //   samtech_url     → URL del endpoint (si difiere)
   try {
     const schema = route?.field_schema || [];
     for (const f of schema) {
@@ -139,9 +109,7 @@ async function send({ event, unit, route } = {}) {
   const tercero  = unit?.name || unit?.cliente_nombre || 'No Asignado';
 
   const fields = {
-    pgps,
-    empresa,
-    tercero,
+    pgps, empresa, tercero,
     pat:       plate,
     fn:        formatUtc(event?.wialon_ts),
     lat:       lat.toFixed(6),
@@ -151,7 +119,7 @@ async function send({ event, unit, route } = {}) {
     mot:       ignicion,
     hdop:      String(toInt(event?.hdop, 0)).padStart(3, '0'),
     odo:       toInt(event?.odometro, 0),
-    eve:       ignicion ? 46 : 47, // 46=encendido/movimiento, 47=apagado/detenido
+    eve:       ignicion ? 46 : 47,
     conductor: 'No Asignado',
     numSAT:    toInt(event?.sats, 0),
     sens1:     0,
@@ -163,7 +131,16 @@ async function send({ event, unit, route } = {}) {
   const innerXml = buildInnerXml(fields);
   const envelope = buildSoapEnvelope(innerXml);
 
-  console.log(`[dduarte] enviando imei=${imei} plate=${plate} empresa=${empresa} fn=${fields.fn}`);
+  // ── LOG PAYLOAD (imprime los campos GPS sin credenciales) ─────
+  console.log(`[dduarte] ► PAYLOAD plate=${plate} imei=${imei} empresa=${empresa}`);
+  console.log(`[dduarte]   fn=${fields.fn} lat=${fields.lat} lon=${fields.lon} vel=${fields.vel} mot=${fields.mot} eve=${fields.eve} ori=${fields.ori}`);
+  console.log(`[dduarte]   pgps=${pgps} tercero="${tercero}" hdop=${fields.hdop} sats=${fields.numSAT} odo=${fields.odo}`);
+  console.log(`[dduarte]   url=${url}`);
+  // Log del XML interno completo solo si LOG_LEVEL=debug
+  if (process.env.LOG_LEVEL === 'debug') {
+    console.log(`[dduarte]   innerXml=${innerXml}`);
+    console.log(`[dduarte]   envelope=${envelope}`);
+  }
 
   const t0 = Date.now();
   let res, body;
@@ -178,18 +155,19 @@ async function send({ event, unit, route } = {}) {
     });
     body = await res.text().catch(() => '');
   } catch (err) {
-    console.error(`[dduarte] error de red ${imei}:`, err.message);
+    console.error(`[dduarte] ✗ ERROR RED plate=${plate} imei=${imei}: ${err.message}`);
     return { ok: false, status: 'failed', http_status: 0, latency_ms: Date.now()-t0, response_http: err.message };
   }
 
   const latency_ms = Date.now() - t0;
-  // Respuesta OK = texto "OK" en el body
   const ok = res.ok && /\bOK\b/i.test(body) && !/error/i.test(body);
 
+  // ── LOG RESPUESTA ─────────────────────────────────────────────
   if (ok) {
-    console.log(`[dduarte] ✓ ${plate} empresa=${empresa} (${res.status}) ${latency_ms}ms`);
+    console.log(`[dduarte] ✓ OK plate=${plate} empresa=${empresa} http=${res.status} ${latency_ms}ms`);
   } else {
-    console.warn(`[dduarte] ✗ ${plate} empresa=${empresa} (${res.status}) ${body.slice(0,200)}`);
+    console.warn(`[dduarte] ✗ FAIL plate=${plate} empresa=${empresa} http=${res.status} ${latency_ms}ms`);
+    console.warn(`[dduarte]   RESP: ${body.slice(0, 400)}`);
   }
 
   return {
