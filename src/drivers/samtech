@@ -156,10 +156,10 @@ async function send({ event, unit, route } = {}) {
 
   // ── LOG RESPUESTA ─────────────────────────────────────────────
   if (ok) {
-    console.log(`[dduarte] ✓ OK plate=${plate} empresa=${empresa} http=${res.status} ${latency_ms}ms`);
+    console.log(`✓ OK plate=${plate} empresa=${empresa} http=${res.status} ${latency_ms}ms`);
   } else {
-    console.warn(`[dduarte] ✗ FAIL plate=${plate} empresa=${empresa} http=${res.status} ${latency_ms}ms`);
-    console.warn(`[dduarte]   RESP: ${body.slice(0, 400)}`);
+    console.warn(`✗ FAIL plate=${plate} empresa=${empresa} http=${res.status} ${latency_ms}ms`);
+    console.warn(`RESP: ${body.slice(0, 400)}`);
   }
 
   return {
@@ -172,4 +172,4 @@ async function send({ event, unit, route } = {}) {
   };
 }
 
-module.exports = { send, name: 'dduarte' };
+module.exports = { send, name: 'SAMTECH' };
