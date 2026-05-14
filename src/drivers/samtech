@@ -132,7 +132,7 @@ async function send({ event, unit, route } = {}) {
   const envelope = buildSoapEnvelope(innerXml);
 
   // ── LOG PAYLOAD — una sola línea con XML completo ──────────────
-  console.log(`[dduarte] ► plate=${plate} imei=${imei} empresa=${empresa} fn=${fields.fn} lat=${fields.lat} lon=${fields.lon} vel=${fields.vel} mot=${fields.mot} | XML=${innerXml}`);
+  console.log(`[SAMTECH] ► plate=${plate} imei=${imei} empresa=${empresa} fn=${fields.fn} lat=${fields.lat} lon=${fields.lon} vel=${fields.vel} mot=${fields.mot} | XML=${innerXml}`);
 
   const t0 = Date.now();
   let res, body;
@@ -156,9 +156,9 @@ async function send({ event, unit, route } = {}) {
 
   // ── LOG RESPUESTA ─────────────────────────────────────────────
   if (ok) {
-    console.log(`✓ OK plate=${plate} empresa=${empresa} http=${res.status} ${latency_ms}ms`);
+    console.log(`SAMTECH✓ OK plate=${plate} empresa=${empresa} http=${res.status} ${latency_ms}ms`);
   } else {
-    console.warn(`"samtech"✗ FAIL plate=${plate} empresa=${empresa} http=${res.status} ${latency_ms}ms`);
+    console.warn(`"SAMTECH"✗ FAIL plate=${plate} empresa=${empresa} http=${res.status} ${latency_ms}ms`);
     console.warn(`RESP: ${body.slice(0, 400)}`);
   }
 
