@@ -131,16 +131,8 @@ async function send({ event, unit, route } = {}) {
   const innerXml = buildInnerXml(fields);
   const envelope = buildSoapEnvelope(innerXml);
 
-  // ── LOG PAYLOAD (imprime los campos GPS sin credenciales) ─────
-  console.log(`[dduarte] ► PAYLOAD plate=${plate} imei=${imei} empresa=${empresa}`);
-  console.log(`[dduarte]   fn=${fields.fn} lat=${fields.lat} lon=${fields.lon} vel=${fields.vel} mot=${fields.mot} eve=${fields.eve} ori=${fields.ori}`);
-  console.log(`[dduarte]   pgps=${pgps} tercero="${tercero}" hdop=${fields.hdop} sats=${fields.numSAT} odo=${fields.odo}`);
-  console.log(`[dduarte]   url=${url}`);
-  // Log del XML interno completo solo si LOG_LEVEL=debug
-  if (process.env.LOG_LEVEL === 'debug') {
-    console.log(`[dduarte]   innerXml=${innerXml}`);
-    console.log(`[dduarte]   envelope=${envelope}`);
-  }
+  // ── LOG PAYLOAD — una sola línea con XML completo ──────────────
+  console.log(`[dduarte] ► plate=${plate} imei=${imei} empresa=${empresa} fn=${fields.fn} lat=${fields.lat} lon=${fields.lon} vel=${fields.vel} mot=${fields.mot} | XML=${innerXml}`);
 
   const t0 = Date.now();
   let res, body;
