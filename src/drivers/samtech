@@ -158,7 +158,7 @@ async function send({ event, unit, route } = {}) {
   if (ok) {
     console.log(`✓ OK plate=${plate} empresa=${empresa} http=${res.status} ${latency_ms}ms`);
   } else {
-    console.warn(`✗ FAIL plate=${plate} empresa=${empresa} http=${res.status} ${latency_ms}ms`);
+    console.warn(`"samtech"✗ FAIL plate=${plate} empresa=${empresa} http=${res.status} ${latency_ms}ms`);
     console.warn(`RESP: ${body.slice(0, 400)}`);
   }
 
