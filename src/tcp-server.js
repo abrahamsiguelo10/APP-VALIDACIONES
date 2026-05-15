@@ -173,10 +173,7 @@ function parseWialonIPS(raw) {
       if (isNaN(lat) || isNaN(lon)) return null;
 
       const inputsVal          = inputs && inputs !== 'NA' ? parseInt(inputs, 10) : 0;
-      const ignitionFromInputs = !!(inputsVal & 1);
-      // Fallback: si inputs no reporta ignición pero hay velocidad > 0, inferir encendido
-      const speedVal  = parseFloat(speed) || 0;
-      const ignition  = ignitionFromInputs || speedVal > 0;
+      const ignition = !!(inputsVal & 1);
 
       let wialon_ts = null;
       try {
