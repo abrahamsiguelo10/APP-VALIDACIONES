@@ -1,0 +1,315 @@
+'use strict';
+
+/**
+ * src/drivers/recursoconfiable.js
+ * Driver SOAP para Recurso Confiable — Iron Tracking
+ * Documento: D-TI-15 v14
+ *
+ * Flujo:
+ *   1. GetUserToken  → obtiene token (vigencia 24h, se cachea en memoria)
+ *   2. GPSAssetTracking → envía el pulso GPS con el token
+ *
+ * Endpoint producción:
+ *   http://gps.rcontrol.com.mx/Tracking/wcf/RCService.svc
+ *
+ * Configuración en GUI:
+ *   driver_slug : recursoconfiable
+ *   api_url     : http://gps.rcontrol.com.mx/Tracking/wcf/RCService.svc
+ *   auth → type : basic
+ *   auth → username : TU_USUARIO_RC
+ *   auth → password : TU_PASSWORD_RC
+ *
+ * Campos fijos opcionales vía field_schema (source: fixed):
+ *   rc_customer_id   — Identificador de la empresa solicitante (ej: "41013")
+ *   rc_customer_name — Nombre de la empresa transportista
+ *   rc_code          — Código de evento por defecto (default: "1")
+ *   rc_vehicle_type  — Tipo de vehículo (ej: "Tracto")
+ *   rc_vehicle_brand — Marca del vehículo (ej: "Ford")
+ *   rc_vehicle_model — Modelo del vehículo (ej: "F500")
+ */
+
+const DEFAULT_URL    = 'http://gps.rcontrol.com.mx/Tracking/wcf/RCService.svc';
+const SOAP_ACTION_TOKEN   = 'http://tempuri.org/IRCService/GetUserToken';
+const SOAP_ACTION_TRACKING= 'http://tempuri.org/IRCService/GPSAssetTracking';
+
+// ── Caché de token por credenciales (userId|password → {token, expires}) ─────
+const _tokenCache = new Map();
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function xmlEsc(s) {
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
+}
+
+function toInt(v, fb = 0)  { const n = Number(v); return Number.isFinite(n) ? Math.trunc(n) : fb; }
+function toDec(v, fb = 0)  { const n = Number(v); return Number.isFinite(n) ? n : fb; }
+
+/**
+ * Formato requerido por RC: YYYY-MM-DDTHH:MM:SS (UTC/GMT 0)
+ */
+function toRCDate(isoStr) {
+  const d = isoStr ? new Date(isoStr) : new Date();
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())}` +
+         `T${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+
+/**
+ * Placa sin espacios ni caracteres especiales (requerido por RC)
+ */
+function cleanPlate(plate) {
+  return String(plate || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+// ── Leer field_schema ─────────────────────────────────────────────────────────
+function readSchema(route) {
+  const cfg = {
+    rc_customer_id:   '',
+    rc_customer_name: '',
+    rc_code:          '1',
+    rc_vehicle_type:  '',
+    rc_vehicle_brand: '',
+    rc_vehicle_model: '',
+  };
+  try {
+    let schema = route?.field_schema || [];
+    if (typeof schema === 'string') { try { schema = JSON.parse(schema); } catch(_) { schema = []; } }
+    for (const f of schema) {
+      if (f.source === 'fixed' && f.fixedValue !== undefined && f.fixedValue !== '') {
+        if (cfg.hasOwnProperty(f.apiKey)) cfg[f.apiKey] = String(f.fixedValue);
+      }
+    }
+  } catch(_) {}
+  return cfg;
+}
+
+// ── SOAP: GetUserToken ────────────────────────────────────────────────────────
+function buildTokenRequest(userId, password) {
+  return `<?xml version="1.0" encoding="utf-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+  xmlns:tem="http://tempuri.org/">
+  <soapenv:Header/>
+  <soapenv:Body>
+    <tem:GetUserToken>
+      <tem:userId>${xmlEsc(userId)}</tem:userId>
+      <tem:password>${xmlEsc(password)}</tem:password>
+    </tem:GetUserToken>
+  </soapenv:Body>
+</soapenv:Envelope>`;
+}
+
+async function getToken(url, userId, password) {
+  const cacheKey = `${userId}|${password}`;
+  const cached   = _tokenCache.get(cacheKey);
+
+  // Token cacheado y vigente (24h menos 5 min de margen)
+  if (cached && cached.expires > Date.now()) {
+    return cached.token;
+  }
+
+  const envelope = buildTokenRequest(userId, password);
+  const res  = await fetch(url, {
+    method:  'POST',
+    headers: {
+      'Content-Type': 'text/xml; charset=utf-8',
+      'SOAPAction':   SOAP_ACTION_TOKEN,
+    },
+    body:   envelope,
+    signal: AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined,
+  });
+
+  const body = await res.text().catch(() => '');
+
+  if (!res.ok) {
+    throw new Error(`GetUserToken HTTP ${res.status}: ${body.slice(0, 200)}`);
+  }
+
+  // Extraer token del response
+  const tokenMatch = body.match(/<a:token[^>]*>([^<]+)<\/a:token>/);
+  if (!tokenMatch || !tokenMatch[1]) {
+    // Verificar si hay error de autenticación
+    const errMatch = body.match(/<b:Value>([^<]*Autent[^<]*)<\/b:Value>/i);
+    throw new Error(errMatch ? `Auth RC: ${errMatch[1]}` : `Token no encontrado en respuesta RC: ${body.slice(0, 300)}`);
+  }
+
+  const token = tokenMatch[1].trim();
+
+  // Cachear por 23h55m
+  _tokenCache.set(cacheKey, {
+    token,
+    expires: Date.now() + (23 * 60 + 55) * 60 * 1000,
+  });
+
+  console.log(`[recursoconfiable] ✓ Token obtenido para userId=${userId} (vigencia 24h)`);
+  return token;
+}
+
+// ── SOAP: GPSAssetTracking ────────────────────────────────────────────────────
+function buildTrackingRequest(token, event, unit, cfg) {
+  const plate   = cleanPlate(unit.plate || unit.name || '');
+  const lat     = toDec(event.lat, 0).toFixed(6);
+  const lon     = toDec(event.lon, 0).toFixed(6);
+  const speed   = toInt(event.speed, 0);
+  const course  = toInt(event.heading, 0);
+  const alt     = toInt(event.alt || event.altitude, 0);
+  const odo     = toInt(event.odometro || event.odometer, 0);
+  const ign     = (event.ignition === true || event.ignition === 1) ? 'true' : 'false';
+  const date    = toRCDate(event.wialon_ts);
+  const serial  = xmlEsc(unit.imei || '0');
+  const code    = xmlEsc(cfg.rc_code || '1');
+  const custId  = xmlEsc(cfg.rc_customer_id || '');
+  const custName= xmlEsc(cfg.rc_customer_name || unit.cliente_nombre || '');
+  const vType   = xmlEsc(cfg.rc_vehicle_type || '');
+  const vBrand  = xmlEsc(cfg.rc_vehicle_brand || '');
+  const vModel  = xmlEsc(cfg.rc_vehicle_model || '');
+
+  return `<?xml version="1.0" encoding="utf-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+  xmlns:tem="http://tempuri.org/"
+  xmlns:iron="http://schemas.datacontract.org/2004/07/IronTracking">
+  <soapenv:Header/>
+  <soapenv:Body>
+    <tem:GPSAssetTracking>
+      <tem:token>${xmlEsc(token)}</tem:token>
+      <tem:events>
+        <iron:Event>
+          <iron:altitude>${alt}</iron:altitude>
+          <iron:asset>${xmlEsc(plate)}</iron:asset>
+          <iron:battery>0</iron:battery>
+          <iron:code>${code}</iron:code>
+          <iron:course>${course}</iron:course>
+          <iron:customer>
+            <iron:id>${custId}</iron:id>
+            <iron:name>${custName}</iron:name>
+          </iron:customer>
+          <iron:date>${date}</iron:date>
+          <iron:direction>${course}</iron:direction>
+          <iron:humidity>0</iron:humidity>
+          <iron:ignition>${ign}</iron:ignition>
+          <iron:latitude>${lat}</iron:latitude>
+          <iron:longitude>${lon}</iron:longitude>
+          <iron:odometer>${odo}</iron:odometer>
+          <iron:serialNumber>${serial}</iron:serialNumber>
+          <iron:shipment/>
+          <iron:speed>${speed}</iron:speed>
+          <iron:temperature>0</iron:temperature>
+          ${vType  ? `<iron:vehicleType>${vType}</iron:vehicleType>`   : '<iron:vehicleType/>'}
+          ${vBrand ? `<iron:vehicleBrand>${vBrand}</iron:vehicleBrand>` : '<iron:vehicleBrand/>'}
+          ${vModel ? `<iron:vehicleModel>${vModel}</iron:vehicleModel>` : '<iron:vehicleModel/>'}
+        </iron:Event>
+      </tem:events>
+    </tem:GPSAssetTracking>
+  </soapenv:Body>
+</soapenv:Envelope>`;
+}
+
+// ── Función principal ─────────────────────────────────────────────────────────
+async function send({ event, unit, route } = {}) {
+
+  // Leer auth desde route
+  const auth = (() => {
+    try { return typeof route?.auth === 'string' ? JSON.parse(route.auth) : route?.auth; }
+    catch(_) { return null; }
+  })();
+
+  const userId   = auth?.username?.trim() || '';
+  const password = auth?.password?.trim() || '';
+
+  if (!userId || !password) {
+    console.error('[recursoconfiable] ❌ Faltan credenciales (auth → username / password)');
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'missing_credentials' };
+  }
+
+  // Validar coordenadas
+  const lat = toDec(event?.lat, null);
+  const lon = toDec(event?.lon, null);
+  if (lat === null || lon === null || (lat === 0 && lon === 0)) {
+    console.warn(`[recursoconfiable] coordenadas inválidas ${unit?.plate} — skip`);
+    return { ok: true, http_status: 0, status: 'skipped', response_http: 'invalid_coords' };
+  }
+
+  const plate = cleanPlate(unit?.plate || unit?.name || '');
+  if (!plate) {
+    return { ok: false, http_status: 0, status: 'failed', response_http: 'missing_plate' };
+  }
+
+  const url = (route?.url || route?.apiUrl || DEFAULT_URL).trim();
+  const cfg = readSchema(route);
+
+  const t0 = Date.now();
+
+  // ── Paso 1: Obtener token ─────────────────────────────────────
+  let token;
+  try {
+    token = await getToken(url, userId, password);
+  } catch (err) {
+    console.error(`[recursoconfiable] ✗ GetUserToken plate=${plate}: ${err.message}`);
+    // Limpiar caché si falló auth para forzar reintento en próximo evento
+    _tokenCache.delete(`${userId}|${password}`);
+    return {
+      ok:            false,
+      http_status:   0,
+      status:        'failed',
+      response_http: `GetUserToken error: ${err.message}`.slice(0, 500),
+      latency_ms:    Date.now() - t0,
+    };
+  }
+
+  // ── Paso 2: Enviar pulso GPS ──────────────────────────────────
+  const envelope = buildTrackingRequest(token, event, unit, cfg);
+
+  console.log(`[recursoconfiable] → plate=${plate} date=${toRCDate(event?.wialon_ts)} lat=${lat?.toFixed(4)} lon=${lon?.toFixed(4)} vel=${toInt(event?.speed)} ign=${event?.ignition}`);
+
+  if (process.env.LOG_LEVEL === 'debug') {
+    console.log(`[recursoconfiable]   envelope=${envelope.slice(0, 500)}`);
+  }
+
+  let res, body;
+  try {
+    res  = await fetch(url, {
+      method:  'POST',
+      headers: {
+        'Content-Type': 'text/xml; charset=utf-8',
+        'SOAPAction':   SOAP_ACTION_TRACKING,
+      },
+      body:   envelope,
+      signal: AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined,
+    });
+    body = await res.text().catch(() => '');
+  } catch (err) {
+    const latency_ms = Date.now() - t0;
+    console.error(`[recursoconfiable] ✗ Error red plate=${plate}: ${err.message}`);
+    return { ok: false, http_status: 0, status: 'failed', response_http: err.message.slice(0, 500), latency_ms };
+  }
+
+  const latency_ms = Date.now() - t0;
+
+  // Verificar respuesta — éxito si viene idJob
+  const idJobMatch = body.match(/<a:idJob>(\d+)<\/a:idJob>/);
+  const ok         = res.ok && !!idJobMatch;
+  const idJob      = idJobMatch ? idJobMatch[1] : null;
+
+  // Detectar token expirado → limpiar caché para renovar en próximo evento
+  if (body.includes('SQL:USERUNK') || body.includes('Token)')) {
+    console.warn(`[recursoconfiable] ⚠ Token inválido/expirado — limpiando caché`);
+    _tokenCache.delete(`${userId}|${password}`);
+  }
+
+  if (ok) {
+    console.log(`[recursoconfiable] ✓ plate=${plate} idJob=${idJob} http=${res.status} ${latency_ms}ms`);
+  } else {
+    const errKey = body.match(/<b:Key>key<\/b:Key>\s*<b:Value>([^<]+)<\/b:Value>/)?.[1] || '';
+    const errMsg = body.match(/<b:Key>message<\/b:Key>\s*<b:Value>([^<]+)<\/b:Value>/)?.[1] || '';
+    console.warn(`[recursoconfiable] ✗ plate=${plate} http=${res.status} ${latency_ms}ms key=${errKey} msg=${errMsg}`);
+  }
+
+  return {
+    ok,
+    http_status:   res.status,
+    status:        ok ? 'sent' : 'failed',
+    response_http: body.slice(0, 2000),
+    latency_ms,
+    error:         ok ? null : `http_${res.status}`,
+  };
+}
+
+module.exports = { send, name: 'recursoconfiable' };
